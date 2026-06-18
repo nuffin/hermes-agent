@@ -450,13 +450,18 @@ def get_current_board() -> str:
 
 
 def set_current_board(slug: str) -> Path:
-    """Persist ``slug`` as the active board; returns the file written. Does NOT
-    check the board exists — callers do (so ``boards switch <typo>`` errors)."""
+    """Persist ``slug`` as the active board and update the process override.
+
+    The caller validates that the board exists. This function only normalizes
+    and records the slug, so ``boards switch <typo>`` remains an error rather
+    than silently selecting a nonexistent board.
+    """
     _assert_not_delegated_child_mutation()
     normed = _require_slug(slug)
     path = current_board_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normed + "\n", encoding="utf-8")
+    os.environ["HERMES_KANBAN_BOARD"] = normed
     return path
 
 
