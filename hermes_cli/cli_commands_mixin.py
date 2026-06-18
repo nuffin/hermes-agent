@@ -1865,7 +1865,9 @@ class CLICommandsMixin:
         if rest.startswith("kanban"):
             rest = rest[len("kanban"):].lstrip()
         try:
-            output = run_slash(rest)
+            # Classic CLI and TUI share this handler, so an explicit in-session
+            # board switch must replace the board pin installed at chat startup.
+            output = run_slash(rest, update_process_env=True)
         except Exception as exc:  # pragma: no cover - defensive
             output = f"(._.) kanban error: {exc}"
         if output:
