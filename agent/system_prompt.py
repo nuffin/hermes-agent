@@ -168,6 +168,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # its core operating instructions, not optional guidance).
     if getattr(agent, "_skill_graph_mode", False):
         stable_parts.append(SKILL_GRAPH_IDENTITY)
+        import logging as _lg; _lg.getLogger("hermes.system_prompt").info("SKILL_GRAPH_IDENTITY injected via _skill_graph_mode=True")
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
