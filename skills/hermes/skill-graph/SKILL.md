@@ -51,6 +51,9 @@ After loading a skill via `skill_load()`, verify it fits the current task:
   match the task — call `skill_graph_search()` again with different
   keywords.
 - **Good match?** Continue with execution.
+- **Graph returned something? Even if the description doesn't look
+  perfect, load it and check. The graph may have injected names via
+  hooks that aren't visible in the description.**
 
 Pipelines should declare their scope explicitly in the description
 so the agent can judge fit before executing.
