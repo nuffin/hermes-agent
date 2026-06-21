@@ -200,9 +200,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Skill-graph mode guidance: when the flat index is skipped and the
-    # graph tools are loaded, tell the agent to discover skills dynamically.
-    if getattr(agent, "_skill_graph_mode", False) and "skill_graph_search" in agent.valid_tool_names:
+    # Skill-graph mode guidance: when the flat index is skipped, tell the
+    # agent to discover skills via the graph.
+    if getattr(agent, "_skill_graph_mode", False):
         tool_guidance.append(SKILL_GRAPH_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -274,9 +274,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # SKILL_GRAPH_GUIDANCE (in tool_guidance) tells the agent to discover
     # skills dynamically via the graph instead.
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    has_skill_graph_tool = any(name in agent.valid_tool_names for name in ['skill_graph_search', 'skill_load'])
 
-    if has_skill_graph_tool and getattr(agent, "_skill_graph_mode", False):
+    if getattr(agent, "_skill_graph_mode", False):
         skills_prompt = ""  # graph handles discovery; no flat index needed
     elif has_skills_tools:
         avail_toolsets = {
