@@ -90,7 +90,8 @@ exact words:
 | View / understand project structure | `skill_graph_search("project management framework overview")` |
 | Create / manage tasks | `skill_graph_search("task management and workflow")` |
 | Git operations | `skill_graph_search("git commit and push workflow")` |
-| Code review | `skill_graph_search("code review pull request")` |
+| Code review (local codebase) | `skill_graph_search("codebase audit review static analysis")` |
+| Code review (GitHub PR) | `skill_graph_search("code review pull request")` |
 | Write PRD / requirements | `skill_graph_search("product requirements document writing")` |
 | Debug a program | `skill_graph_search("debug python systematic")` |
 | Design / prototype | `skill_graph_search("design prototype mockup")` |
