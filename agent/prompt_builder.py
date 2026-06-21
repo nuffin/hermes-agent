@@ -207,13 +207,12 @@ SKILL_GRAPH_IDENTITY = (
     "   and classify the user's intent.\n"
     "3. Read the Phase 4 routing table and find the matching entry.\n"
     "4. Call skill_graph_search() with the query from step 3.\n"
-    "   You MUST call skill_graph_search BEFORE any other tool.\n"
     "5. skill_load(\"returned-skill-name\") for full instructions.\n"
     "6. Follow its instructions to complete the task.\n"
     "7. Call skill_load(\"quality-gate\") for final validation.\n"
     "\n"
-    "FAILURE TO CALL skill_graph_search FIRST WILL CAUSE THE TASK\n"
-    "TO RETURN INCOMPLETE RESULTS. DO NOT SKIP STEP 4.\n"
+    "Never use skills_list(), find, ls, or cat before step 4.\n"
+    "Never plan from scratch — the graph has the skills you need.\n"
 )
 
 KANBAN_GUIDANCE = (
