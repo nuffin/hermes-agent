@@ -106,6 +106,8 @@ The table below maps common intent types to keyword-rich search queries.
 Add more keywords relevant to the specific context — more terms increase
 the graph's ability to find the right match via its scoring pipeline.
 
+**Always include the specific name or entity the user mentioned.**
+
 | User intent | Search query (add more context keywords!) |
 |------------|------------------------------------------|
 | Role / character selection | `skill_graph_search("role worker agent character troupe roster")` |
