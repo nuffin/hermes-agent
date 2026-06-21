@@ -168,7 +168,29 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # its core operating instructions, not optional guidance).
     if getattr(agent, "_skill_graph_mode", False):
         stable_parts.append(SKILL_GRAPH_IDENTITY)
-        import logging as _lg; _lg.getLogger("hermes.system_prompt").info("SKILL_GRAPH_IDENTITY injected via _skill_graph_mode=True")
+        # Build a minimal skill index containing only the skill-graph
+        # companion, so the agent can discover and load it without graph
+        # search. The description comes from the on-disk SKILL.md.
+        _sg_desc = ""
+        try:
+            import os as _os, yaml as _yaml
+            _paths = [
+                _os.path.join(_os.path.expanduser("~/.hermes/hermes-agent/skills/hermes/skill-graph/SKILL.md")),
+                _os.path.join(_os.path.expanduser("~/.hermes/skills/hermes/skill-graph/SKILL.md")),
+            ]
+            for _p in _paths:
+                if _os.path.isfile(_p):
+                    _fm = next(_yaml.safe_load_all(open(_p, encoding="utf-8")))
+                    _sg_desc = (_fm or {}).get("description", "")
+                    break
+        except Exception:
+            pass
+        if not _sg_desc:
+            _sg_desc = "Skill knowledge graph — discover and load skills by intent"
+        stable_parts.append(
+            "Available Skills\n"
+            f"  skill-graph — {_sg_desc[:100]}\n"
+        )
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
