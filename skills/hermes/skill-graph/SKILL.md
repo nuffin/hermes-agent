@@ -36,7 +36,7 @@ tells you which skill to search for via the knowledge graph.
 5. skill_load("result-name") → execute
 6. skill_load("quality-gate") → final validation
 
-Never use search_files / shell ls/cat before step 4.
+Never use find/ls/cat before step 4.
 Never plan from scratch — the graph has the skills you need.
 ```
 
@@ -120,16 +120,6 @@ the graph's ability to find the right match via its scoring pipeline.
 | Deploy a service | `skill_graph_search("deploy service server container")` |
 | Video production | `skill_graph_search("video production recording editing")` |
 | Database design | `skill_graph_search("database schema data model naming")` |
-
-## Domain-Specific Routing
-
-For routing extensions specific to the installed skill ecosystem
-(scene activation, troupe entity lookup, pipeline context),
-load the file configured at `skills.config.skill-graph.extensions_file`
-in config.yaml (default: `~/.hermes/personal/skill-graph/routing-extensions.md`).
-
-This file extends the Phase 4 Routing Table and Phase 3 Pre-flight Check
-with domain-specific entries.
 
 ## Slash Commands
 

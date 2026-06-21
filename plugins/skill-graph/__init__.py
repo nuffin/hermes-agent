@@ -95,9 +95,6 @@ CREATE TABLE IF NOT EXISTS skill_term_stats (
     term         TEXT NOT NULL,
     search_count INTEGER DEFAULT 1,
     load_count   INTEGER DEFAULT 0,
-    success_count INTEGER DEFAULT 0,
-    last_searched TEXT,
-    last_loaded   TEXT,
     PRIMARY KEY (skill_name, term)
 );
 """
@@ -106,32 +103,8 @@ CREATE TABLE IF NOT EXISTS skill_term_stats (
 
 
 def _db_path() -> Path:
-    """Return path to graph DB under the active Hermes home.
-
-    Priority:
-    1. skills.config.skill-graph.db_path from config.yaml (explicit override)
-    2. HERMES_BUNDLED_PLUGINS → root level (profiles/<name>/skill-graph.db)
-    3. Default → under personal/ (profiles/<name>/personal/skill-graph.db)
-    """
-    # Priority 1: config.yaml override
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        raw = (
-            config
-            .get("skills", {})
-            .get("config", {})
-            .get("skill-graph", {})
-            .get("db_path")
-        )
-        if raw:
-            return Path(raw).expanduser().resolve()
-    except Exception:
-        pass
-
+    """Return path to graph DB under the active Hermes home."""
     hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-    if os.environ.get("HERMES_BUNDLED_PLUGINS"):
-        return hermes_home / GRAPH_DB_FILENAME
     return hermes_home / "personal" / GRAPH_DB_FILENAME
 
 
@@ -181,36 +154,43 @@ def _read_source_dirs_from_config() -> list[Path]:
 def _find_all_skills_dirs() -> list[Path]:
     """Return list of directories to scan for SKILL.md files.
 
-    Scans three tiers:
-      1. Current profile's skills/ dir (profile-specific skills)
-      2. Global ~/.hermes/skills/ (shared across profiles — built-in
-         skills, symlinked suites, etc.)
-      3. External skill dirs from Hermes config + source_dirs
+    Always includes:
+      1. The global ~/.hermes/skills/ (Hermes built-in + any PS symlinks)
+      2. The global ~/.hermes/hermes-agent/skills/ (Hermes built-in source)
+      3. The current profile's skills/ dir (via HERMES_HOME)
+      4. Configured source_dirs (user's extra paths, e.g. PS repo)
+      5. Hermes config's external_dirs
     """
     global_hermes = Path.home() / ".hermes"
     hermes_home = Path(os.environ.get("HERMES_HOME", global_hermes))
     dirs: list[Path] = []
 
-    # 1. Current profile's skills/ dir (profile-local)
-    profile_skills = hermes_home / "skills"
-    if profile_skills.exists():
-        dirs.append(profile_skills)
-
-    # 2. Global ~/.hermes/skills/ (shared across profiles)
+    # 1. Global ~/.hermes/skills/ (always scanned, not profile-relative)
     global_skills = global_hermes / "skills"
-    if global_skills.exists() and str(global_skills) != str(profile_skills):
+    if global_skills.exists():
         dirs.append(global_skills)
 
-    # 3. Agent-created skills (discoverable via graph, not in prompt)
+    # 2. Hermes Agent built-in skills (global)
+    agent_skills = global_hermes / "hermes-agent" / "skills"
+    if agent_skills.exists():
+        dirs.append(agent_skills)
+
+    # 3. Current profile's skills/ dir (if inside a named profile,
+    #    HERMES_HOME != global_hermes, this picks up profile-specific skills)
+    profile_skills = hermes_home / "skills"
+    if profile_skills.exists() and str(profile_skills) != str(global_skills):
+        dirs.append(profile_skills)
+
+    # 4. Hermes-agent-created skills (discoverable via graph, not in prompt)
     agent_created_dir = hermes_home / "skill-graph" / "agent-created"
     if agent_created_dir.exists():
         dirs.append(agent_created_dir)
 
-    # 4. Configured source dirs (user's extra paths, e.g. PS repo)
+    # 5. Configured source dirs (skill-graph's own extra paths)
     source_dirs = _read_source_dirs_from_config()
     dirs.extend(source_dirs)
 
-    # 5. External skill dirs from Hermes config
+    # 6. External skill dirs from Hermes config
     try:
         from hermes_cli.config import load_config
         config = load_config()
@@ -250,14 +230,9 @@ def _find_skill_path(name: str) -> Path | None:
 def _scan_skill_mds(skill_dirs: list[Path]) -> list[tuple[str, Path]]:
     """Scan all skill directories for SKILL.md files.
 
-    Deduplicates by real path (resolving symlinks) so the same skill
-    discovered via different routes (symlink vs original, multiple
-    base_dirs) is only indexed once.
-
     Returns list of (skill_name, skill_md_path).
     """
     results: list[tuple[str, Path]] = []
-    seen_realpaths: set[str] = set()
     seen_names: set[str] = set()
 
     for base_dir in skill_dirs:
@@ -270,10 +245,7 @@ def _scan_skill_mds(skill_dirs: list[Path]) -> list[tuple[str, Path]]:
             skill_md = cat_dir / "SKILL.md"
             if skill_md.exists():
                 name = cat_dir.name
-                real = os.path.realpath(skill_md)
-                dedup_key = f"{name}\x00{real}"
-                if dedup_key not in seen_realpaths:
-                    seen_realpaths.add(dedup_key)
+                if name not in seen_names:
                     seen_names.add(name)
                     results.append((name, skill_md))
                 continue
@@ -284,10 +256,7 @@ def _scan_skill_mds(skill_dirs: list[Path]) -> list[tuple[str, Path]]:
                 skill_md = name_dir / "SKILL.md"
                 if skill_md.exists():
                     name = name_dir.name
-                    real = os.path.realpath(skill_md)
-                    dedup_key = f"{name}\x00{real}"
-                    if dedup_key not in seen_realpaths:
-                        seen_realpaths.add(dedup_key)
+                    if name not in seen_names:
                         seen_names.add(name)
                         results.append((name, skill_md))
     return results
@@ -415,30 +384,15 @@ def _extract_skill_terms(name: str, tags: list[str], description: str) -> list[t
 
 
 def _dedup_skills(skills: list[tuple[str, Path]]) -> dict[str, Path]:
-    """Deduplicate skills by real path (resolving symlinks).
-
-    When the same SKILL.md is reachable via multiple paths (e.g. a symlink
-    in ~/.hermes/skills/ and the original in a source_dir), only one entry
-    is kept.  Prefers paths under ~/.hermes/skills/ when duplicates exist,
-    so profile-local overrides take precedence.
-    """
+    """Deduplicate skills by name, preferring ~/.hermes/skills/ paths."""
     deduped: dict[str, Path] = {}
-    real_to_name: dict[str, str] = {}
     primary_hint = str(Path.home() / ".hermes" / "skills")
     for name, path in skills:
-        real = os.path.realpath(path)
-        existing_name = real_to_name.get(real)
-        if existing_name is None:
-            # First time seeing this real path
-            real_to_name[real] = name
+        if name not in deduped:
             deduped[name] = path
         else:
-            # Same real file — prefer ~/.hermes/skills/ paths
             if str(path).startswith(primary_hint) and \
-               not str(deduped[existing_name]).startswith(primary_hint):
-                # Replace: current path is in primary dir, old one wasn't
-                del deduped[existing_name]
-                real_to_name[real] = name
+               not str(deduped[name]).startswith(primary_hint):
                 deduped[name] = path
     return deduped
 
@@ -490,7 +444,6 @@ def _upsert_skill(conn: sqlite3.Connection, name: str, path: Path, now: float) -
             "INSERT OR IGNORE INTO skill_terms (term, skill_name, strength, source) VALUES (?, ?, ?, ?)",
             (term_text, name, strength, source),
         )
-
 
     return info
 
@@ -604,13 +557,6 @@ def _update_single_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
         return False
     now = time.time()
     _upsert_skill(conn, skill_name, skill_path, now)
-    # Mark skills in main ~/.hermes/skills/ dir as needing external organization
-    main_skills = str((Path.home() / ".hermes" / "skills").resolve())
-    if str(skill_path.resolve()).startswith(main_skills):
-        conn.execute(
-            "UPDATE skill_nodes SET needs_organizing = 1 WHERE name = ? AND (needs_organizing IS NULL OR needs_organizing = 0)",
-            (skill_name,),
-        )
     conn.commit()
     logger.debug("skill-graph: updated single skill '%s' (%s)", skill_name, skill_path)
     return True
@@ -643,7 +589,6 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
                FROM skill_fts f
                JOIN skill_nodes n ON f.name = n.name
                WHERE skill_fts MATCH ?
-                 AND (n.is_deleted IS NULL OR n.is_deleted = 0)
                ORDER BY rank
                LIMIT ?""",
             (fts_query, limit * 2),
@@ -699,18 +644,16 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
             }
             expansion_queue.append(target)
 
-    # Phase 3: Tag match (existing) — uses its own dedup set so it doesn't
-    # block Phase 4 from finding higher-scoring term matches.
-    _tag_seen: set[str] = set()
+    # Phase 3: Tag match (existing)
     terms = _extract_terms(query)
     for term in terms:
         cursor = conn.execute(
-            """SELECT name FROM skill_nodes WHERE instr(tags, ?) > 0 AND (is_deleted IS NULL OR is_deleted = 0)""",
+            """SELECT name FROM skill_nodes WHERE instr(tags, ?) > 0""",
             (json.dumps(term),),
         )
         for row in cursor:
-            if row["name"] not in _tag_seen:
-                _tag_seen.add(row["name"])
+            if row["name"] not in seen:
+                seen.add(row["name"])
                 info = _get_node_info(conn, row["name"])
                 if info:
                     info["relevance"] = "tag_match"
@@ -721,38 +664,17 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
     # skill_terms table (auto-extracted from name, tags, description).
     # This catches Chinese terms and split-name parts that FTS5 misses.
     for term in terms:
-        if seen:
-            cursor = conn.execute(
-                """SELECT t.skill_name, t.strength, t.source, n.category, n.description
-                   FROM skill_terms t
-                   JOIN skill_nodes n ON t.skill_name = n.name AND (n.is_deleted IS NULL OR n.is_deleted = 0)
-                   WHERE t.term = ? AND t.skill_name NOT IN ({})
-                   ORDER BY t.strength DESC
-                   LIMIT 5""".format(",".join("?" for _ in seen)),
-                (term.lower(),) + tuple(seen),
-            )
-        else:
-            cursor = conn.execute(
-                """SELECT t.skill_name, t.strength, t.source, n.category, n.description
-                   FROM skill_terms t
-                   JOIN skill_nodes n ON t.skill_name = n.name AND (n.is_deleted IS NULL OR n.is_deleted = 0)
-                   WHERE t.term = ?
-                   ORDER BY t.strength DESC
-                   LIMIT 5""",
-                (term.lower(),),
-            )
+        cursor = conn.execute(
+            """SELECT t.skill_name, t.strength, t.source, n.category, n.description
+               FROM skill_terms t
+               JOIN skill_nodes n ON t.skill_name = n.name
+               WHERE t.term = ? AND t.skill_name NOT IN ({})
+               ORDER BY t.strength DESC
+               LIMIT 5""".format(",".join("?" for _ in seen)) if seen else "1=1",
+            (term.lower(),) + (tuple(seen) if seen else ()),
+        )
         for row in cursor:
             sname = row["skill_name"]
-            _term_score = 0.8 * row["strength"]
-            if sname in results:
-                # Don't overwrite — take the higher score
-                if results[sname]["score"] < _term_score:
-                    results[sname]["score"] = _term_score
-                    results[sname]["relevance"] = "term_match"
-                    results[sname]["relationship_chain"] = [
-                        f"term[{term}] → {sname} (strength={row['strength']}, source={row['source']})"
-                    ]
-                continue
             seen.add(sname)
             results[sname] = {
                 "name": sname,
@@ -766,15 +688,10 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
             }
 
     # Phase 5: Term-based scoring boost + search stats
-    # Uses per-(skill, term) stats with confidence-weighted S-curve.
-    _norm_terms = [t.lower() for t in terms]
+    # Apply per-(skill, term) load-ratio boost from skill_term_stats.
+    # A skill that gets loaded more often for a given term ranks higher.
     for sname, r in results.items():
-        _placeholders = ",".join("?" for _ in _norm_terms)
-        _term_rows = conn.execute(
-            f"SELECT term FROM skill_terms WHERE skill_name = ? AND term IN ({_placeholders})",
-            (sname,) + tuple(_norm_terms),
-        ).fetchall()
-        matched_terms = [row["term"] for row in _term_rows]
+        matched_terms = [t for t in terms if t.lower() in (r.get("name", "") + r.get("description", "") + str(r.get("tags", ""))).lower()]
         if matched_terms:
             for mt in matched_terms:
                 try:
@@ -786,109 +703,32 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
                     )
                 except Exception:
                     pass
+            # Compute average load ratio for matched terms
             try:
                 rows = conn.execute(
-                    """SELECT term, load_count, search_count, success_count FROM skill_term_stats
+                    """SELECT term, load_count, search_count FROM skill_term_stats
                        WHERE skill_name = ? AND term IN ({})"""
                     .format(",".join("?" for _ in matched_terms)),
                     (sname,) + tuple(mt.lower() for mt in matched_terms),
                 ).fetchall()
                 if rows:
-                    import math as _m
-                    _avg_eff = sum(
-                        (r["success_count"] * 2 + r["load_count"]) / max(r["search_count"] * 3, 1)
-                        for r in rows
-                    ) / len(rows)
-                    _confidence = 1 - _m.pow(0.5, sum(r["search_count"] for r in rows) / max(len(rows), 1) / 5)
-                    _adj = (_avg_eff - 0.5) * 2
-                    _tanh = _adj / (1 + abs(_adj) * 0.5)  # tanh approximation
-                    r["score"] *= (1.0 + 0.1 * _tanh * _confidence)
+                    avg_ratio = sum(r["load_count"] / max(r["search_count"], 1) for r in rows) / len(rows)
+                    r["score"] *= (1.0 + 0.15 * avg_ratio)
             except Exception:
                 pass
     conn.commit()
 
     sorted_results = sorted(results.values(), key=lambda r: -r["score"])
-    if not sorted_results:
-        return _fallback_search(query, conn, limit)
-    return sorted_results[:limit]
-
-
-def _fallback_search(query: str, conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]]:
-    """Broad fallback when the primary search returns nothing.
-
-    Returns skills whose name, tags, or description contain any of the
-    query terms, ordered by term strength. This catches skills that FTS5
-    and exact-term matching miss (e.g. stemming mismatches, partial words).
-    """
-    terms = _extract_terms(query)
-    if not terms:
-        # No parseable terms — return top skills by name
-        cursor = conn.execute(
-            "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE (is_deleted IS NULL OR is_deleted = 0) ORDER BY name LIMIT ?",
-            (limit,),
-        )
-        fallback = []
-        for row in cursor:
-            fallback.append({
-                "name": row["name"],
-                "category": row["category"] or "",
-                "description": row["description"] or "",
-                "tags": json.loads(row["tags"]) if row["tags"] else [],
-                "file_path": row["file_path"],
-                "relevance": "fallback",
-                "score": 0.1,
-            })
-        return fallback
-
-    results: dict[str, dict[str, Any]] = {}
-    for term in terms:
-        cursor = conn.execute(
-            """SELECT n.name, n.category, n.description, n.tags, n.file_path
-               FROM skill_nodes n
-               WHERE (n.is_deleted IS NULL OR n.is_deleted = 0)
-                 AND (instr(n.name, ?) > 0
-                  OR instr(n.description, ?) > 0
-                  OR instr(n.tags, ?) > 0)
-               LIMIT ?""",
-            (term, term, json.dumps(term), limit),
-        )
-        for row in cursor:
-            if row["name"] not in results:
-                results[row["name"]] = {
-                    "name": row["name"],
-                    "category": row["category"] or "",
-                    "description": row["description"] or "",
-                    "tags": json.loads(row["tags"]) if row["tags"] else [],
-                    "file_path": row["file_path"],
-                    "relevance": "fallback",
-                    "score": 0.2,
-                }
-    sorted_results = sorted(results.values(), key=lambda r: -r["score"])
     return sorted_results[:limit]
 
 
 def _fts_query(query: str) -> str:
-    """Convert a natural language query to an FTS5 query string.
-
-    For ASCII-heavy queries, builds an AND query from multi-char terms.
-    For Chinese-heavy queries (single-char tokens from unicode61), returns
-    empty so _search_graph falls through to term-table matching (Phase 4).
-    """
+    """Convert a natural language query to an FTS5 query string."""
     terms = re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff_-]+", query.lower())
-    # Split Chinese multi-char terms into individual characters for FTS5
-    # compatibility, since unicode61 tokenizes each CJK char separately.
-    flat: list[str] = []
-    for t in terms:
-        if re.match(r"^[\u4e00-\u9fff]+$", t) and len(t) > 1:
-            flat.extend(list(t))  # each CJK char is its own token
-        else:
-            flat.append(t)
-    has_ascii = any(t.isascii() for t in flat)
+    has_ascii = any(t.isascii() for t in terms)
     if has_ascii:
-        # Quote each term so FTS5 treats hyphens and other special chars
-        # as literal text, not column-filter operators.
-        return " AND ".join(f'"{t}"' for t in flat if len(t) > 1)
-    return " OR ".join(t for t in flat if len(t) > 1) if flat else ""
+        return " AND ".join(t for t in terms if len(t) > 1)
+    return " OR ".join(t for t in terms if len(t) > 1) if terms else ""
 
 
 def _extract_terms(query: str) -> list[str]:
@@ -900,8 +740,7 @@ def _extract_terms(query: str) -> list[str]:
 def _get_node_info(conn: sqlite3.Connection, name: str) -> dict[str, Any] | None:
     """Fetch full node info from the database."""
     cursor = conn.execute(
-        """SELECT name, category, description, tags, file_path, needs_organizing
-           FROM skill_nodes WHERE name = ? AND (is_deleted IS NULL OR is_deleted = 0)""",
+        "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE name = ?",
         (name,),
     )
     row = cursor.fetchone()
@@ -913,7 +752,6 @@ def _get_node_info(conn: sqlite3.Connection, name: str) -> dict[str, Any] | None
         "description": row["description"],
         "tags": json.loads(row["tags"]) if row["tags"] else [],
         "file_path": row["file_path"],
-        "needs_organizing": bool(dict(row).get("needs_organizing")) or False,
     }
 
 
@@ -930,7 +768,6 @@ def _ensure_graph() -> sqlite3.Connection:
     if _global_conn is None:
         conn = _get_conn()
         _init_db(conn)
-        _migrate_db(conn)
         _global_conn = conn
     if not _global_synced:
         with _graph_lock:
@@ -940,253 +777,7 @@ def _ensure_graph() -> sqlite3.Connection:
     return _global_conn
 
 
-# ── Schema migration helper ──────────────────────────────────────────────────
-
-def _migrate_db(conn: sqlite3.Connection) -> None:
-    """Apply schema changes that can't be done via CREATE TABLE IF NOT EXISTS."""
-    # v2: add success_count column
-    try:
-        conn.execute("ALTER TABLE skill_term_stats ADD COLUMN success_count INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    try:
-        conn.execute("ALTER TABLE skill_term_stats ADD COLUMN last_searched TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE skill_term_stats ADD COLUMN last_loaded TEXT")
-    except sqlite3.OperationalError:
-        pass
-    # v3: soft delete + needs_organizing for lifecycle management
-    for col, col_type in (
-        ("is_deleted", "INTEGER DEFAULT 0"),
-        ("deleted_at", "TEXT"),
-        ("needs_organizing", "INTEGER DEFAULT 0"),
-    ):
-        try:
-            conn.execute(f"ALTER TABLE skill_nodes ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
-
-
-
-def _read_config_path() -> Path | None:
-    """Read config.yaml path from HERMES_HOME."""
-    hermes_home = os.environ.get("HERMES_HOME", "")
-    if hermes_home:
-        cfg = Path(hermes_home) / "config.yaml"
-        if cfg.exists():
-            return cfg
-    cfg = Path.home() / ".hermes" / "config.yaml"
-    return cfg if cfg.exists() else None
-
-def _show_graph_config() -> str:
-    """Return current graph config (slash command 'config' default action)."""
-    try:
-        conn = _ensure_graph()
-        db_path = _db_path()
-        scanned = _find_all_skills_dirs()
-        cfg_dirs = _read_source_dirs_from_config()
-        skill_count = conn.execute("SELECT COUNT(*) FROM skill_nodes").fetchone()[0]
-        db_size = db_path.stat().st_size if db_path.exists() else 0
-        lines = [
-            "Skill Graph configuration",
-            f"  DB path:     {db_path}",
-            f"  DB size:     {db_size / 1024:.1f} KB",
-            f"  Skills:      {skill_count}",
-            f"  Source dirs (config): {cfg_dirs}" if cfg_dirs else "  Source dirs (config): (none)",
-            "  Scanned dirs:",
-        ]
-        for d in scanned:
-            cnt = len(list(d.rglob("SKILL.md"))) if d.exists() else 0
-            lines.append(f"    {d}  ({cnt} SKILL.md)")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Config failed: {e}"
-
-def _handle_source_dir_config(action: str, path_str: str) -> str:
-    """Add or remove a source_dir at runtime and persist to config.yaml."""
-    if not path_str:
-        return f"Usage: /sg config {action} <path>"
-    target = os.path.abspath(os.path.expanduser(path_str))
-    if not os.path.isdir(target):
-        return f"Not a directory: {target}"
-    try:
-        cfg_path = _read_config_path()
-        if not cfg_path:
-            return "❌ Cannot find config.yaml"
-        with open(cfg_path) as f:
-            cfg = yaml.safe_load(f) or {}
-        sg_cfg = cfg.setdefault("skills", {}).setdefault("config", {}).setdefault("skill-graph", {})
-        source_dirs = sg_cfg.get("source_dirs", [])
-        resolved = [os.path.abspath(os.path.expanduser(str(d))) for d in source_dirs]
-        if action == "add":
-            if target in resolved:
-                return f"Already in source_dirs: {target}"
-            source_dirs.append(path_str)
-        elif action == "remove":
-            if target not in resolved:
-                return f"Not in source_dirs: {target}"
-            source_dirs = [d for d in source_dirs if os.path.abspath(os.path.expanduser(str(d))) != target]
-        else:
-            return f"Unknown action: {action}"
-        sg_cfg["source_dirs"] = source_dirs
-        with open(cfg_path, "w") as f:
-            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-        try:
-            conn = _ensure_graph()
-            with _graph_lock:
-                count = _full_rebuild(conn)
-            return f"✅ {action}ed {target}\n   Graph rebuilt: {count} skills indexed."
-        except Exception as e:
-            return f"✅ Config updated but graph rebuild failed: {e}"
-    except Exception as e:
-        return f"Config {action} failed: {e}"
-
-
-def _handle_skill_graph_config(args: dict | None = None, **kw) -> str:
-    """Handle skill_graph_config tool — add/remove/list source_dirs."""
-    if not isinstance(args, dict):
-        return json.dumps({"success": False, "error": "args must be dict"})
-    action = args.get("action", "")
-    path_str = args.get("path", "")
-    persist = args.get("persist", True)
-    try:
-        if action == "list_dirs":
-            cfg_dirs = _read_source_dirs_from_config()
-            return json.dumps({"success": True, "source_dirs": [str(d) for d in cfg_dirs],
-                               "scanned_dirs": [str(d) for d in _find_all_skills_dirs() if d.exists()],
-                               "persisted": persist}, default=str)
-        if action in ("add_dir", "remove_dir"):
-            if not path_str:
-                return json.dumps({"success": False, "error": "path required"})
-            target = os.path.abspath(os.path.expanduser(path_str))
-            if not os.path.isdir(target):
-                return json.dumps({"success": False, "error": f"Not a directory: {target}"})
-            if persist:
-                cfg_path = _read_config_path()
-                if not cfg_path:
-                    return json.dumps({"success": False, "error": "Cannot find config.yaml"})
-                with open(cfg_path) as f:
-                    cfg = yaml.safe_load(f) or {}
-                sg_cfg = cfg.setdefault("skills", {}).setdefault("config", {}).setdefault("skill-graph", {})
-                source_dirs = sg_cfg.get("source_dirs", [])
-                resolved = [os.path.abspath(os.path.expanduser(str(d))) for d in source_dirs]
-                if action == "add_dir":
-                    if target in resolved:
-                        return json.dumps({"success": True, "action": "add_dir", "path": target, "note": "already present"})
-                    source_dirs.append(path_str)
-                else:
-                    source_dirs = [d for d in source_dirs if os.path.abspath(os.path.expanduser(str(d))) != target]
-                sg_cfg["source_dirs"] = source_dirs
-                with open(cfg_path, "w") as f:
-                    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-            conn = _ensure_graph()
-            with _graph_lock:
-                count = _full_rebuild(conn)
-            return json.dumps({"success": True, "action": action, "path": target, "skills_indexed": count, "persisted": persist})
-        return json.dumps({"success": False, "error": f"Unknown action: {action}. Use add_dir, remove_dir, or list_dirs."})
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
-
 # ── Slash command handler ───────────────────────────────────────────────────
-
-
-def _format_edges(skill_name: str) -> str:
-    """Query and format graph edges only."""
-    try:
-        conn = _ensure_graph()
-        rows = conn.execute(
-            """SELECT source, target, rel_type, properties FROM skill_edges
-               WHERE source = ? OR target = ?
-               ORDER BY rel_type, source""",
-            (skill_name, skill_name),
-        ).fetchall()
-        if not rows:
-            return f"No relations defined for: {skill_name}"
-        seen: set[tuple[str, str, str]] = set()
-        parts = []
-        for src, tgt, rel, props in rows:
-            key = (src, tgt, rel)
-            if key in seen:
-                continue
-            seen.add(key)
-            arrow = f"  {src} ──({rel})──> {tgt}"
-            reason = ""
-            if isinstance(props, str) and props:
-                import json as _j
-                try:
-                    reason = _j.loads(props).get("reason", "")
-                except Exception:
-                    reason = props[:40]
-            elif isinstance(props, dict):
-                reason = props.get("reason", "")
-            if reason:
-                parts.append(f"{arrow:55s} {reason[:50]}")
-            else:
-                parts.append(arrow)
-        return "Edges:\n" + "\n".join(parts) + "\n"
-    except Exception:
-        return ""
-
-
-def _format_terms(skill_name: str) -> str:
-    """Query and format term associations with inline stats."""
-    try:
-        conn = _ensure_graph()
-        parts = []
-
-        # Skill's own terms
-        terms = conn.execute(
-            "SELECT t.term, t.strength, t.source, "
-            "COALESCE(s.search_count,0) AS sc, COALESCE(s.load_count,0) AS lc, "
-            "COALESCE(s.success_count,0) AS suc "
-            "FROM skill_terms t "
-            "LEFT JOIN skill_term_stats s ON t.skill_name = s.skill_name AND t.term = s.term "
-            "WHERE t.skill_name = ? ORDER BY t.strength DESC, t.source",
-            (skill_name,),
-        ).fetchall()
-        if terms:
-            term_lines = ["", "  Terms:"]
-            for t in terms:
-                _sc, _lc, _suc = t['sc'], t['lc'], t['suc']
-                _eff = (_suc * 2 + _lc) / max(_sc * 3, 1)
-                _conf = 1 - __import__("math").pow(0.5, _sc / 5)
-                _adj = (_eff - 0.5) * 2
-                _th = _adj / (1 + abs(_adj) * 0.5)
-                _boost = 0.1 * _th * _conf
-                _sign = "+" if _boost > 0 else ""
-                _stats = f"s={_sc}/l={_lc}/ok={_suc}/b={_sign}{_boost:.3f}".replace("+-", "")
-                term_lines.append(
-                    f"    {skill_name} ──({t['source']})──> {t['term']}  [{_stats}]"
-                )
-            parts.append("\n".join(term_lines))
-
-        # Reverse lookup
-        rev = conn.execute(
-            "SELECT t.skill_name, t.strength, t.source, "
-            "COALESCE(s.search_count,0) AS sc, COALESCE(s.load_count,0) AS lc, "
-            "COALESCE(s.success_count,0) AS suc "
-            "FROM skill_terms t "
-            "LEFT JOIN skill_term_stats s ON t.skill_name = s.skill_name AND t.term = s.term "
-            "WHERE t.term = ? ORDER BY t.strength DESC",
-            (skill_name,),
-        ).fetchall()
-        if rev:
-            rev_lines = ["", "  Skills with this term:"]
-            for sn, s, src, sc, lc, suc in rev:
-                _eff2 = (suc * 2 + lc) / max(sc * 3, 1)
-                _conf2 = 1 - __import__("math").pow(0.5, sc / 5)
-                _adj2 = (_eff2 - 0.5) * 2
-                _th2 = _adj2 / (1 + abs(_adj2) * 0.5)
-                _boost2 = 0.1 * _th2 * _conf2
-                _sign2 = "+" if _boost2 > 0 else ""
-                rev_lines.append(f"    {sn:40s} ──({src})──> {skill_name}  [s={sc}/l={lc}/ok={suc}/b={_sign2}{_boost2:.3f}]".replace("+-", ""))
-            parts.append("\n".join(rev_lines))
-
-        return "\n".join(parts) if parts else ""
-    except Exception:
-        return ""
 
 
 def _handle_slash_command(args: str) -> str | None:
@@ -1204,55 +795,26 @@ def _handle_slash_command(args: str) -> str | None:
             logger.exception("skill-graph: rebuild failed")
             return f"Rebuild failed: {e}"
 
-    elif subcmd == "show":
-        """Show full skill content (preview)."""
+    elif subcmd == "load":
+        """Directly load and display a skill's content."""
         if not rest:
-            return "Usage: /skill-graph show <skill-name>"
+            return "Usage: /skill-graph load <skill-name>"
         try:
             result = _handle_skill_load({"name": rest})
             data = json.loads(result)
             if not data.get("success"):
                 return f"Not found: {rest}"
-            content = data.get("content", "")
-            return (
-                f"Skill: {data['name']} ({len(content)} chars)\n"
-                f"  Description: {data.get('description', '')}\n"
-                f"  Category:    {data.get('category', '')}\n"
-                f"\n{content[:2000]}"
-            )
-        except Exception as e:
-            return f"Show failed: {e}"
-
-    elif subcmd == "info":
-        """Show skill metadata only."""
-        if not rest:
-            return "Usage: /skill-graph info <skill-name>"
-        try:
-            conn = _ensure_graph()
-            node = conn.execute(
-                "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE name = ?",
-                (rest,),
-            ).fetchone()
-            if not node:
-                return f"Not found: {rest}  (try /sg list)"
             return "\n".join([
-                f"Node: {node['name']}",
-                f"  Category:    {node['category'] or ''}",
-                f"  Description: {node['description'] or ''}",
-                f"  Tags:        {node['tags'] or ''}",
-                f"  Path:        {node['file_path'] or ''}",
+                f"Skill: {data['name']}",
+                f"  Category:    {data.get('category', '')}",
+                f"  Description: {data.get('description', '')[:120]}",
+                f"  Tags:        {', '.join(data.get('tags', [])[:6])}",
+                f"  Path:        {data.get('file_path', '')}",
+                f"  Relations:   {len(data.get('relations', []))} defined",
+                f"  Content:     {len(data.get('content', ''))} chars",
             ])
         except Exception as e:
-            return f"Info failed: {e}"
-
-    elif subcmd == "terms":
-        """Show term associations with stats."""
-        if not rest:
-            return "Usage: /skill-graph terms <skill-name>"
-        try:
-            return _format_terms(rest)
-        except Exception as e:
-            return f"Terms failed: {e}"
+            return f"Load failed: {e}"
 
     elif subcmd in ("status", "stats"):
         try:
@@ -1331,12 +893,27 @@ def _handle_slash_command(args: str) -> str | None:
             return f"List failed: {e}"
 
     elif subcmd == "config":
-        rest_parts = rest.strip().split(None, 1) if rest.strip() else []
-        config_action = rest_parts[0].lower() if rest_parts else "show"
-        config_arg = rest_parts[1] if len(rest_parts) > 1 else ""
-        if config_action in ("add", "remove"):
-            return _handle_source_dir_config(config_action, config_arg)
-        return _show_graph_config()
+        try:
+            conn = _ensure_graph()
+            db_path = _db_path()
+            scanned = _find_all_skills_dirs()
+            cfg_dirs = _read_source_dirs_from_config()
+            skill_count = conn.execute("SELECT COUNT(*) FROM skill_nodes").fetchone()[0]
+            db_size = db_path.stat().st_size if db_path.exists() else 0
+            lines = [
+                "Skill Graph configuration",
+                f"  DB path:     {db_path}",
+                f"  DB size:     {db_size / 1024:.1f} KB",
+                f"  Skills:      {skill_count}",
+                f"  Source dirs (config): {cfg_dirs}" if cfg_dirs else "  Source dirs (config): (none)",
+                "  Scanned dirs:",
+            ]
+            for d in scanned:
+                cnt = len(list(d.rglob("SKILL.md"))) if d.exists() else 0
+                lines.append(f"    {d}  ({cnt} SKILL.md)")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Config failed: {e}"
 
     elif subcmd in ("score", "explain"):
         """Show detailed scoring breakdown for a search query."""
@@ -1373,37 +950,11 @@ def _handle_slash_command(args: str) -> str | None:
             return f"Score breakdown failed: {e}"
 
     else:
-        # Unknown command — try proxying to a skill in the graph
-        if subcmd:
-            try:
-                conn = _ensure_graph()
-                _node = conn.execute(
-                    "SELECT file_path FROM skill_nodes WHERE name = ?", (subcmd,)
-                ).fetchone()
-                if _node:
-                    _result = _handle_skill_load({"name": subcmd})
-                    _data = json.loads(_result)
-                    if _data.get("success"):
-                        _content = _data.get("content", "")
-                        return (
-                            f"Loaded skill: {subcmd}\n"
-                            f"  Description: {_data.get('description', '')}\n"
-                            f"  Category:    {_data.get('category', '')}\n"
-                            f"  Content ({len(_content)} chars):\n"
-                            f"{_content[:500]}\n"
-                            f"...\n"
-                            f"(Use /sg info {subcmd} for metadata, "
-                            f"/sg terms {subcmd} for term details)"
-                        )
-            except Exception:
-                pass
         return (
             "/skill-graph — Skill knowledge graph\n\n"
             "Subcommands:\n"
             "  /skill-graph search <query>   Search skills by intent\n"
-            "  /skill-graph show <name>      Show full skill content (preview)\n"
-            "  /skill-graph info <name>      Show skill metadata\n"
-            "  /skill-graph terms <name>     Show term associations with stats\n"
+            "  /skill-graph load <name>      Load and display skill details\n"
             "  /skill-graph score <query>    Show scoring breakdown with term stats\n"
             "  /skill-graph list             List all skills in graph\n"
             "  /skill-graph config           Show configuration (paths, DB)\n"
@@ -1421,53 +972,17 @@ def _handle_skill_graph_search(args: dict | None = None, **kw) -> str:
         args = kw.get("args", kw)
     query = args.get("query", "") if isinstance(args, dict) else ""
     limit = int(args.get("limit", 10)) if isinstance(args, dict) else 10
-    list_all = args.get("list_all", False) if isinstance(args, dict) else False
 
-    if not query and not list_all:
+    if not query:
         return json.dumps({
             "success": False,
             "error": "query is required",
-            "hint": "Pass a query describing what you want to do, "
-                    "or set list_all=True to browse all skills.",
+            "hint": "Pass a query describing what you want to do",
         })
 
     try:
         conn = _ensure_graph()
         with _graph_lock:
-            if list_all:
-                cursor = conn.execute(
-                    """SELECT name, category, description, tags, file_path, needs_organizing
-                       FROM skill_nodes
-                       WHERE (is_deleted IS NULL OR is_deleted = 0)
-                       ORDER BY name"""
-                )
-                results = []
-                for row in cursor:
-                    results.append({
-                        "name": row["name"],
-                        "category": row["category"] or "",
-                        "description": row["description"] or "",
-                        "tags": json.loads(row["tags"]) if row["tags"] else [],
-                        "file_path": row["file_path"],
-                        "relevance": "listed",
-                        "score": 0.0,
-                        "needs_organizing": bool(dict(row).get("needs_organizing")) or False,
-                    })
-                total = len(results)
-                hint = "All skills listed by name. Call skill_load(name) to load full content."
-                logger.info("skill-graph: search list_all=True → %d results (total: %d)", total, total)
-                logger.debug("skill-graph: search list_all=True → skills: %s", [r["name"] for r in results])
-                return json.dumps({
-                    "success": True,
-                    "query": "",
-                    "results": results,
-                    "edges_between_results": [],
-                    "total_skills_in_graph": total,
-                    "result_count": len(results),
-                    "hint": hint,
-                    "note": "list_all=True — results sorted by name, not by relevance score.",
-                }, ensure_ascii=False)
-
             results = _search_graph(query, conn, limit=limit)
             total = conn.execute("SELECT COUNT(*) FROM skill_nodes").fetchone()[0]
             result_names = [r["name"] for r in results]
@@ -1490,17 +1005,6 @@ def _handle_skill_graph_search(args: dict | None = None, **kw) -> str:
                         "properties": json.loads(row["properties"]) if row["properties"] else {},
                     })
 
-        if results and results[0].get("score", 0) < 0.3:
-            hint = (
-                "Top results have low confidence. "
-                "Retry skill_graph_search() with different keywords, "
-                "or use skill_graph_search(list_all=True) to browse all skills."
-            )
-        else:
-            hint = "Call skill_load(name) to load full content of a discovered skill."
-        logger.info("skill-graph: search query=%r limit=%d scenes=%s → %d results (total: %d)",
-                    query, limit, scenes or [], len(results), total)
-        logger.debug("skill-graph: search query=%r → skills: %s", query, result_names)
         return json.dumps({
             "success": True,
             "query": query,
@@ -1508,7 +1012,7 @@ def _handle_skill_graph_search(args: dict | None = None, **kw) -> str:
             "edges_between_results": edges_between,
             "total_skills_in_graph": total,
             "result_count": len(results),
-            "hint": hint,
+            "hint": "Call skill_load(name) to load full content of a discovered skill.",
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -1608,11 +1112,6 @@ def register(ctx):
                         "description": "Max results (default 10)",
                         "default": 10,
                     },
-                    "list_all": {
-                        "type": "boolean",
-                        "description": "List all available skills by name (bypasses scoring). Use when search results have low confidence.",
-                        "default": False,
-                    },
                 },
                 "required": ["query"],
             },
@@ -1651,51 +1150,12 @@ def register(ctx):
         check_fn=None,
     )
 
-
-    # ── Tool: skill_graph_config ──
-    ctx.register_tool(
-        name="skill_graph_config",
-        toolset="skills",
-        schema={
-            "name": "skill_graph_config",
-            "description": (
-                "Manage skill-graph source directories at runtime without restarting Hermes. "
-                "Add or remove directories for skill discovery, or list current configuration. "
-                "Changes persist to config.yaml when persist=true (default). "
-                "The graph is automatically rebuilt after add/remove."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "add_dir, remove_dir, or list_dirs",
-                        "enum": ["add_dir", "remove_dir", "list_dirs"],
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path (required for add_dir/remove_dir)",
-                    },
-                    "persist": {
-                        "type": "boolean",
-                        "description": "Save to config.yaml (default: true). Set false for ephemeral changes.",
-                        "default": True,
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-        handler=_handle_skill_graph_config,
-        description="Manage skill-graph source directories at runtime",
-        check_fn=None,
-    )
-
     # ── Slash command: /skill-graph ──
     ctx.register_command(
         name="skill-graph",
         handler=_handle_slash_command,
         description="Skill knowledge graph: rebuild, status, help",
-        args_hint="rebuild|status|config [add|remove] <path>",
+        args_hint="rebuild|status",
     )
 
     # ── Alias: /sg → same handler as /skill-graph ──
@@ -1703,56 +1163,8 @@ def register(ctx):
         name="sg",
         handler=_handle_slash_command,
         description="Alias for /skill-graph",
-        args_hint="rebuild|status|config [add|remove] <path>",
+        args_hint="rebuild|status",
     )
-
-    # ── Hook: pre_tool_call — gate search_files behind skill_graph_search ──
-    # search_files: prevents the model from bypassing skill discovery by
-    #   going straight to filesystem search (e.g. "find project files").
-    # read_file is intentionally excluded — it's the execution step after a
-    #   skill has been loaded (or reading a known config/source file) and
-    #   should not be gated.
-    # find is not a real Hermes tool; search_files replaced it.
-    _gated_tools = frozenset({"search_files"})
-    _graph_searched: bool = False  # per-turn flag
-    _last_turn_id: str = ""  # for per-turn reset detection
-
-    # Resolve skill_graph_mode from config at registration time (startup constant)
-    _graph_mode = False
-    try:
-        from hermes_cli.config import load_config
-        _graph_mode = load_config().get("agent", {}).get("skill_graph_mode", False)
-    except Exception:
-        pass
-
-    def _on_pre_tool_call(tool_name: str, args: dict | None = None, **kw: Any) -> dict | str | None:
-        nonlocal _graph_searched, _graph_mode, _last_turn_id
-        turn_id = kw.get("turn_id", "")
-
-        # Per-turn reset: when turn_id changes, clear the flag
-        if turn_id and turn_id != _last_turn_id:
-            _graph_searched = False
-            _last_turn_id = turn_id
-
-        # If this IS skill_graph_search, mark it and allow
-        if tool_name == "skill_graph_search":
-            _graph_searched = True
-            return None
-
-        # Check gating: skill-graph mode + restricted tool + not yet searched
-        if (
-            _graph_mode
-            and tool_name in _gated_tools
-            and not _graph_searched
-        ):
-            return {"action": "block", "message":
-                f"Tool '{tool_name}' is blocked until you call "
-                f"skill_graph_search() first. This profile requires graph "
-                f"discovery before filesystem searches."
-            }
-        return None
-
-    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
 
     # ── Hook: on_session_start — ensure DB ──
     def _on_session_start(**kw):
@@ -1764,203 +1176,16 @@ def register(ctx):
 
     ctx.register_hook("on_session_start", _on_session_start)
 
-    # ── Hook: build_skills_index — replace flat index with graph discovery ──
-    def _on_build_skills_index(agent, skills_prompt, valid_tool_names, **kw):
-        """Replace the flat skill index with graph discovery guidance.
-
-        Returns a dict that suppresses the flat index and injects the
-        skill-graph identity protocol + tool guidance + a minimal
-        Available Skills block (skill-graph companion + gateway extensions)
-        into the system prompt.  Only fires when ``skill_graph_search``
-        is in the valid tool set (plugin loaded and not disabled).
-        """
-        if "skill_graph_search" not in valid_tool_names:
-            return None
-
-        from agent.prompt_builder import SKILL_GRAPH_IDENTITY, SKILL_GRAPH_GUIDANCE
-
-        # Build a minimal Available Skills block so the agent can discover
-        # and load the skill-graph companion without flat-index search.
-        _sg_desc = "Skill knowledge graph — discover and load skills by intent"
-        try:
-            import yaml as _yaml
-            for _p in [
-                os.path.expanduser("~/.hermes/hermes-agent/skills/hermes/skill-graph/SKILL.md"),
-                os.path.expanduser("~/.hermes/skills/hermes/skill-graph/SKILL.md"),
-            ]:
-                if os.path.isfile(_p):
-                    _fm = next(_yaml.safe_load_all(open(_p, encoding="utf-8")))
-                    _sg_desc = (_fm or {}).get("description", "") or _sg_desc
-                    break
-        except Exception:
-            pass
-
-        # Read gateway skill extensions from routing-extensions.md.
-        _gateway_extras: list[tuple[str, str]] = []
-        try:
-            from hermes_cli.config import load_config_readonly as _load_cfg
-            _cfg = _load_cfg()
-            _ext_file = (
-                (((_cfg.get("skills") or {}).get("config") or {})
-                 .get("skill-graph") or {}).get("extensions_file") or ""
-            )
-            if _ext_file:
-                _ext_path = os.path.expanduser(_ext_file)
-                if os.path.isfile(_ext_path):
-                    _in_gw = False
-                    for _line in open(_ext_path, encoding="utf-8").readlines():
-                        _line = _line.rstrip()
-                        if _line.startswith("## Pre-installed Gateways"):
-                            _in_gw = True
-                            continue
-                        if _in_gw:
-                            if _line.startswith("## "):
-                                break
-                            if _line.startswith("| `") and "|" in _line[3:]:
-                                _cells = _line.split("|")
-                                if len(_cells) >= 3:
-                                    _gn = _cells[1].strip().strip("`")
-                                    _gp = _cells[2].strip()
-                                    if _gn and not _gn.startswith("-"):
-                                        _gateway_extras.append((_gn, _gp))
-        except Exception:
-            pass
-
-        _avail = [f"  skill-graph — {_sg_desc[:100]}"]
-        for _gn, _gp in _gateway_extras:
-            _avail.append(f"  {_gn} — {_gp[:100]}")
-        _available_block = "Available Skills\n" + "\n".join(_avail) + "\n"
-
-        return {
-            "skills_prompt": "",
-            "identity": SKILL_GRAPH_IDENTITY + "\n\n" + _available_block,
-            "guidance": SKILL_GRAPH_GUIDANCE,
-        }
-
-    ctx.register_hook("build_skills_index", _on_build_skills_index)
-
-        # ── Register proxy commands from graph-discovered skills ──
-    _main_skills_dir = str((Path.home() / ".hermes" / "skills").resolve())
-
-    def _register_graph_commands():
-        """Scan all skills' SKILL.md frontmatter for commands: and register proxy handlers."""
-        try:
-            skill_dirs = _find_all_skills_dirs()
-            skills = _scan_skill_mds(skill_dirs)
-            deduped = _dedup_skills(skills)
-            _registered = 0
-            for _name, _path in deduped.items():
-                _path_str = str(_path.resolve())
-                _unresolved_str = str(_path)
-                _is_in_main_dir = (
-                    _path_str.startswith(_main_skills_dir) or
-                    _unresolved_str.startswith(_main_skills_dir)
-                )
-                # Register /<skill_name> ONLY for skills outside the main skills dir.
-                # Skills in ~/.hermes/skills/ are already handled natively by Hermes'
-                # scan_skill_commands() — a plugin proxy would block the native handler
-                # that loads SKILL.md as instructions and continues the conversation.
-                if not _is_in_main_dir:
-                    ctx.register_command(
-                        name=_name,
-                        handler=_make_proxy(_name),
-                        description=f"Proxy to graph-discovered skill: {_name}",
-                    )
-                    _registered += 1
-                # Register any explicit commands: from frontmatter for ALL skills
-                try:
-                    _text = _path.read_text(encoding="utf-8", errors="replace")
-                    _text = _text.lstrip("\ufeff")
-                    if _text.startswith("---"):
-                        _end = _text.find("---", 3)
-                        if _end != -1:
-                            _fm = yaml.safe_load(_text[3:_end].strip()) or {}
-                            _cmds = _fm.get("metadata", {}).get("hermes", {}).get("commands", [])
-                            if isinstance(_cmds, str):
-                                _cmds = [c.strip() for c in _cmds.split(",") if c.strip()]
-                            if isinstance(_cmds, list):
-                                for _cmd in _cmds:
-                                    _cmd = _cmd.lstrip("/").strip()
-                                    if _cmd and _cmd != _name:
-                                        ctx.register_command(
-                                            name=_cmd,
-                                            handler=_make_proxy(_name),
-                                            description=f"Proxy to graph-discovered skill: {_name}",
-                                        )
-                                        _registered += 1
-                except Exception:
-                    pass
-            if _registered:
-                logger.info("skill-graph: registered %d proxy slash commands from graph skills", _registered)
-        except Exception:
-            logger.exception("skill-graph: failed to register proxy commands")
-
-    def _make_proxy(skill_name: str):
-        """Create a proxy handler that loads the skill and injects it as agent input."""
-        def _proxy(_args: str) -> dict | None:
-            try:
-                _result = _handle_skill_load({"name": skill_name})
-                _data = json.loads(_result)
-                if not _data.get("success"):
-                    return None
-                _content = _data.get("content", "")
-                _skill_dir = _data.get("skill_dir", "")
-                _name = _data.get("name", skill_name)
-
-                parts = [
-                    f"[IMPORTANT: The user has invoked the {_name} skill. "
-                    f"The full skill content is loaded below.]",
-                    "",
-                    _content.strip(),
-                ]
-                if _skill_dir:
-                    parts.extend(["", f"[Skill directory: {_skill_dir}]"])
-                if _args:
-                    parts.extend(["",
-                        f"The user has provided the following instruction "
-                        f"alongside the skill invocation: {_args}"])
-
-                return {"action": "inject", "content": "\n".join(parts)}
-            except Exception:
-                pass
-            return None
-        return _proxy
-
-    _register_graph_commands()
-    _last_loaded_skill: str | None = None
-
+    # ── Hook: post_tool_call — incremental update on skill_manage ──
     def _on_post_tool_call(**kw):
-        nonlocal _last_loaded_skill
         tool_name = kw.get("tool_name", "")
-
-        # Track skill_load → when quality-gate loads, mark the previous skill as successful
-        if tool_name == "skill_load":
-            skill_name = (kw.get("args", {}) or {}).get("name", "") or ""
-            if not skill_name:
-                return
-            if skill_name == "quality-gate" and _last_loaded_skill:
-                try:
-                    conn = _get_conn()
-                    conn.execute(
-                        "UPDATE skill_term_stats SET success_count = success_count + 1 WHERE skill_name = ?",
-                        (_last_loaded_skill,),
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-                _last_loaded_skill = None
-            else:
-                _last_loaded_skill = skill_name
-            return
-
-        # Handle skill_manage → update graph
         if tool_name != "skill_manage":
             return
         args = kw.get("args", {})
         if not isinstance(args, dict):
             return
         action = args.get("action", "")
-        if action not in ("create", "edit", "patch", "delete"):
+        if action not in ("create", "edit", "patch"):
             return
         skill_name = args.get("name", "")
         if not skill_name:
@@ -1968,85 +1193,15 @@ def register(ctx):
         try:
             conn = _ensure_graph()
             with _graph_lock:
-                if action == "delete":
-                    conn.execute(
-                        "UPDATE skill_nodes SET is_deleted = 1, deleted_at = datetime('now') WHERE name = ?",
-                        (skill_name,),
-                    )
-                    conn.commit()
-                    logger.info("skill-graph: soft-deleted skill '%s'", skill_name)
-                else:
-                    updated = _update_single_skill(conn, skill_name)
-                    if updated:
-                        logger.info("skill-graph: updated skill '%s' after %s", skill_name, action)
+                updated = _update_single_skill(conn, skill_name)
+            if updated:
+                logger.info("skill-graph: updated skill '%s' after %s", skill_name, action)
         except Exception:
             logger.exception("skill-graph: post_tool_call failed for skill '%s'", skill_name)
 
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 
-    # ── Monkey-patch skill_view to fall back to skill-graph ──
-    try:
-        import tools.skills_tool as _st
-        _orig_skill_view = _st.skill_view
-
-        def _patched_skill_view(
-            name: str,
-            file_path: str = None,
-            task_id: str = None,
-            preprocess: bool = True,
-        ) -> str:
-            result = _orig_skill_view(
-                name, file_path=file_path,
-                task_id=task_id, preprocess=preprocess,
-            )
-            data = json.loads(result)
-            if data.get("success") or file_path:
-                return result
-            sg = _handle_skill_load({"name": name})
-            sg_data = json.loads(sg)
-            return sg if sg_data.get("success") else result
-
-        _st.skill_view = _patched_skill_view
-        logger.info("skill-graph: patched skill_view with graph fallback")
-    except Exception:
-        logger.exception("skill-graph: failed to patch skill_view")
-
-    # ── Monkey-patch _find_skill to fall back to skill-graph ──
-    # When skill_graph_mode is on, the agent may receive injected candidates
-    # for skills that live in graph source_dirs (e.g. PS repo) but not in the
-    # local skills/ dir that _find_skill scans. Without this patch, skill_manage
-    # (patch/edit/write_file/delete) fails with "not found in active profile"
-    # for any graph-managed skill.
-    #
-    # Patch strategy: try the original _find_skill first (local skills take
-    # precedence). On miss, delegate to the graph's _find_skill_path, which
-    # scans all configured source_dirs. Read-only skills (hermes bundled,
-    # hermes-agent live install) are allowed to resolve — patch/edit operate
-    # on their physical path and the file system permissions handle protection.
-    try:
-        import tools.skill_manager_tool as _smt
-        _orig_find_skill = _smt._find_skill
-
-        def _patched_find_skill(name: str):
-            result = _orig_find_skill(name)
-            if result is not None:
-                return result
-            # Graph fallback: resolve physical path from the graph's index
-            graph_path = _find_skill_path(name)
-            if graph_path is not None:
-                logger.info(
-                    "skill-graph: _find_skill graph fallback resolved '%s' → %s",
-                    name, graph_path,
-                )
-                return {"path": graph_path.parent}
-            return None
-
-        _smt._find_skill = _patched_find_skill
-        logger.info("skill-graph: patched _find_skill with graph fallback")
-    except Exception:
-        logger.exception("skill-graph: failed to patch _find_skill")
-
     logger.info(
-        "skill-graph plugin registered: tools=skill_graph_search+skill_load+skill_graph_config, "
-        "cmd=/skill-graph, hooks=on_session_start+post_tool_call+pre_tool_call"
+        "skill-graph plugin registered: tools=skill_graph_search+skill_load, "
+        "cmd=/skill-graph, hooks=on_session_start+post_tool_call"
     )
