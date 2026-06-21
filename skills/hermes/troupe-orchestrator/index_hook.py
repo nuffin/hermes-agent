@@ -41,9 +41,9 @@ def on_graph_index(
             if not data:
                 continue
 
-            # Merge all dict-format sources (characters, orchestrators, workers)
+            # Merge all dict-format sources (characters, orchestrators, workers, factions)
             items = {}
-            for key in ("characters", "orchestrators", "workers"):
+            for key in ("characters", "orchestrators", "workers", "factions"):
                 src = data.get(key, {})
                 if isinstance(src, dict):
                     items.update(src)
