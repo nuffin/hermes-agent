@@ -182,6 +182,16 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+SKILL_GRAPH_GUIDANCE = (
+    "Skill discovery: This profile uses a knowledge graph for dynamic skill "
+    "discovery. Do NOT use skills_list() — the flat index is intentionally "
+    "empty. Instead, call skill_graph_search(query) to find the right skill "
+    "by describing what you need in natural language, then load it with "
+    "skill_load(name). Always load intent-router first for task classification "
+    "and routing. After completing the main work, call skill_load(\"quality-gate\") "
+    "for final validation."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
