@@ -108,6 +108,8 @@ the graph's ability to find the right match via its scoring pipeline.
 
 | User intent | Search query (add more context keywords!) |
 |------------|------------------------------------------|
+| Role / character selection | `skill_graph_search("role worker agent character troupe roster")` |
+| Scene / pipeline config | `skill_graph_search("scene pipeline workflow orchestration stage")` |
 | View / understand project | `skill_graph_search("project overview structure analysis document")` |
 | Create / manage tasks | `skill_graph_search("task workflow management lifecycle")` |
 | Git operations | `skill_graph_search("git commit push branch workflow")` |
