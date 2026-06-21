@@ -38,6 +38,19 @@ tells you which skill to search for via the knowledge graph.
 
 Never use find/ls/cat before step 4.
 Never plan from scratch — the graph has the skills you need.
+
+## Multi-Intent Handling
+
+If the user's request contains multiple intents (e.g. "查项目然后做
+代码审查"), process them **sequentially** — not in parallel:
+
+1. Extract intents: identify each distinct goal
+2. Process the first intent: classify → route → search → load → execute
+3. Process the second intent: same flow
+4. Summarize: combine results into one response
+
+Do NOT merge intents into a single search query. Each intent gets its
+own skill_graph_search / skill_load cycle.
 ```
 
 ## Loader Protocol
