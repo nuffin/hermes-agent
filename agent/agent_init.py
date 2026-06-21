@@ -1330,7 +1330,6 @@ def init_agent(
     # skill-graph plugin's skill_graph_search() + skill_load() tools.
     # Default: False (compatible flat-index behaviour).
     agent._skill_graph_mode = bool(_agent_section.get("skill_graph_mode", False))
-    import logging as _lg; _lg.getLogger("hermes.system_prompt").info("_skill_graph_mode=%s from config", agent._skill_graph_mode)
 
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
