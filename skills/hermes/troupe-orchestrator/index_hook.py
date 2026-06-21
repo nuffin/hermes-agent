@@ -14,6 +14,7 @@ def on_graph_index(
     skill_dir: Path,
     skill_name: str,
     info: dict,
+    content: str = "",
 ) -> None:
     """Called by skill-graph after indexing this skill.
 
