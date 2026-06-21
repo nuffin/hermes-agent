@@ -11,12 +11,15 @@ metadata:
       - hermes
       - skills
       - discovery
-      - graph
-      - intent-router
       - 意图路由器
       - routing
       - classification
----
+    relations:
+      - type: complemented_by
+        target: quality-gate
+        properties:
+          reason: Routing + validation complete the pipeline
+          strength: strong
 
 # Skill Graph — Intent Routing + Discovery
 
