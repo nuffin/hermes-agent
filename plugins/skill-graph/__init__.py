@@ -669,7 +669,9 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
             }
             expansion_queue.append(target)
 
-    # Phase 3: Tag match (existing)
+    # Phase 3: Tag match (existing) — uses its own dedup set so it doesn't
+    # block Phase 4 from finding higher-scoring term matches.
+    _tag_seen: set[str] = set()
     terms = _extract_terms(query)
     for term in terms:
         cursor = conn.execute(
@@ -677,8 +679,8 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
             (json.dumps(term),),
         )
         for row in cursor:
-            if row["name"] not in seen:
-                seen.add(row["name"])
+            if row["name"] not in _tag_seen:
+                _tag_seen.add(row["name"])
                 info = _get_node_info(conn, row["name"])
                 if info:
                     info["relevance"] = "tag_match"
@@ -711,6 +713,16 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
             )
         for row in cursor:
             sname = row["skill_name"]
+            _term_score = 0.8 * row["strength"]
+            if sname in results:
+                # Don't overwrite — take the higher score
+                if results[sname]["score"] < _term_score:
+                    results[sname]["score"] = _term_score
+                    results[sname]["relevance"] = "term_match"
+                    results[sname]["relationship_chain"] = [
+                        f"term[{term}] → {sname} (strength={row['strength']}, source={row['source']})"
+                    ]
+                continue
             seen.add(sname)
             results[sname] = {
                 "name": sname,
