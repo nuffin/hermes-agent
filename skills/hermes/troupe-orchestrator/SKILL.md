@@ -8,7 +8,7 @@ category: hermes
 platforms: [linux, macos]
 metadata:
   hermes:
-    tags: [troupe, orchestration, worker, multi-agent, scene, workflow, 角色, 场景, 编排, 工作组]
+    tags: [troupe, orchestration, worker, multi-agent, scene, workflow, character, 角色, 场景, 编排, 工作组]
 ---
 
 # Troupe Orchestrator

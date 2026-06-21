@@ -446,8 +446,10 @@ def _upsert_skill(conn: sqlite3.Connection, name: str, path: Path, now: float) -
         )
 
     # Hook: run optional index_hook.py in the skill directory.
-    # The hook receives (conn, skill_dir_path, skill_name, info) and can
-    # inject additional terms, edges, or nodes into the graph.
+    # The hook receives (conn, skill_dir_path, skill_name, info, content) and
+    # can either write directly to conn (old style) or return a dict with
+    #       "terms": [(term, strength, source), ...}
+    # for skill-graph to index centrally.
     _hook_path = path.parent / "index_hook.py"
     if _hook_path.is_file():
         try:
@@ -457,7 +459,14 @@ def _upsert_skill(conn: sqlite3.Connection, name: str, path: Path, now: float) -
                 _mod = _iu.module_from_spec(_spec)
                 _spec.loader.exec_module(_mod)
                 if hasattr(_mod, "on_graph_index"):
-                    _mod.on_graph_index(conn, path.parent, name, info)
+                    _hook_content = path.read_text(encoding="utf-8", errors="replace")
+                    _result = _mod.on_graph_index(conn, path.parent, name, info, _hook_content)
+                    if isinstance(_result, dict):
+                        for _t, _s, _src in _result.get("terms", []):
+                            conn.execute(
+                                "INSERT OR IGNORE INTO skill_terms (term, skill_name, strength, source) VALUES (?, ?, ?, ?)",
+                                (_t.lower(), name, _s, _src),
+                            )
         except Exception:
             logger.exception("skill-graph: index_hook failed for '%s'", name)
 
