@@ -262,11 +262,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    # skill-graph mode: when the skill-graph plugin is enabled and the
-    # agent._skill_graph_mode flag is set (via config), skip the flat skill
-    # index. The agent discovers skills dynamically via the graph instead.
+    # skill-graph mode: when the skill-graph plugin is loaded AND the
+    # agent._skill_graph_mode flag is set, skip the flat skill index.
+    # SKILL_GRAPH_GUIDANCE (in tool_guidance) tells the agent to discover
+    # skills dynamically via the graph instead.
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    if has_skills_tools and not getattr(agent, "_skill_graph_mode", False):
+    has_skill_graph_tool = any(name in agent.valid_tool_names for name in ['skill_graph_search', 'skill_load'])
+
+    if has_skill_graph_tool and getattr(agent, "_skill_graph_mode", False):
+        skills_prompt = ""  # graph handles discovery; no flat index needed
+    elif has_skills_tools:
         avail_toolsets = {
             toolset
             for toolset in (
