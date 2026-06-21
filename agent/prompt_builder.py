@@ -192,6 +192,26 @@ SKILL_GRAPH_GUIDANCE = (
     "for final validation."
 )
 
+# Injected into the identity tier (same weight as SOUL.md) when
+# agent._skill_graph_mode is True.  Models treat identity as core
+# operating instructions, not optional guidance.
+SKILL_GRAPH_IDENTITY = (
+    "## Operating Protocol\n"
+    "\n"
+    "This profile has NO pre-installed skills.  You must discover every "
+    "skill through the knowledge graph:\n"
+    "\n"
+    "1. Call skill_graph_search() to find the right skill by describing\n"
+    "   what you need in natural language.\n"
+    "2. Call skill_load(\"skill-name\") to get full instructions.\n"
+    "3. Follow the skill's instructions.\n"
+    "4. Call skill_load(\"quality-gate\") for final validation.\n"
+    "\n"
+    "Do NOT use skills_list() — it returns nothing useful.\n"
+    "Do NOT explore with find/ls before searching the graph.\n"
+    "Do NOT plan from scratch — search first, always."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "

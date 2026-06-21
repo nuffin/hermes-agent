@@ -38,6 +38,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     SKILL_GRAPH_GUIDANCE,
+    SKILL_GRAPH_IDENTITY,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
@@ -161,6 +162,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Skill-graph mode: inject protocol into the identity tier so it
+    # carries the same weight as SOUL.md (the model treats identity as
+    # its core operating instructions, not optional guidance).
+    if getattr(agent, "_skill_graph_mode", False):
+        stable_parts.append(SKILL_GRAPH_IDENTITY)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
