@@ -693,7 +693,7 @@ def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10) -> list
     terms = _extract_terms(query)
     for term in terms:
         cursor = conn.execute(
-            """SELECT name FROM skill_nodes WHERE instr(tags, ?) > 0""",
+            """SELECT name FROM skill_nodes WHERE instr(tags, ?) > 0 AND (is_deleted IS NULL OR is_deleted = 0)""",
             (json.dumps(term),),
         )
         for row in cursor:
@@ -885,7 +885,8 @@ def _extract_terms(query: str) -> list[str]:
 def _get_node_info(conn: sqlite3.Connection, name: str) -> dict[str, Any] | None:
     """Fetch full node info from the database."""
     cursor = conn.execute(
-        "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE name = ?",
+        """SELECT name, category, description, tags, file_path, needs_organizing
+           FROM skill_nodes WHERE name = ? AND (is_deleted IS NULL OR is_deleted = 0)""",
         (name,),
     )
     row = cursor.fetchone()
@@ -1116,7 +1117,8 @@ def _handle_slash_command(args: str) -> str | dict | None:
         try:
             conn = _ensure_graph()
             node = conn.execute(
-                "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE name = ?",
+                """SELECT name, category, description, tags, file_path, needs_organizing
+           FROM skill_nodes WHERE name = ? AND (is_deleted IS NULL OR is_deleted = 0)""",
                 (rest,),
             ).fetchone()
             if not node:
@@ -1334,7 +1336,10 @@ def _handle_skill_graph_search(args: dict | None = None, **kw) -> str:
         with _graph_lock:
             if list_all:
                 cursor = conn.execute(
-                    "SELECT name, category, description, tags, file_path FROM skill_nodes ORDER BY name"
+                    """SELECT name, category, description, tags, file_path, needs_organizing
+                       FROM skill_nodes
+                       WHERE (is_deleted IS NULL OR is_deleted = 0)
+                       ORDER BY name"""
                 )
                 results = []
                 for row in cursor:
