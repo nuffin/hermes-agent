@@ -187,7 +187,12 @@ SKILL_GRAPH_GUIDANCE = (
     "discovery. Do NOT use skills_list() — the flat index is intentionally "
     "empty. Instead, call skill_graph_search(query) to find the right skill "
     "by describing what you need in natural language, then load it with "
-    "skill_load(name). Load the skill-graph companion first for task classification "
+    "skill_load(name). "
+    "Before calling skill_manage(action='create') to create a new skill, "
+    "always verify with skill_graph_search(list_all=True) or a broader query "
+    "that no existing skill can be updated to meet the need. "
+    "Only create after confirming a genuine gap. "
+    "Load the skill-graph companion first for task classification "
     "and routing. After completing the main work, call skill_load(\"quality-gate\") "
     "for final validation."
 )
