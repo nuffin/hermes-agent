@@ -2,11 +2,11 @@
 Persistent Ticket plugin — cross-profile ticket/issue tracking system.
 
 Stores tickets in a shared SQLite DB at a configurable path
-(default: ~/.hermes/personal/todo/ticket.db).
+(default: ~/.hermes/personal/ticket/ticket.db).
 
 Configuration (in config.yaml):
     ticket:
-      base: ~/.hermes/personal/todo     # Default
+      base: ~/.hermes/personal/ticket     # Default
       auto_clean_days: 0                 # 0=disabled, N=auto-delete done items older than N days
 
 Tools:
@@ -84,7 +84,7 @@ def _read_config() -> dict:
 def _base_path() -> Path:
     """Return the resolved ticket base directory from config."""
     cfg = _read_config()
-    raw = cfg.get("base", "~/.hermes/personal/todo")
+    raw = cfg.get("base", "~/.hermes/personal/ticket")
     return Path(os.path.expandvars(os.path.expanduser(str(raw)))).resolve()
 
 
