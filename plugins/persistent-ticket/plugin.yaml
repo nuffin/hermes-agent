@@ -1,0 +1,6 @@
+name: persistent-ticket
+version: 1.0.0
+description: "Persistent, cross-profile ticket/issue tracking system — ticket_add/list/done/cancel, profile_ticket_*, /ticket slash command."
+author: "Hauzer S. Lee"
+hooks:
+  - on_session_start

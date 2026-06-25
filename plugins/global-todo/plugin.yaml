@@ -1,0 +1,6 @@
+name: global-todo
+version: 1.0.0
+description: "Persistent, cross-profile todo system — global_todo_add/list/done/cancel, profile_todo_*, /todo slash command. Configurable base path, optional auto-clean."
+author: "Hauzer S. Lee"
+hooks:
+  - on_session_start
