@@ -246,10 +246,20 @@ def _handle_global_todo_list(args: dict | None = None, **kw: Any) -> str:
             "done_at": r["done_at"] or "",
         } for r in rows]
 
+        # Build summary by scope (pending counts per scope)
+        if status == "pending":
+            scope_rows = conn.execute(
+                "SELECT scope, COUNT(*) as cnt FROM todo_items WHERE status='pending' GROUP BY scope ORDER BY scope"
+            ).fetchall()
+            summary_by_scope = [{"scope": r["scope"], "count": r["cnt"]} for r in scope_rows]
+        else:
+            summary_by_scope = []
+
         return json.dumps({
             "success": True,
             "count": len(results),
             "results": results,
+            "summary_by_scope": summary_by_scope,
         }, ensure_ascii=False)
     except Exception as e:
         logger.exception("global_todo_list failed")
@@ -412,6 +422,16 @@ def _handle_todo_slash(args_str: str) -> str:
         if not items:
             return f"No {status} todos."
         lines = [f"Todos ({status}, {len(items)}):", ""]
+
+        # Summary by scope
+        summary = data.get("summary_by_scope", [])
+        if summary and len(summary) > 1:
+            scope_counts = " | ".join(
+                f"{s['scope']}={s['count']}" for s in summary
+            )
+            lines.append(f"  📊 Per scope: {scope_counts}")
+            lines.append("")
+
         for t in items:
             flag = "[P0]" if t["priority"] == "P0" else ""
             scope_tag = f"[{t['scope']}]" if t["scope"] != "global" else ""
