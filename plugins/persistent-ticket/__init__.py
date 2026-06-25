@@ -503,13 +503,41 @@ def _handle_ticket_slash(args_str: str) -> str:
         pending = conn.execute(
             "SELECT COUNT(*) FROM ticket_items WHERE status='pending'"
         ).fetchone()[0]
-        return (
-            f"Ticket configuration\\n"
-            f"  Base path:  {base}\\n"
-            f"  DB:         {db_path} ({db_size / 1024:.1f} KB)\\n"
-            f"  Auto-clean: {'disabled' if days == 0 else f'{days} days'}\\n"
-            f"  Items:      {total} total, {pending} pending"
-        )
+
+        # Show layered config like git: global + profile
+        current_profile = _get_current_profile()
+        lines = [f"Ticket configuration ({current_profile})", ""]
+
+        # Try to read profile-level config
+        hermes_home = os.environ.get("HERMES_HOME", "")
+        profile_config_path = ""
+        if hermes_home:
+            profile_config_path = os.path.join(hermes_home, "config.yaml")
+        elif current_profile != "default":
+            profile_config_path = os.path.join(
+                os.path.expanduser("~/.hermes/profiles"), current_profile, "config.yaml"
+            )
+
+        if profile_config_path and os.path.exists(profile_config_path):
+            try:
+                import yaml
+                with open(profile_config_path) as f:
+                    pc = yaml.safe_load(f) or {}
+                pt = pc.get("ticket", {})
+                if pt:
+                    lines.append(f"  Profile config ({current_profile}):")
+                    for k, v in pt.items():
+                        lines.append(f"    {k}: {v}")
+                    lines.append("")
+            except Exception:
+                pass
+
+        lines.append(f"  Effective settings:")
+        lines.append(f"    base:           {base}")
+        lines.append(f"    auto_clean_days: {days}")
+        lines.append(f"  DB: {db_path} ({db_size / 1024:.1f} KB)")
+        lines.append(f"  Items: {total} total, {pending} pending")
+        return "\n".join(lines)
 
     else:
         return f"Unknown subcommand: {subcmd}. Try: add, list, done, cancel, config"
