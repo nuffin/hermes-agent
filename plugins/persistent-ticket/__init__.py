@@ -409,7 +409,9 @@ def _handle_ticket_slash(args_str: str) -> str:
 
     # Determine scope and subcommand
     if tokens[0].lower() in subcmds:
-        scope = "global"
+        # Auto-detect scope: default profile → "global", named profile → profile name
+        raw_profile = _get_current_profile()
+        scope = "global" if raw_profile == "default" else raw_profile
         subcmd = tokens[0].lower()
         rest = " ".join(tokens[1:])
     else:
