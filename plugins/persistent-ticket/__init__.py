@@ -383,65 +383,93 @@ def _handle_profile_ticket_done(args: dict | None = None, **kw: Any) -> str:
 
 
 def _handle_ticket_slash(args_str: str) -> str:
-    """Handle ``/ticket <subcommand> [args]``."""
+    """Handle ``/ticket [scope] <subcommand> [args]``.
+
+    If first token is a subcommand (add/list/done/cancel/config), scope defaults to global.
+    If first token is a scope name (global or profile name), second token is the subcommand.
+    """
     args_str = (args_str or "").strip()
     if not args_str:
         return (
-            "Ticket — persistent ticket system\\n\\n"
-            "Subcommands:\\n"
-            "  /ticket add <content>       Add a global ticket\\n"
-            "  /ticket list [status]       List tickets (default: pending)\\n"
-            "  /ticket done <id>           Mark done\\n"
-            "  /ticket cancel <id>         Cancel a ticket\\n"
-            "  /ticket config              Show configuration"
+            "Ticket — persistent ticket system\n\n"
+            "Usage:\n"
+            "  /ticket add <content>           Add a global ticket\n"
+            "  /ticket global add <content>    Explicit global ticket\n"
+            "  /ticket eir add <content>       Ticket scoped to a profile\n"
+            "  /ticket list [status]           List all pending tickets\n"
+            "  /ticket eir list                List tickets for a profile\n"
+            "  /ticket done <id>               Mark done\n"
+            "  /ticket cancel <id>             Cancel\n"
+            "  /ticket config                  Show config\n\n"
+            "Status values: pending (default), in_progress, partial, done, cancelled"
         )
 
-    parts = args_str.split(None, 1)
-    subcmd = parts[0].lower()
-    rest = parts[1].strip() if len(parts) > 1 else ""
+    tokens = args_str.split()
+    subcmds = {"add", "list", "done", "cancel", "config"}
+
+    # Determine scope and subcommand
+    if tokens[0].lower() in subcmds:
+        scope = "global"
+        subcmd = tokens[0].lower()
+        rest = " ".join(tokens[1:])
+    else:
+        scope = tokens[0].lower()
+        if len(tokens) < 2 or tokens[1].lower() not in subcmds:
+            return f"Unknown command or missing subcommand after '{scope}'.\n" \
+                   f"Try: /ticket {scope} add <content>, /ticket {scope} list, etc."
+        subcmd = tokens[1].lower()
+        rest = " ".join(tokens[2:])
 
     if subcmd == "add":
         if not rest:
             return "Usage: /ticket add <content>"
         result = _handle_ticket_add({
             "content": rest,
-            "scope": "global",
+            "scope": scope,
         })
         data = json.loads(result)
         if data.get("success"):
-            return f"✅ Ticket #{data['id']} added: {rest}"
+            scope_tag = f" [{scope}]" if scope != "global" else ""
+            return f"✅ Ticket #{data['id']} added{scope_tag}: {rest}"
         return f"❌ {data.get('error', 'unknown error')}"
 
     elif subcmd == "list":
-        status = rest if rest in ("pending", "done", "cancelled") else "pending"
-        result = _handle_ticket_list({"status": status})
+        status = rest if rest in ("pending", "in_progress", "partial", "done", "cancelled") else "pending"
+        list_args = {"status": status}
+        if scope != "global":
+            list_args["scope"] = scope
+        result = _handle_ticket_list(list_args)
         data = json.loads(result)
         if not data.get("success"):
             return f"❌ {data.get('error', 'unknown error')}"
         items = data.get("results", [])
         if not items:
-            return f"No {status} tickets."
-        lines = [f"Tickets ({status}, {len(items)}):", ""]
+            scope_tag = f" for '{scope}'" if scope != "global" else ""
+            return f"No {status} tickets{scope_tag}."
+        scope_tag = f" ({scope})" if scope != "global" else ""
+        lines = [f"Tickets{scope_tag} ({status}, {len(items)}):", ""]
 
-        # Summary by scope
+        # Summary by scope (only for global/all-scope view)
         summary = data.get("summary_by_scope", [])
-        if summary and len(summary) > 1:
+        if summary and len(summary) > 1 and scope == "global":
             scope_counts = " | ".join(
                 f"{s['scope']}={s['count']}" for s in summary
             )
-            lines.append(f"  📊 Per scope: {scope_counts}")
+            lines.append(f"  Per scope: {scope_counts}")
             lines.append("")
 
         for t in items:
             flag = "[P0]" if t["priority"] == "P0" else ""
-            scope_tag = f"[{t['scope']}]" if t["scope"] != "global" else ""
+            scope_tag2 = f"[{t['scope']}]" if t["scope"] != "global" else ""
             cat_tag = f"({t['category']})" if t["category"] else ""
             worker_tag = f"~{t['worker']}" if t["worker"] else ""
-            deadline_tag = f" ⏰{t['deadline']}" if t["deadline"] else ""
+            deadline_tag = f" {t['deadline']}" if t["deadline"] else ""
             lines.append(
-                f"  #{t['id']:>4} {flag:<4} {scope_tag}{cat_tag}{worker_tag}"
-                f"  {t['content'][:60]} {deadline_tag}"
+                f"  #{t['id']:>4} {flag:<4} {scope_tag2}{cat_tag}{worker_tag}"
+                f"  {t['content'][:60]}{deadline_tag}"
             )
+            if t["status"] != "pending":
+                lines[-1] += f" [{t['status']}]"
         return "\n".join(lines)
 
     elif subcmd == "done":
@@ -450,8 +478,8 @@ def _handle_ticket_slash(args_str: str) -> str:
         result = _handle_ticket_done({"id": int(rest)})
         data = json.loads(result)
         if data.get("success"):
-            return f"✅ Ticket #{rest} marked as done"
-        return f"❌ {data.get('error', 'unknown error')}"
+            return f"Ticket #{rest} done"
+        return f"Error: {data.get('error', 'unknown error')}"
 
     elif subcmd == "cancel":
         if not rest or not rest.isdigit():
@@ -459,8 +487,8 @@ def _handle_ticket_slash(args_str: str) -> str:
         result = _handle_ticket_cancel({"id": int(rest)})
         data = json.loads(result)
         if data.get("success"):
-            return f"✅ Ticket #{rest} cancelled"
-        return f"❌ {data.get('error', 'unknown error')}"
+            return f"Ticket #{rest} cancelled"
+        return f"Error: {data.get('error', 'unknown error')}"
 
     elif subcmd == "config":
         cfg = _read_config()
