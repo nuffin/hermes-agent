@@ -933,8 +933,35 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
 
+    # ── pre_skill_create hook (allow plugin redirect / block / handle) ──
+    from hermes_cli.plugins import invoke_hook as _invoke_skill_hook
+
+    _skill_dir_override: Optional[Path] = None
+    for _result in _invoke_skill_hook(
+        "pre_skill_create", name=name, content=content, category=category
+    ):
+        if not isinstance(_result, dict):
+            continue
+        action = _result.get("action")
+        if action == "block":
+            return {"success": False, "error": _result.get("reason", "Skill creation blocked by plugin")}
+        if action == "redirect":
+            _skill_dir_override = Path(
+                os.path.expandvars(os.path.expanduser(str(_result["path"])))
+            )
+            break
+        if action == "handled":
+            _invoke_skill_hook(
+                "post_skill_create", name=name, category=category or "", path="", success=True
+            )
+            return {"success": True, "message": f"Skill '{name}' created by plugin.", "hook_handled": True}
+
     # Create the skill directory
-    skill_dir = _resolve_skill_dir(name, category)
+    skill_dir = (
+        _resolve_skill_dir(name, category)
+        if _skill_dir_override is None
+        else _skill_dir_override
+    )
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write SKILL.md atomically
@@ -960,7 +987,11 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(_skills_dir())),
+        "path": (
+            str(skill_dir.relative_to(_skills_dir()))
+            if _skill_dir_override is None
+            else str(skill_dir)
+        ),
         "skill_md": str(skill_md),
         "_change": {"description": _desc},
     }
@@ -972,6 +1003,18 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     )
     _add_description_prompt_preview(result, content)
     _attach_lint_findings(result, skill_md)
+
+    # ── post_skill_create hook (observer only) ──
+    try:
+        _invoke_skill_hook(
+            "post_skill_create",
+            name=name,
+            category=category or "",
+            path=str(skill_dir),
+            success=True,
+        )
+    except Exception:
+        pass
     return result
 
 

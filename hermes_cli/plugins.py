@@ -385,6 +385,11 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+    # Skill lifecycle hooks. Fired before and after a new SKILL.md is written.
+    # pre_skill_create is observer-only in this merged taxonomy; the skill
+    # manager remains the authority for filesystem writes.
+    "pre_skill_create",
+    "post_skill_create",
 }
 
 # Hooks whose return value carries a directive that the shell-hook response
