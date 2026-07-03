@@ -5,10 +5,17 @@ imported lazily inside each method (import cycle)."""
 from __future__ import annotations
 
 import sys
+import time
 
 from rich.markup import escape as _escape
 
 from utils import base_url_host_matches
+
+
+# A module import happens once per CLI process.  Session objects, by contrast,
+# can be loaded long after the process starts, so their own construction time
+# cannot distinguish a warm resume from a restart resume.
+_PROCESS_START: float = time.time()
 
 
 def _single_query_clarify_callback(question: str, choices=None, multi_select=False) -> str:
@@ -651,6 +658,34 @@ class CLIAgentSetupMixin:
                 _single_query_clarify_callback
                 if getattr(self, "_single_query_mode", False)
                 else self._clarify_callback)
+            # Build ephemeral system prompt, appending a resume note when
+            # the conversation history predates the current process — i.e.,
+            # the session was restored from a prior Hermes run.  Compare
+            # the last message's timestamp against process start time to
+            # detect this regardless of how the session was loaded
+            # (--resume flag, TUI auto-resume, or /resume in-session).
+            _ephemeral_sp = self.system_prompt if self.system_prompt else None
+            _last_message_ts = None
+            for msg in reversed(self.conversation_history):
+                ts = msg.get("timestamp")
+                if ts is not None:
+                    _last_message_ts = ts
+                    break
+            if (
+                _last_message_ts is not None
+                and _last_message_ts < _PROCESS_START
+            ):
+                _resume_note = (
+                    "\n\n[Session resumed after a process restart. "
+                    "This conversation history was restored from a prior session. "
+                    "Tool calls shown in the history have already been executed — "
+                    "do NOT re-execute them. "
+                    "The previous session's work was already reported — "
+                    "continue without re-summarizing. "
+                    "Address the user's current message below. "
+                    "Unless the user explicitly asks for a recap, ignore the past work.]"
+                )
+                _ephemeral_sp = (_ephemeral_sp or "") + _resume_note
             self.agent = AIAgent(
                 model=effective_model, api_key=runtime.get("api_key"),
                 base_url=runtime.get("base_url"), provider=runtime.get("provider"),
@@ -662,7 +697,6 @@ class CLIAgentSetupMixin:
                 enabled_toolsets=self.enabled_toolsets, disabled_toolsets=self.disabled_toolsets,
                 verbose_logging=self.verbose, quiet_mode=not self.verbose,
                 tool_progress_mode=getattr(self, "tool_progress_mode", "all"),
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config, service_tier=self.service_tier,
                 request_overrides=request_overrides, providers_allowed=self._providers_only,
@@ -671,7 +705,10 @@ class CLIAgentSetupMixin:
                 provider_require_parameters=self._provider_require_params,
                 provider_data_collection=self._provider_data_collection,
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
-                session_id=self.session_id, platform="cli", session_db=self._session_db,
+                session_id=self.session_id,
+                platform="cli",
+                ephemeral_system_prompt=_ephemeral_sp,
+                session_db=self._session_db,
                 clarify_callback=clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
                 fallback_model=self._fallback_model, thinking_callback=self._on_thinking,

@@ -79,6 +79,11 @@ sys.excepthook = _panic_hook
 threading.excepthook = lambda args: _record_crash(
     "thread exception", args.exc_type, args.exc_value, args.exc_traceback, thread_name=args.thread.name)
 
+# Record process start time for session-resume detection.
+# Compared against the last message timestamp in a resumed session to
+# determine whether the conversation history predates this process run.
+_PROCESS_START: float = time.time()
+
 with contextlib.suppress(Exception):
     from hermes_cli.banner import prefetch_update_check
 
@@ -2239,6 +2244,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
     runtime) wins over global config/env. Older rows stored the resolved provider "custom" (no named entry
     matches) — recover the identity from the persisted base_url or the rebuild fails "No LLM provider
     configured". Persisted base_url/api_key/api_mode are honored only for the original runtime, never a fallback."""
+
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
         requested_provider = model_override.get("provider") or provider_override or None
@@ -2360,6 +2366,31 @@ def _make_agent(
     from agent.shell_hooks import register_from_config
     register_from_config(cfg)
     system_prompt = _startup_system_prompt(cfg, session_id or key)
+    # A cold-resumed TUI build may not receive the session's open database
+    # handle.  Fall back to the process store so restart detection works for
+    # both eager and deferred resume paths.
+    _resume_db = session_db if session_db is not None else _get_db()
+    if _resume_db is not None and session_id is not None:
+        try:
+            row = _resume_db._conn.execute(
+                "SELECT MAX(timestamp) FROM messages "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+            if row is not None and row[0] is not None and row[0] < _PROCESS_START:
+                system_prompt = (
+                    system_prompt
+                    + "\n\n[Session resumed after a process restart. "
+                    "This conversation history was restored from a prior session. "
+                    "Tool calls shown in the history have already been executed — "
+                    "do NOT re-execute them. "
+                    "The previous session's work was already reported — "
+                    "continue without re-summarizing. "
+                    "Address the user's current message below. "
+                    "Unless the user explicitly asks for a recap, ignore the past work.]"
+                ).strip()
+        except Exception:
+            pass
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     fallback_notice = runtime.pop("_fallback_notice", None)
     _pr = _load_provider_routing()
