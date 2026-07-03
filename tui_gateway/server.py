@@ -4308,7 +4308,10 @@ def _make_agent(
                     "This conversation history was restored from a prior session. "
                     "Tool calls shown in the history have already been executed — "
                     "do NOT re-execute them. "
-                    "Address the user's current message below.]"
+                    "The previous session's work was already reported — "
+                    "continue without re-summarizing. "
+                    "Address the user's current message below. "
+                    "Unless the user explicitly asks for a recap, ignore the past work.]"
                 )
                 system_prompt = (system_prompt + "\n\n" + _resume_note).strip()
         except Exception:

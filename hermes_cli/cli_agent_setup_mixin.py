@@ -362,7 +362,10 @@ class CLIAgentSetupMixin:
                     "This conversation history was restored from a prior session. "
                     "Tool calls shown in the history have already been executed — "
                     "do NOT re-execute them. "
-                    "Address the user's current message below.]"
+                    "The previous session's work was already reported — "
+                    "continue without re-summarizing. "
+                    "Address the user's current message below. "
+                    "Unless the user explicitly asks for a recap, ignore the past work.]"
                 )
                 _ephemeral_sp = (_ephemeral_sp or "") + _resume_note
 
