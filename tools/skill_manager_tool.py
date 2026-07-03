@@ -12,6 +12,7 @@ import hashlib
 import json
 from contextlib import ExitStack, suppress
 import logging
+import os
 import re
 import shutil
 import threading
@@ -422,9 +423,32 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         return _err(err)
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
-    skill_dir = _resolve_skill_dir(name, category)
-    from hermes_constants import mkdir_under_hermes_home
-    mkdir_under_hermes_home(skill_dir)
+
+    from hermes_cli.lifecycle import invoke_hook
+    skill_dir_override = None
+    for hook_result in invoke_hook("pre_skill_create", name=name, content=content, category=category):
+        if not isinstance(hook_result, dict):
+            continue
+        action = hook_result.get("action")
+        if action == "block":
+            return _err(hook_result.get("reason", "Skill creation blocked by plugin"))
+        if action == "redirect":
+            path = hook_result.get("path")
+            if not path:
+                continue
+            skill_dir_override = Path(os.path.expandvars(os.path.expanduser(str(path))))
+            break
+        if action == "handled":
+            result = {"success": True, "message": f"Skill '{name}' created by plugin.", "hook_handled": True}
+            invoke_hook("post_skill_create", name=name, category=category or "", path="", success=True)
+            return result
+
+    skill_dir = skill_dir_override or _resolve_skill_dir(name, category)
+    if skill_dir_override is None:
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(skill_dir)
+    else:
+        skill_dir.mkdir(parents=True, exist_ok=True)
     skill_md = skill_dir / "SKILL.md"
     atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
     if scan_error := _security_scan_skill(skill_dir):
@@ -440,6 +464,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                 f"skill_manage(action='write_file', name='{name}', file_path='references/example.md', "
                 "file_content='...')"}
     _attach_lint_findings(_add_description_prompt_preview(result, content), skill_md)
+    invoke_hook("post_skill_create", name=name, category=category or "", path=str(skill_dir), success=True)
     return result
 
 
@@ -448,8 +473,21 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if err := _validate_frontmatter(content) or _validate_content_size(content):
         return _err(err)
     skill_dir, guard = _locate_for_write(name, "edit")
+    if guard:
+        return guard
+
+    from hermes_cli.lifecycle import invoke_hook
+    for hook_result in invoke_hook("pre_skill_edit", name=name, content=content):
+        if not isinstance(hook_result, dict):
+            continue
+        action = hook_result.get("action")
+        if action == "block":
+            return _err(hook_result.get("reason", "Skill edit blocked by plugin"))
+        if action == "handled":
+            return {"success": True, "message": f"Skill '{name}' edited by plugin.", "hook_handled": True}
+
     # SKILL.md always exists here (_find_skill requires it), so a blocked scan restores it.
-    if guard := guard or _guarded_write(name, skill_dir, skill_dir / "SKILL.md", "edit", "SKILL.md", content):
+    if guard := _guarded_write(name, skill_dir, skill_dir / "SKILL.md", "edit", "SKILL.md", content):
         return guard
     result = {
         "success": True, "message": f"Skill '{name}' updated (full rewrite).",
