@@ -494,6 +494,15 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "path": str(skill_dir), "_change": {"description": _description_preview(content)}}
     return _add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content)
 
+    # ── post_skill_edit hook (observer only) ──
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_post_hook
+        _invoke_post_hook("post_skill_edit", name=name, path=str(existing["path"]), success=True)
+    except Exception:
+        pass
+
+    return result
+
 
 def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = None,
                  replace_all: bool = False) -> Dict[str, Any]:
