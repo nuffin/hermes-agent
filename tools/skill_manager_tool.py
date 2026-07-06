@@ -1252,6 +1252,20 @@ def _patch_skill(
     # (tools/fuzzy_match.py), and its error carries a file_preview this layer
     # cannot produce. Duplicating it here would only shadow the richer message.
 
+    # ── pre_skill_patch hook (allow plugin handle / block) ──
+    from hermes_cli.plugins import invoke_hook as _invoke_patch_hook
+
+    for _hr in _invoke_patch_hook("pre_skill_patch", name=name, old_string=old_string,
+                                   new_string=new_string, file_path=file_path,
+                                   replace_all=replace_all):
+        if not isinstance(_hr, dict):
+            continue
+        _act = _hr.get("action")
+        if _act == "block":
+            return {"success": False, "error": _hr.get("reason", "Skill patch blocked by plugin")}
+        if _act == "handled":
+            return {"success": True, "message": f"Skill '{name}' patched by plugin.", "hook_handled": True}
+
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
@@ -1367,6 +1381,18 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         target must exist on disk. Validated here so the model can't claim an
         umbrella that doesn't exist.
     """
+    # ── pre_skill_delete hook (allow plugin handle / block) ──
+    from hermes_cli.plugins import invoke_hook as _invoke_del_hook
+
+    for _hr in _invoke_del_hook("pre_skill_delete", name=name):
+        if not isinstance(_hr, dict):
+            continue
+        _act = _hr.get("action")
+        if _act == "block":
+            return {"success": False, "error": _hr.get("reason", "Skill delete blocked by plugin")}
+        if _act == "handled":
+            return {"success": True, "message": f"Skill '{name}' deleted by plugin.", "hook_handled": True}
+
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
@@ -1487,6 +1513,19 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
+    # ── pre_skill_write_file hook (allow plugin handle / block) ──
+    from hermes_cli.plugins import invoke_hook as _invoke_wf_hook
+
+    for _hr in _invoke_wf_hook("pre_skill_write_file", name=name,
+                                file_path=file_path, file_content=file_content):
+        if not isinstance(_hr, dict):
+            continue
+        _act = _hr.get("action")
+        if _act == "block":
+            return {"success": False, "error": _hr.get("reason", "Skill write_file blocked by plugin")}
+        if _act == "handled":
+            return {"success": True, "message": f"File '{file_path}' written to skill '{name}' by plugin.", "hook_handled": True}
+
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
@@ -1538,6 +1577,18 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     err = _validate_file_path(file_path)
     if err:
         return {"success": False, "error": err}
+
+    # ── pre_skill_remove_file hook (allow plugin handle / block) ──
+    from hermes_cli.plugins import invoke_hook as _invoke_rf_hook
+
+    for _hr in _invoke_rf_hook("pre_skill_remove_file", name=name, file_path=file_path):
+        if not isinstance(_hr, dict):
+            continue
+        _act = _hr.get("action")
+        if _act == "block":
+            return {"success": False, "error": _hr.get("reason", "Skill remove_file blocked by plugin")}
+        if _act == "handled":
+            return {"success": True, "message": f"File '{file_path}' removed from skill '{name}' by plugin.", "hook_handled": True}
 
     existing = _find_skill(name)
     if not existing:
