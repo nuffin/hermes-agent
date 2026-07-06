@@ -761,6 +761,7 @@ def add_suppressed_name(skill_name: str) -> None:
         names.add(skill_name)
         _write_suppressed_names(names)
 
+
 def agent_created_report() -> List[Dict[str, Any]]:
     """DEPRECATED — use :func:`curated_report` instead.
 
