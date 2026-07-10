@@ -543,6 +543,12 @@ def build_top_level_parser():
             "Intended for one-shot/eval invocations with a hard ceiling."
         ),
     )
+    chat_parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        default=False,
+        help="Disable streaming output; wait for the full response before displaying",
+    )
     _inherited_flag(
         chat_parser,
         "--yolo",
