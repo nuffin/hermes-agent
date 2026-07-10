@@ -104,6 +104,28 @@ class CLIStreamMixin:
         agent's clear callback is bound symmetrically with the show callback."""
         return
 
+    def _on_interim_assistant(self, text: str, already_streamed: bool = False) -> None:
+        """Render an intermediate assistant message that appears between tool calls."""
+        if already_streamed or not self.interim_assistant_messages:
+            return
+        display_text = text.strip()
+        if not display_text:
+            return
+        if getattr(self, "_stream_buf", "") and getattr(self, "_stream_box_opened", False):
+            self._flush_stream()
+        try:
+            from cli import _DIM, _RST, _cprint
+            content_width = max(_terminal_columns() - 10, 20)
+            lines = textwrap.fill(display_text, width=content_width).split("\n")
+            max_line = max(map(len, lines), default=0)
+            box_width = max_line + 6
+            _cprint(f"\n{_DIM}╭─ ◆ {'─' * max(box_width - 6, 0)}╮{_RST}")
+            for line in lines:
+                _cprint(f"{_DIM}│{_RST}  {line}{' ' * (max_line - len(line))}  {_DIM}│{_RST}")
+            _cprint(f"{_DIM}╰{'─' * max(box_width - 2, 0)}╯{_RST}")
+        except Exception:
+            return
+
     def _current_reasoning_callback(self):
         """Return the active reasoning display callback for the current mode."""
         if self.show_reasoning and self.streaming_enabled:
