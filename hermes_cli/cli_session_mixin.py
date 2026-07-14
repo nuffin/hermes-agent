@@ -496,12 +496,13 @@ class CLISessionMixin:
         old_session_id = self.session_id
         # Plugin hook: on_session_pre_switch fires before session rotation.
         with contextlib.suppress(Exception):
-            from hermes_cli.plugins import invoke_hook
-            invoke_hook(
-                "on_session_pre_switch",
-                old_session_id=old_session_id,
-                cli=self,
-            )
+            from hermes_cli.plugins import has_hook, invoke_hook
+            if has_hook("on_session_pre_switch"):
+                invoke_hook(
+                    "on_session_pre_switch",
+                    old_session_id=old_session_id,
+                    cli=self,
+                )
         _boundary_snapshot = None
         if self.agent:
             if self.conversation_history:
@@ -564,13 +565,14 @@ class CLISessionMixin:
 
             # Plugin hook: on_session_post_switch fires after rotation.
             with contextlib.suppress(Exception):
-                from hermes_cli.plugins import invoke_hook
-                invoke_hook(
-                    "on_session_post_switch",
-                    old_session_id=old_session_id,
-                    new_session_id=self.session_id,
-                    cli=self,
-                )
+                from hermes_cli.plugins import has_hook, invoke_hook
+                if has_hook("on_session_post_switch"):
+                    invoke_hook(
+                        "on_session_post_switch",
+                        old_session_id=old_session_id,
+                        new_session_id=self.session_id,
+                        cli=self,
+                    )
 
             if self._session_db:
                 with contextlib.suppress(Exception):
