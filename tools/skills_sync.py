@@ -474,6 +474,7 @@ def sync_skills(quiet: bool = False, link: bool = False) -> dict:
             st.relocated.append(skill_name)
         if skill_name in external_index:
 
+
             _defer_to_external(st, skill_name, dest, bundled_hash)
         elif skill_name not in st.manifest:
             _install_new_skill(st, skill_name, skill_src, dest, bundled_hash, link=link)
