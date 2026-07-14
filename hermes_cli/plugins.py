@@ -196,6 +196,7 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+
     # Skill lifecycle hooks. Fired by skill_manage() before (pre) and after
     # (post) a new SKILL.md is written to disk.  Plugins may influence the
     # pre hook via return value:
@@ -249,6 +250,13 @@ VALID_HOOKS: Set[str] = {
     #   None / {}              → default: _find_skill + delete/archive
     # Kwargs: name
     "pre_skill_delete",
+
+    # CLI-local lifecycle observers. ``pre_command`` above is the shared
+    # CLI/gateway observer; these two retain the CLI's post-dispatch and
+    # successful-exit boundaries without changing command control flow.
+    "post_command",
+    "on_quit",
+
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as

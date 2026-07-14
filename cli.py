@@ -3275,6 +3275,42 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         method_name, pass_arg = entry
         handler = getattr(self, method_name)
         result = handler(cmd_original) if pass_arg else handler()
+
+        # ``on_quit`` is distinct from the ordinary post-dispatch observer:
+        # fire it only for a successful /quit or /exit immediately before the
+        # REPL exits. Invalid exit arguments keep the REPL alive and do not
+        # constitute a quit lifecycle event.
+        if canonical == "quit":
+            if result is False:
+                try:
+                    from hermes_cli.plugins import has_hook, invoke_hook
+                    if has_hook("on_quit"):
+                        invoke_hook(
+                            "on_quit",
+                            command="quit",
+                            raw=cmd_original,
+                            session_id=self.session_id,
+                            cli=self,
+                        )
+                except Exception:
+                    pass
+            return result is not False
+
+        # ``post_command`` observes a completed non-quit command handler.
+        # The has_hook guard keeps the normal CLI dispatch path cheap when no
+        # plugin subscribes; plugin failures must never alter command results.
+        try:
+            from hermes_cli.plugins import has_hook, invoke_hook
+            if has_hook("post_command"):
+                invoke_hook(
+                    "post_command",
+                    command=canonical,
+                    raw=cmd_original,
+                    session_id=self.session_id,
+                    cli=self,
+                )
+        except Exception:
+            pass
         return result is not False
 
     def _process_unregistered_slash(self, cmd_original: str, cmd_lower: str) -> bool:
