@@ -11084,16 +11084,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # double-fire when process_command() recursively expands an alias.
         if _cmd_def is not None and not getattr(self, "_pre_command_fired", False):
             self._pre_command_fired = True
-            from hermes_cli.plugins import fire_pre_command_hook
-            _rest_parts = cmd_original.split(None, 1)
-            fire_pre_command_hook(
-                surface="cli",
-                command=canonical,
-                alias_used=_base_word,
-                args_raw=_rest_parts[1].strip() if len(_rest_parts) > 1 else "",
-                session_key=getattr(self, "session_id", None),
-                platform="cli",
-            )
+            from hermes_cli.plugins import fire_pre_command_hook, has_hook
+            if has_hook("pre_command"):
+                _rest_parts = cmd_original.split(None, 1)
+                fire_pre_command_hook(
+                    surface="cli",
+                    command=canonical,
+                    alias_used=_base_word,
+                    args_raw=_rest_parts[1].strip() if len(_rest_parts) > 1 else "",
+                    session_key=getattr(self, "session_id", None),
+                    platform="cli",
+                )
 
         # A bare `/resume` prompt is one-shot: any command other than the
         # resume/sessions handlers (which manage the pending state themselves)
@@ -11107,14 +11108,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _is_quit = (canonical in {"quit", "exit"})
         if not _is_quit:
             try:
-                from hermes_cli.plugins import invoke_hook as _post_cmd_hook
-                _post_cmd_hook(
-                    "post_command",
-                    command=canonical,
-                    raw=cmd_original,
-                    session_id=self.session_id,
-                    cli=self,
-                )
+                from hermes_cli.plugins import has_hook, invoke_hook
+                if has_hook("post_command"):
+                    invoke_hook(
+                        "post_command",
+                        command=canonical,
+                        raw=cmd_original,
+                        session_id=self.session_id,
+                        cli=self,
+                    )
             except Exception:
                 pass
 
@@ -11132,14 +11134,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Plugin hook: on_quit — fires before CLI exits so plugins
             # can auto-title, compress conversation, or save state.
             try:
-                from hermes_cli.plugins import invoke_hook as _quit_hook
-                _quit_hook(
-                    "on_quit",
-                    command="quit",
-                    raw=cmd_original,
-                    session_id=self.session_id,
-                    cli=self,
-                )
+                from hermes_cli.plugins import has_hook, invoke_hook
+                if has_hook("on_quit"):
+                    invoke_hook(
+                        "on_quit",
+                        command="quit",
+                        raw=cmd_original,
+                        session_id=self.session_id,
+                        cli=self,
+                    )
             except Exception:
                 pass
             return False
