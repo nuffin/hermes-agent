@@ -494,6 +494,14 @@ class CLISessionMixin:
             _sync_process_session_id, datetime)
         from hermes_cli.cli_model_switch_mixin import _resolve_cli_reasoning
         old_session_id = self.session_id
+        # Plugin hook: on_session_pre_switch fires before session rotation.
+        with contextlib.suppress(Exception):
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook(
+                "on_session_pre_switch",
+                old_session_id=old_session_id,
+                cli=self,
+            )
         _boundary_snapshot = None
         if self.agent:
             if self.conversation_history:
@@ -553,6 +561,16 @@ class CLISessionMixin:
                     self.agent._todo_store = TodoStore()
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
+
+            # Plugin hook: on_session_post_switch fires after rotation.
+            with contextlib.suppress(Exception):
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "on_session_post_switch",
+                    old_session_id=old_session_id,
+                    new_session_id=self.session_id,
+                    cli=self,
+                )
 
             if self._session_db:
                 with contextlib.suppress(Exception):
