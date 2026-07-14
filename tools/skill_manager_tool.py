@@ -381,7 +381,9 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
 
 def _run_pre_skill_hook(hook_name: str, **kwargs) -> Optional[Dict[str, Any]]:
     """Return a normalized block/handled response, or None to continue mutation."""
-    from hermes_cli.lifecycle import invoke_hook
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+    if not has_hook(hook_name):
+        return None
     for hook_result in invoke_hook(hook_name, **kwargs):
         if not isinstance(hook_result, dict):
             continue
@@ -438,9 +440,11 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
 
-    from hermes_cli.lifecycle import invoke_hook
+    from hermes_cli.lifecycle import has_hook, invoke_hook
     skill_dir_override = None
-    for hook_result in invoke_hook("pre_skill_create", name=name, content=content, category=category):
+    hook_results = (invoke_hook("pre_skill_create", name=name, content=content, category=category)
+                    if has_hook("pre_skill_create") else ())
+    for hook_result in hook_results:
         if not isinstance(hook_result, dict):
             continue
         action = hook_result.get("action")
@@ -454,7 +458,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             break
         if action == "handled":
             result = {"success": True, "message": f"Skill '{name}' created by plugin.", "hook_handled": True}
-            invoke_hook("post_skill_create", name=name, category=category or "", path="", success=True)
+            if has_hook("post_skill_create"):
+                invoke_hook("post_skill_create", name=name, category=category or "", path="", success=True)
             return result
 
     skill_dir = skill_dir_override or _resolve_skill_dir(name, category)
@@ -478,7 +483,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                 f"skill_manage(action='write_file', name='{name}', file_path='references/example.md', "
                 "file_content='...')"}
     _attach_lint_findings(_add_description_prompt_preview(result, content), skill_md)
-    invoke_hook("post_skill_create", name=name, category=category or "", path=str(skill_dir), success=True)
+    if has_hook("post_skill_create"):
+        invoke_hook("post_skill_create", name=name, category=category or "", path=str(skill_dir), success=True)
     return result
 
 
@@ -501,8 +507,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "success": True, "message": f"Skill '{name}' updated (full rewrite).",
         "path": str(skill_dir), "_change": {"description": _description_preview(content)}}
     result = _add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content)
-    from hermes_cli.lifecycle import invoke_hook
-    invoke_hook("post_skill_edit", name=name, path=str(skill_dir), success=True)
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+    if has_hook("post_skill_edit"):
+        invoke_hook("post_skill_edit", name=name, path=str(skill_dir), success=True)
     return result
 
 
