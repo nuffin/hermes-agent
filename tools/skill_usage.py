@@ -631,6 +631,13 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         return False, f"skill '{skill_name}' not found"
     if is_external_skill_path(skill_dir):
         return False, _external_read_only_message(skill_name)
+    # Linked bundled skills retain an external source of truth. Curation must not mutate it.
+    if skill_dir.is_symlink():
+        return False, (
+            f"{skill_name!r} is a symlinked skill (real content at {skill_dir.resolve()}). "
+            "It is managed externally; remove the symlink manually if needed."
+        )
+
     # Flatten under the skill NAME, not the directory name: `mlops/training/accelerate` is the skill
     # `huggingface-accelerate`, and restore/list/purge all key on the name.
     dest = _archive_dir() / skill_name
@@ -677,16 +684,28 @@ def _match_skill_dir(skill_mds: Iterable[Path], skill_name: str) -> Optional[Pat
 
 
 def _find_skill_dir(skill_name: str) -> Optional[Path]:
-    """Skill dir by frontmatter ``name`` (flat or nested); the gated index iterator sees only the active org mirror."""
+    # Find a local skill by frontmatter name, including direct symlink entries.
     from agent.skill_utils import iter_skill_index_files
     base = _skills_dir()
-    # Linked bundled skills point into an externally managed checkout.  Do not
-    # let curator discovery follow those links and mutate their source tree.
-    return _match_skill_dir(
-        (p for p in iter_skill_index_files(base, "SKILL.md")
-         if not is_external_skill_path(p) and not p.parent.is_symlink()),
+    if not base.exists():
+        return None
+    found = _match_skill_dir(
+        (p for p in iter_skill_index_files(base, "SKILL.md") if not is_external_skill_path(p)),
         skill_name,
-    ) if base.exists() else None
+    )
+    if found is not None:
+        return found
+    # The indexed walk does not traverse directory symlinks, but archive_skill
+    # must still recognize and reject a directly linked bundled skill.
+    for entry in base.rglob("*"):
+        if not entry.is_symlink() or not entry.is_dir():
+            continue
+        skill_md = entry.resolve() / "SKILL.md"
+        if (skill_md.is_file() and not is_excluded_skill_path(skill_md)
+                and not is_external_skill_path(skill_md)
+                and _read_skill_name(skill_md, fallback=entry.name) == skill_name):
+            return entry
+    return None
 
 
 def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
@@ -765,6 +784,7 @@ def add_suppressed_name(skill_name: str) -> None:
     if skill_name not in names:
         names.add(skill_name)
         _write_suppressed_names(names)
+
 
 
 
