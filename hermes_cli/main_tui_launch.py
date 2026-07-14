@@ -831,8 +831,6 @@ def _pin_kanban_board_env() -> None:
     ``kanban.allow_session_board_switch: true`` leaves the environment unpinned,
     so a successful ``kanban boards switch`` takes effect in the current session.
     """
-    if os.environ.get("HERMES_KANBAN_BOARD"):
-        return
     try:
         from hermes_cli.config import load_config
         kanban_cfg = load_config().get("kanban") or {}
@@ -840,6 +838,8 @@ def _pin_kanban_board_env() -> None:
             return
     except Exception:
         pass
+    if os.environ.get("HERMES_KANBAN_BOARD"):
+        return
     with contextlib.suppress(Exception):
         from hermes_cli.kanban_db import get_current_board
         os.environ["HERMES_KANBAN_BOARD"] = get_current_board()
