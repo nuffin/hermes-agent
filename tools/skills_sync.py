@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Seed and update bundled skills using copies by default or explicit directory symlinks.
 
+
 The manifest accepts v1 ``name``, v2 ``name:hash``, and v3
 ``name:mode[:hash]`` records. Symlink entries remain links while their source
 checkout is clean; a dirty checkout is never modified by this sync operation.
@@ -472,6 +473,7 @@ def sync_skills(quiet: bool = False, link: bool = False) -> dict:
         if not dest.exists() and not dest.is_symlink() and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
             st.relocated.append(skill_name)
         if skill_name in external_index:
+
             _defer_to_external(st, skill_name, dest, bundled_hash)
         elif skill_name not in st.manifest:
             _install_new_skill(st, skill_name, skill_src, dest, bundled_hash, link=link)

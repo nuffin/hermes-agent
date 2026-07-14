@@ -680,8 +680,13 @@ def _find_skill_dir(skill_name: str) -> Optional[Path]:
     """Skill dir by frontmatter ``name`` (flat or nested); the gated index iterator sees only the active org mirror."""
     from agent.skill_utils import iter_skill_index_files
     base = _skills_dir()
-    return _match_skill_dir((p for p in iter_skill_index_files(base, "SKILL.md") if not is_external_skill_path(p)),
-                            skill_name) if base.exists() else None
+    # Linked bundled skills point into an externally managed checkout.  Do not
+    # let curator discovery follow those links and mutate their source tree.
+    return _match_skill_dir(
+        (p for p in iter_skill_index_files(base, "SKILL.md")
+         if not is_external_skill_path(p) and not p.parent.is_symlink()),
+        skill_name,
+    ) if base.exists() else None
 
 
 def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
@@ -760,6 +765,7 @@ def add_suppressed_name(skill_name: str) -> None:
     if skill_name not in names:
         names.add(skill_name)
         _write_suppressed_names(names)
+
 
 
 def agent_created_report() -> List[Dict[str, Any]]:
