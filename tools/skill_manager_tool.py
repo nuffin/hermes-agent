@@ -492,7 +492,13 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     if err := _validate_frontmatter(content) or _validate_content_size(content):
         return _err(err)
-    if hook_result := _run_pre_skill_hook("pre_skill_edit", name=name, content=content):
+    existing = _find_skill(name)
+    old_content = None
+    if existing:
+        with suppress(OSError):
+            old_content = (existing["path"] / "SKILL.md").read_text(encoding="utf-8")
+    if hook_result := _run_pre_skill_hook(
+            "pre_skill_edit", name=name, content=content, old_content=old_content):
         if hook_result.get("hook_handled"):
             hook_result["message"] = f"Skill '{name}' edited by plugin."
         return hook_result
@@ -650,6 +656,10 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     skill_dir, guard = _locate_for_write(name, "remove_file", org_guard=False)
     if guard:
         return guard
+    if hook_result := _run_pre_skill_hook("pre_skill_remove_file", name=name, file_path=file_path):
+        if hook_result.get("hook_handled"):
+            hook_result["message"] = f"File '{file_path}' removed from skill '{name}' by plugin."
+        return hook_result
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if err:
         return err
@@ -659,10 +669,6 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
     if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
         return read_guard
-    if hook_result := _run_pre_skill_hook("pre_skill_remove_file", name=name, file_path=file_path):
-        if hook_result.get("hook_handled"):
-            hook_result["message"] = f"File '{file_path}' removed from skill '{name}' by plugin."
-        return hook_result
     target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
