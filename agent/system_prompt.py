@@ -293,7 +293,9 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
         memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
-        SKILL_GRAPH_GUIDANCE if getattr(agent, "_skill_graph_mode", False) else None,
+        SKILL_GRAPH_GUIDANCE if (
+            getattr(agent, "_skill_graph_mode", False) and "skill_graph_search" in names
+        ) else None,
         _kanban_guidance,
     ]
     return " ".join(g for g in tool_guidance if g) or None
@@ -302,7 +304,10 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
     categories to names-only — never hidden, every name stays visible."""
-    if getattr(agent, "_skill_graph_mode", False):
+    if (
+        getattr(agent, "_skill_graph_mode", False)
+        and "skill_graph_search" in getattr(agent, "valid_tool_names", [])
+    ):
         return ""
     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
@@ -675,7 +680,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
     # The graph protocol belongs to the stable identity tier: it is fixed for
     # the life of a session and does not expand the prompt into a flat catalog.
-    if getattr(agent, "_skill_graph_mode", False):
+    if (
+        getattr(agent, "_skill_graph_mode", False)
+        and "skill_graph_search" in getattr(agent, "valid_tool_names", [])
+    ):
         stable_parts.append(SKILL_GRAPH_IDENTITY)
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
