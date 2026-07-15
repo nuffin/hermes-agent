@@ -6378,8 +6378,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # into the input area and requires Enter to send.
             task = target_buffer.open_in_editor(validate_and_handle=False)
             editor_auto_submit = (
-                (self.config or {}).get("display", {}).get("editor_auto_submit", True)
-            )
+                getattr(self, "config", None) or {}
+            ).get("display", {}).get("editor_auto_submit", True)
             if editor_auto_submit and task is not None and hasattr(task, "add_done_callback"):
                 task.add_done_callback(
                     lambda _t, b=target_buffer: self._submit_editor_buffer(b)
