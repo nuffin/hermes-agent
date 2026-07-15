@@ -491,9 +491,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Dynamic skill discovery is an agent operating protocol, distinct from the
     # graph backend. Keep it in the session-stable identity tier so it neither
     # expands the initial prompt into a flat catalog nor changes across turns.
-    # The graph's build_skills_index hook later supplies the bootstrap index and
-    # preserves discovery across bundled, installed, external, and source dirs.
-    if getattr(agent, "_skill_graph_mode", False) and "skill_graph_search" in getattr(agent, "valid_tool_names", []):
+    # Only advertise the protocol when its search tool is actually available.
+    if (
+        getattr(agent, "_skill_graph_mode", False)
+        and "skill_graph_search" in getattr(agent, "valid_tool_names", [])
+    ):
         stable_parts.append(SKILL_GRAPH_IDENTITY)
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
