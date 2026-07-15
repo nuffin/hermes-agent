@@ -11,6 +11,11 @@ from rich.markup import escape as _escape
 
 from utils import base_url_host_matches
 
+# Record process start time for session-resume detection.
+# Compared against the last message timestamp in a resumed session
+# to determine whether the conversation history predates this process.
+_PROCESS_START: float = time.time()
+
 
 # A module import happens once per CLI process.  Session objects, by contrast,
 # can be loaded long after the process starts, so their own construction time
