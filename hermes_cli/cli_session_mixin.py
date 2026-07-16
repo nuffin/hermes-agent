@@ -563,17 +563,6 @@ class CLISessionMixin:
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
-            # Plugin hook: session_switched fires after rotation.
-            with contextlib.suppress(Exception):
-                from hermes_cli.plugins import has_hook, invoke_hook
-                if has_hook("session_switched"):
-                    invoke_hook(
-                        "session_switched",
-                        old_session_id=old_session_id,
-                        new_session_id=self.session_id,
-                        cli=self,
-                    )
-
             if self._session_db:
                 with contextlib.suppress(Exception):
                     self.agent._session_db_created = False
@@ -602,6 +591,17 @@ class CLISessionMixin:
                         self.session_id, parent_session_id=old_session_id or "",
                         reset=True, reason="new_session")
             self._notify_session_boundary("on_session_reset")
+            # The durable row, title, memory handoff, and reset boundary are
+            # complete before plugins observe the new session identity.
+            with contextlib.suppress(Exception):
+                from hermes_cli.plugins import has_hook, invoke_hook
+                if has_hook("session_switched"):
+                    invoke_hook(
+                        "session_switched",
+                        old_session_id=old_session_id,
+                        new_session_id=self.session_id,
+                        cli=self,
+                    )
 
         if not silent:
             if title:
