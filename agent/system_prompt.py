@@ -555,6 +555,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _avail.append(f"  {_gn} — {_gp[:100]}")
         stable_parts.append("Available Skills\n" + "\n".join(_avail) + "\n")
 
+
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a
     # dangling reference in two cases — no skill tools in the toolset
