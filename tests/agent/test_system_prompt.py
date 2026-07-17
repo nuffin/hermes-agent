@@ -403,3 +403,66 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+def _make_skill_graph_agent(**overrides):
+    return _make_agent(
+        valid_tool_names=["skill_graph_search"],
+        _skill_graph_mode=True,
+        _task_completion_guidance=False,
+        _tool_use_enforcement=False,
+        _environment_probe=False,
+        **overrides,
+    )
+
+
+def test_gateway_extras_from_routing_extensions(tmp_path, monkeypatch):
+    ext_file = tmp_path / "routing-extensions.md"
+    ext_file.write_text(
+        "## Pre-installed Gateways (Extensions)\n\n"
+        "| Gateway Skill | Purpose |\n|---|---|\n"
+        "| `project-directories` | Project map |\n| `troupe-lookup` | Roster |\n"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"skills": {"config": {"skill-graph": {"extensions_file": str(ext_file)}}}},
+    )
+    with patch("run_agent.load_soul_md", return_value=""), patch(
+        "run_agent.build_context_files_prompt", return_value=""
+    ):
+        stable = build_system_prompt_parts(_make_skill_graph_agent())["stable"]
+    assert "Available Skills" in stable
+    assert "project-directories" in stable
+    assert "troupe-lookup" in stable
+
+
+def test_gateway_extras_missing_file_no_crash(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"skills": {"config": {"skill-graph": {"extensions_file": "/missing"}}}},
+    )
+    with patch("run_agent.load_soul_md", return_value=""), patch(
+        "run_agent.build_context_files_prompt", return_value=""
+    ):
+        stable = build_system_prompt_parts(_make_skill_graph_agent())["stable"]
+    assert "Available Skills" in stable
+    assert "skill-graph" in stable
+    assert "project-directories" not in stable
+
+
+def test_gateway_extras_no_extensions_file_config(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"skills": {"config": {"skill-graph": {}}}})
+    with patch("run_agent.load_soul_md", return_value=""), patch(
+        "run_agent.build_context_files_prompt", return_value=""
+    ):
+        stable = build_system_prompt_parts(_make_skill_graph_agent())["stable"]
+    assert "Available Skills" in stable
+    assert "skill-graph" in stable
+
+
+def test_gateway_extras_not_injected_without_skill_graph_mode():
+    with patch("run_agent.load_soul_md", return_value=""), patch(
+        "run_agent.build_context_files_prompt", return_value=""
+    ):
+        stable = build_system_prompt_parts(_make_agent(valid_tool_names=["skills_list", "skill_view"]))["stable"]
+    assert "Available Skills\n  skill-graph" not in stable
