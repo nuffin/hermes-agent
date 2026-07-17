@@ -313,6 +313,22 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return len(cleaned) >= min_length and cleaned.lower() not in _PLACEHOLDER_SECRET_VALUES
 
 
+def _is_provider_enabled(provider_id: str) -> bool:
+    """Return False when config.yaml has ``providers.<id>.enabled`` set to false."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        config = read_raw_config()
+        providers_cfg = config.get("providers")
+        if isinstance(providers_cfg, dict):
+            entry = providers_cfg.get(provider_id)
+            if isinstance(entry, dict) and entry.get("enabled") is False:
+                return False
+    except Exception:
+        pass
+    return True
+
+
 # Known API-key prefixes per provider. Only listed providers get prefix validation; everyone else
 # is fail-open. Keeps an obviously malformed key in .env (truncated paste, wrong provider's key)
 # from silently shadowing a valid credential-pool entry and producing opaque 401s.
@@ -361,6 +377,9 @@ def _model_level_key_env(provider_id: str) -> str:
 
 def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
+    if not _is_provider_enabled(provider_id):
+        return "", ""
+
     if provider_id == "copilot":
         # The dedicated copilot auth module does proper token validation/exchange.
         try:
