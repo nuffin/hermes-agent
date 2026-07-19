@@ -877,6 +877,7 @@ def _overlay_has_creds(b: _PickerBuild, pid: str, hermes_slug: str, overlay) -> 
 def _lap_overlay_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None:
     """Section 2: Hermes-only providers (nous, openai-codex, copilot, opencode-go, ...)."""
     from agent.models_dev import PROVIDER_TO_MODELS_DEV
+    from hermes_cli.auth import _is_provider_enabled
     from hermes_cli.model_switch import _declared_model_ids
     from hermes_cli.providers import HERMES_OVERLAYS
 
@@ -886,6 +887,8 @@ def _lap_overlay_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
     for pid, overlay in HERMES_OVERLAYS.items():
         hermes_slug = mdev_to_hermes.get(pid, pid)
         if _skip(b.seen_slugs, b.excluded, pid, hermes_slug):
+            continue
+        if not _is_provider_enabled(hermes_slug):
             continue
         if not _overlay_has_creds(b, pid, hermes_slug, overlay):
             continue
