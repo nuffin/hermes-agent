@@ -2005,6 +2005,10 @@ _API_KEY_BASE_URL_RESOLVERS: Dict[str, Callable[[str, str, str], str]] = {
 
 def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve API key and base URL for an API-key provider."""
+    if not _is_provider_enabled(provider_id):
+        return {
+            "provider": provider_id, "api_key": "", "base_url": "", "source": "disabled"}
+
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         raise AuthError(
@@ -2036,6 +2040,11 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
+    if not _is_provider_enabled(provider_id):
+        return {
+            "provider": provider_id, "api_key": "", "base_url": "", "command": "", "args": [],
+            "source": "disabled"}
+
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         raise AuthError(
