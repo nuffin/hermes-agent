@@ -7558,7 +7558,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         display_text = text.strip()
         if not display_text:
             return
-        if hasattr(self, "_stream_buf") and self._stream_buf:
+        if hasattr(self, "_stream_buf") and self._stream_buf and getattr(self, "_stream_box_opened", False):
             self._flush_stream()
         # Lightweight box frame with left border — distinguishes
         # interim commentary from tool output and final response panel.
@@ -21621,6 +21621,7 @@ def main(
                         # printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        cli.agent.interim_assistant_callback = None
                         cli.agent.reasoning_callback = None
                         # Inline-diff and progress callbacks print directly to
                         # stdout and are gated by NEITHER quiet_mode nor
