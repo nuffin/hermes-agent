@@ -8077,7 +8077,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         display_text = text.strip()
         if not display_text:
             return
-        if hasattr(self, "_stream_buf") and self._stream_buf:
+        if hasattr(self, "_stream_buf") and self._stream_buf and getattr(self, "_stream_box_opened", False):
             self._flush_stream()
         # Lightweight box frame with left border — distinguishes
         # interim commentary from tool output and final response panel.
@@ -22279,6 +22279,7 @@ def main(
                         # (they check agent.tool_progress_mode, initialized
                         # from display.tool_progress at construction).
                         cli.agent.tool_progress_mode = "off"
+                        cli.agent.interim_assistant_callback = None
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
