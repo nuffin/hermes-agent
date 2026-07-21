@@ -599,6 +599,8 @@ def init_agent(
     gateway_session_key: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
+    memory_mode: str = "full",
+    # Deprecated — use memory_mode instead (remove after 2026-08)
     skip_memory: bool = False,
     skip_background_review: bool = False,
     session_db=None,
@@ -1810,7 +1812,17 @@ def init_agent(
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
-    
+
+    # Backward compatibility for deprecated skip_memory parameter
+    if skip_memory:
+        import warnings
+        warnings.warn(
+            "skip_memory is deprecated, use memory_mode='off' instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        memory_mode = "off"
+
     # Load config once for memory, skills, and compression sections
     try:
         from hermes_cli.config import load_config_readonly as _load_agent_config
@@ -1871,6 +1883,7 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    agent._memory_mode = memory_mode
     # skip_memory=True skips the external memory *provider*. Flush/background
     # agents can still pass enabled_toolsets=["memory"] so the built-in file
     # store exists and the memory tool does not fail with store=None (#65429).
@@ -1883,7 +1896,7 @@ def init_agent(
     _memory_toolset_requested = (
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
-    if not skip_memory or _memory_toolset_requested:
+    if memory_mode != "off" and (not skip_memory or _memory_toolset_requested):
         try:
             from tools.memory_tool import (
                 get_builtin_memory_config,
@@ -1912,7 +1925,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if memory_mode != "off":
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
