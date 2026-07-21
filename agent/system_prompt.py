@@ -525,7 +525,7 @@ def _memory_parts(agent: Any) -> List[str]:
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
     tools the toolset config gated off)."""
     parts: List[str] = []
-    if agent._memory_store:
+    if agent._memory_store and getattr(agent, "_memory_mode", "full") != "on_demand":
         for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
             block = agent._memory_store.format_for_system_prompt(kind) if enabled else None
             if block:
