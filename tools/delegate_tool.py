@@ -1486,6 +1486,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    memory_mode: str = "on_demand",
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1586,6 +1587,9 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+
+    if memory_mode != "off" and "memory" not in child_toolsets:
+        child_toolsets.append("memory")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -1829,7 +1833,7 @@ def _build_child_agent(
                 log_prefix=f"[subagent-{task_index}]",
                 platform="subagent",
                 skip_context_files=True,
-                skip_memory=True,
+                memory_mode=memory_mode,
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,
@@ -2004,7 +2008,7 @@ def _dump_subagent_timeout_diagnostic(
         _w("## Child config")
         for attr in (
             "model", "provider", "api_mode", "base_url", "max_iterations",
-            "quiet_mode", "skip_memory", "skip_context_files", "platform",
+            "quiet_mode", "memory_mode", "skip_context_files", "platform",
             "_delegate_role", "_delegate_depth",
         ):
             try:
@@ -3436,6 +3440,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    memory_mode: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3486,6 +3491,7 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    effective_memory_mode = memory_mode if memory_mode in {"off", "on_demand", "full"} else "on_demand"
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3688,6 +3694,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            memory_mode=effective_memory_mode,
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
