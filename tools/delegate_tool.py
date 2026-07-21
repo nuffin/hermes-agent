@@ -1384,7 +1384,7 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
             skip_context_files=True,
-            skip_memory=True,
+            memory_mode=memory_mode,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
             session_db=getattr(parent_agent, "_session_db", None),
