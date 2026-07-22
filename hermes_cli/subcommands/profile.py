@@ -26,7 +26,7 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         help="Full copy of active profile (all state, excluding per-profile history and messaging channels)")
     profile_create.add_argument(
         "--clone-from", metavar="SOURCE",
-        help="Source profile to clone from; implies --clone unless --clone-all is set")
+        help="Source profile(s) to clone from (comma-separated); implies --clone unless --clone-all is set")
     profile_create.add_argument(
         "--clone-channels", action="store_true",
         help="Also copy the source's messaging channels (bot tokens, allowlists, platform sections). "
@@ -48,6 +48,13 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         help="One- or two-sentence description of what this profile is good at. "
              "Used by the kanban decomposer to route tasks based on role instead "
              "of profile name alone. Skip and add later via `hermes profile describe`.")
+
+    profile_inherit = profile_subparsers.add_parser("inherit", help="Create a profile that inherits from one or more parents")
+    profile_inherit.add_argument("sources", help="Source profile(s) to inherit from (comma-separated)")
+    profile_inherit.add_argument("target", help="Profile name for the new child profile")
+    profile_inherit.add_argument("--no-alias", action="store_true", help="Skip wrapper script creation")
+    profile_inherit.add_argument("--no-skills", action="store_true", help="Create an empty profile with no bundled skills")
+    profile_inherit.add_argument("--description", default=None, help="One- or two-sentence description")
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")

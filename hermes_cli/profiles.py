@@ -1012,6 +1012,136 @@ def _bootstrap_profile_dir(profile_dir: Path, source_dir: Optional[Path],
         _clone_file(source_dir, profile_dir, SYNC_MANIFEST_NAME)
 
 
+def _load_profile_yaml(profile_dir: Path) -> dict:
+    """Load a profile config as a mapping, or return an empty mapping when absent."""
+    config_path = profile_dir / "config.yaml"
+    if not config_path.is_file():
+        return {}
+    try:
+        from utils import fast_safe_load
+        with open(config_path, "r", encoding="utf-8") as stream:
+            data = fast_safe_load(stream) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _deep_merge_with_conflicts(base: dict, overlay: dict, prefix: str = "",
+                               base_label: str = "base", overlay_label: str = "overlay") -> Tuple[dict, list]:
+    """Merge mappings while retaining the first differing value and reporting its provenance."""
+    merged, conflicts = dict(base), []
+    for key, overlay_value in overlay.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in merged:
+            merged[key] = overlay_value
+        elif isinstance(merged[key], dict) and isinstance(overlay_value, dict):
+            merged[key], nested = _deep_merge_with_conflicts(merged[key], overlay_value, path, base_label, overlay_label)
+            conflicts.extend(nested)
+        elif merged[key] != overlay_value:
+            conflicts.append((path, merged[key], overlay_value, base_label, overlay_label))
+    return merged, conflicts
+
+
+def _resolve_inherited_config(profile_name: str, visited: Optional[set] = None) -> Tuple[dict, List[str]]:
+    """Resolve ``inherited_from`` recursively; the child overrides every ancestor."""
+    visited = set() if visited is None else set(visited)
+    canon = _canon_valid(profile_name)
+    if canon in visited:
+        raise ValueError(f"Circular inherited_from detected in profile '{canon}'")
+    visited.add(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"Profile '{canon}' does not exist at {profile_dir}")
+    own_config = _load_profile_yaml(profile_dir)
+    parents = own_config.pop("inherited_from", None)
+    if parents is None:
+        parent_names = []
+    elif isinstance(parents, str):
+        parent_names = [parents]
+    elif isinstance(parents, list) and all(isinstance(parent, str) for parent in parents):
+        parent_names = parents
+    else:
+        raise ValueError(f"inherited_from in profile '{canon}' must be a string or list of strings")
+    inherited, warnings = {}, []
+    for parent in parent_names:
+        parent_config, parent_warnings = _resolve_inherited_config(parent, visited)
+        inherited, conflicts = _deep_merge_with_conflicts(inherited, parent_config)
+        warnings.extend(parent_warnings)
+        warnings.extend(f"[inherited_from] {path}: {left!r} vs {right!r} (using first ancestor's value)"
+                        for path, left, right, _, _ in conflicts)
+    return _deep_merge_with_conflicts(own_config, inherited)[0], warnings
+
+
+def _resolve_conflicts_interactively(conflicts: list) -> dict:
+    """Let an interactive creator choose source values; EOF keeps the first source."""
+    resolutions = {}
+    for number, (path, left, right, left_label, right_label) in enumerate(conflicts, 1):
+        print(f"\n[{number}] {path}\n    1) {left_label}: {left!r}\n    2) {right_label}: {right!r}\n    3) Skip (don't set)")
+        while True:
+            try:
+                choice = input("    Choose [1-3]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                choice = "1"
+            if choice == "1":
+                resolutions[path] = left
+                break
+            if choice == "2":
+                resolutions[path] = right
+                break
+            if choice == "3":
+                resolutions[path] = None
+                break
+            print("    Invalid choice. Enter 1, 2, or 3.")
+    return resolutions
+
+
+def _apply_resolutions(config: dict, resolutions: dict) -> dict:
+    """Apply dotted-key conflict choices without mutating the supplied mapping."""
+    import copy
+    result = copy.deepcopy(config)
+    for path, value in resolutions.items():
+        if value is None:
+            continue
+        target = result
+        for key in path.split(".")[:-1]:
+            target = target.setdefault(key, {})
+        target[path.split(".")[-1]] = value
+    return result
+
+
+def _collect_inherited_from_union(profile_names: List[str]) -> List[str]:
+    """Return ordered, de-duplicated source ancestors (not the copied sources themselves)."""
+    result, seen = [], set()
+    for name in profile_names:
+        parents = _load_profile_yaml(get_profile_dir(_canon_valid(name))).get("inherited_from", [])
+        if isinstance(parents, str):
+            parents = [parents]
+        if isinstance(parents, list):
+            for parent in parents:
+                if isinstance(parent, str) and parent not in seen:
+                    seen.add(parent)
+                    result.append(parent)
+    return result
+
+
+def _merge_and_flatten_configs(source_names: List[str], *, interactive: bool = False) -> Tuple[dict, List[str]]:
+    """Merge effective source configs, retaining source order unless the user chooses otherwise."""
+    merged, warnings, conflicts, first_label = {}, [], [], ""
+    for name in source_names:
+        config, source_warnings = _resolve_inherited_config(name)
+        warnings.extend(source_warnings)
+        if not first_label:
+            merged, first_label = config, name
+            continue
+        merged, found = _deep_merge_with_conflicts(merged, config, base_label=first_label, overlay_label=name)
+        conflicts.extend(found)
+        warnings.extend(f"[clone merge] {path}: {left!r} vs {right!r}" for path, left, right, _, _ in found)
+    if interactive and conflicts:
+        merged = _apply_resolutions(merged, _resolve_conflicts_interactively(conflicts))
+    return merged, warnings
+
+
 def create_profile(
     name: str, clone_from: Optional[str] = None, clone_all: bool = False, clone_config: bool = False,
     no_alias: bool = False, no_skills: bool = False, description: Optional[str] = None,
@@ -1043,6 +1173,20 @@ def create_profile(
     canon = _canon_valid(name)
     if canon == "default":
         raise ValueError("Cannot create a profile named 'default' — it is the built-in profile (~/.hermes).")
+    source_names: List[str] = []
+    if clone_from is not None:
+        source_names = [_canon_valid(value.strip()) for value in clone_from.split(",") if value.strip()]
+        if not source_names:
+            raise ValueError("--clone-from requires at least one source profile")
+        if canon in source_names:
+            raise ValueError(f"Cannot clone a profile onto itself: source '{canon}' matches target '{canon}'")
+        missing = [source for source in source_names if not get_profile_dir(source).is_dir()]
+        if missing:
+            raise FileNotFoundError(f"Source profile '{missing[0]}' does not exist at {get_profile_dir(missing[0])}")
+        if clone_all and len(source_names) > 1:
+            raise ValueError("--clone-all does not support multiple sources; use --clone for a merged clone")
+        if clone_channels and len(source_names) > 1:
+            raise ValueError("--clone-channels requires exactly one source profile")
     profile_dir = get_profile_dir(canon)
     if profile_dir.exists() and not named_profile_has_identity(profile_dir):
         if named_profile_is_deleted(profile_dir):
@@ -1057,7 +1201,7 @@ def create_profile(
             )
     if profile_dir.exists():
         raise _profile_exists_error(canon)
-    source_dir = _resolve_clone_source(clone_from) if cloning else None
+    source_dir = _resolve_clone_source(source_names[0] if source_names else None) if cloning else None
     if source_dir is not None and clone_channels:
         from hermes_cli.profile_channels import clone_channels_refusal
         refusal = clone_channels_refusal(source_dir, clone_from or get_active_profile_name() or "default")
@@ -1079,6 +1223,18 @@ def create_profile(
             stripped = strip_channel_settings(staging, include_state=clone_all, source_dir=source_dir)
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
+        if len(source_names) > 1:
+            merged, warnings = _merge_and_flatten_configs(source_names, interactive=True)
+            for warning in warnings:
+                logger.warning("%s", warning)
+            merged.pop("inherited_from", None)
+            ancestors = _collect_inherited_from_union(source_names)
+            if ancestors:
+                merged["inherited_from"] = ancestors
+            import yaml
+            (staging / "config.yaml").write_text(yaml.safe_dump(merged, sort_keys=False, allow_unicode=True), encoding="utf-8")
+            from hermes_cli.profile_channels import strip_channel_settings
+            strip_channel_settings(staging, include_state=False, source_dir=source_dir)
         _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
         os.rename(staging, profile_dir)
     except BaseException:
@@ -1164,6 +1320,42 @@ def _live_default_multiplexer() -> bool:
         return recorded_served_profiles() is not None
     except Exception:
         return False
+
+
+def inherit_profile(source_names: List[str], target_name: str, *, no_alias: bool = False,
+                    no_skills: bool = False, description: Optional[str] = None) -> Path:
+    """Create a profile whose config resolves through one or more named parents."""
+    if not source_names:
+        raise ValueError("inherit requires at least one source profile")
+    canon = _canon_valid(target_name)
+    if canon == "default":
+        raise ValueError("Cannot create a profile named 'default' — it is the built-in profile (~/.hermes).")
+    parents = [_canon_valid(source) for source in source_names]
+    if canon in parents:
+        raise ValueError(f"Cannot inherit from self: source '{canon}' matches target '{canon}'")
+    for parent in parents:
+        if not get_profile_dir(parent).is_dir():
+            raise FileNotFoundError(f"Source profile '{parent}' does not exist at {get_profile_dir(parent)}")
+    profile_dir = get_profile_dir(canon)
+    if profile_dir.exists():
+        raise _profile_exists_error(canon)
+    _, warnings = _merge_and_flatten_configs(parents, interactive=True)
+    clear_named_profile_deleted(profile_dir)
+    staging = _clone_staging_dir(profile_dir)
+    try:
+        _bootstrap_profile_dir(staging, None)
+        import yaml
+        (staging / "config.yaml").write_text(yaml.safe_dump({"inherited_from": parents}, sort_keys=False), encoding="utf-8")
+        _finish_profile_layout(staging, no_skills=no_skills, clone_all=False, description=description)
+        os.rename(staging, profile_dir)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    for warning in warnings:
+        print(f"⚠  {warning}", file=sys.stderr)
+    _maybe_register_gateway_service(canon)
+    _notify_multiplexer(canon)
+    return profile_dir
 
 
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:

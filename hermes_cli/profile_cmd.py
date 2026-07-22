@@ -282,6 +282,17 @@ def _profile_create(args):
     print()
 
 
+def _profile_inherit(args):
+    from hermes_cli.profiles import inherit_profile
+    sources = [source.strip() for source in args.sources.split(",") if source.strip()]
+    try:
+        profile_dir = inherit_profile(sources, args.target, no_alias=args.no_alias,
+                                      no_skills=args.no_skills, description=args.description)
+    except (ValueError, FileExistsError, FileNotFoundError) as exc:
+        _die(f"Error: {exc}")
+    print(f"\nProfile '{args.target}' created at {profile_dir} with inherited_from: {', '.join(sources)}")
+
+
 def _profile_delete(args):
     from hermes_cli.profiles import delete_profile
     try:
@@ -600,6 +611,7 @@ PROFILE_ACTIONS = {
     'list': _profile_list,
     'use': _profile_use,
     'create': _profile_create,
+    'inherit': _profile_inherit,
     'delete': _profile_delete,
     'describe': _profile_describe,
     'show': _profile_show,

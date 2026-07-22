@@ -443,7 +443,7 @@ def _merge_file_config(defaults: Dict[str, Any], file_config: Dict[str, Any]) ->
     # Deep-merge dict sections, overwrite scalars; a None section keeps the defaults;
     # unknown keys (platform_toolsets, memory, ...) are carried over.
     for key, value in file_config.items():
-        if key == "model":
+        if key in {"model", "inherited_from"}:
             continue
         if isinstance(defaults.get(key), dict):
             if isinstance(value, dict):
@@ -483,6 +483,17 @@ def load_cli_config() -> Dict[str, Any]:
                 file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
 
             _file_has_terminal_config = "terminal" in file_config
+            if "inherited_from" in file_config:
+                try:
+                    from hermes_cli.profiles import _resolve_inherited_config
+
+                    profile_path = Path(_hermes_home)
+                    if profile_path.parent.name == "profiles":
+                        file_config, warnings = _resolve_inherited_config(profile_path.name)
+                        for warning in warnings:
+                            logger.warning("%s", warning)
+                except Exception as exc:
+                    logger.warning("Failed to resolve inherited_from config: %s", exc)
             _merge_file_config(defaults, file_config)
         except Exception as e:
             logger.warning("Failed to load cli-config.yaml: %s", e)
