@@ -577,6 +577,8 @@ class AIAgent:
         skip_memory: bool = False,
         skip_background_review: bool = False,
         memory_mode: str = "full",
+        # Deprecated — use memory_mode instead (remove after 2026-08)
+        skip_memory: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -599,6 +601,16 @@ class AIAgent:
                 DeprecationWarning,
                 stacklevel=2,
             )
+        # Backward compatibility for deprecated skip_memory parameter
+        if skip_memory:
+            import warnings
+            warnings.warn(
+                "skip_memory is deprecated, use memory_mode='off' instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            memory_mode = "off"
+
         from agent.agent_init import init_agent
         init_agent(
             self,
