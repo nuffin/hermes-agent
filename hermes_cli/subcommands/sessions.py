@@ -25,6 +25,14 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     sessions_list.add_argument("--workspace", metavar="NEEDLE",
         help="Only sessions in one workspace: a git repo root or project dir "
         "(matched by path substring or basename).")
+    sessions_list.add_argument(
+        "--sort",
+        choices=("started", "last-active"),
+        default=None,
+        help="Sort order: 'started' by session creation time, "
+        "'last-active' by most recent message "
+        "(default: sessions.list_sort from config.yaml)",
+    )
 
     _filter_args = (
         ("--newer-than", dict(metavar="AGE", help="Only match sessions active within the last AGE "
