@@ -690,24 +690,50 @@ def _call_llm_for_tagging(prompt: str) -> dict[str, Any] | None:
 
     try:
         import requests
-        from hermes_cli.config import load_config
+        from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
 
-        config = load_config()
         enrichment = _get_enrichment_config()
         provider_name = enrichment.get("provider", "")
         model_name = enrichment.get("model", "")
 
-        if not provider_name or not model_name:
+        # Provider and model are explicit opt-in settings. Never inherit an
+        # agent default and never select the first configured provider.
+        if not isinstance(provider_name, str) or not provider_name.strip() or not isinstance(model_name, str) or not model_name.strip():
             logger.warning("skill-graph: auto-tag skipped — enrichment.provider and enrichment.model are required")
             return None
+        provider_name = provider_name.strip()
+        model_name = model_name.strip()
 
-        providers = config.get("providers", {})
-        provider_cfg = providers.get(provider_name, {})
-        api_key = provider_cfg.get("api_key", "")
-        base_url = provider_cfg.get("base_url", "")
+        def _resolve_provider(pid: str) -> tuple[str, str] | None:
+            """Resolve credentials and base URL for one explicitly named provider."""
+            pconfig = PROVIDER_REGISTRY.get(pid)
+            if not pconfig:
+                return None
+            for env_var in pconfig.api_key_env_vars:
+                api_key = os.environ.get(env_var, "")
+                if not has_usable_secret(api_key):
+                    continue
+                base_url = os.environ.get(pconfig.base_url_env_var, "") if pconfig.base_url_env_var else ""
+                base_url = base_url or pconfig.inference_base_url or ""
+                if base_url:
+                    return api_key, base_url
+            return None
 
-        if not api_key or not base_url:
-            logger.warning("skill-graph: auto-tag skipped — incomplete provider config")
+        resolved = _resolve_provider(provider_name)
+        if not resolved:
+            logger.warning(
+                "skill-graph: auto-tag skipped — enrichment.provider '%s' has no usable secret or base URL",
+                provider_name,
+            )
+            return None
+        api_key, base_url = resolved
+
+        # Normalise base_url: strip /v1 suffix if present (we add it below)
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        if not base_url:
+            logger.warning("skill-graph: auto-tag skipped — enrichment.provider '%s' has no base URL", provider_name)
             return None
 
         headers = {
@@ -722,7 +748,7 @@ def _call_llm_for_tagging(prompt: str) -> dict[str, Any] | None:
         }
 
         resp = requests.post(
-            f"{base_url.rstrip('/')}/v1/chat/completions",
+            f"{base_url}/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=30,
