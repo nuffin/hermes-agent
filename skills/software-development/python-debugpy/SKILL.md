@@ -1,14 +1,29 @@
 ---
-name: python-debugpy
-description: "Debug Python: pdb REPL + debugpy remote (DAP)."
-version: 1.0.0
 author: Hermes Agent
+description: 'Debug Python: pdb REPL + debugpy remote (DAP).'
 license: MIT
-platforms: [linux, macos]
 metadata:
   hermes:
-    tags: [debugging, python, pdb, debugpy, breakpoints, dap, post-mortem]
-    related_skills: [systematic-debugging, node-inspect-debugger]
+    related_skills:
+    - systematic-debugging
+    - node-inspect-debugger
+    - debugging-hermes-tui-commands
+    scenes:
+    - coding
+    tags:
+    - python
+    - debugging
+    - pdb
+    - debugpy
+    - dap
+    - breakpoints
+    - remote-debugging
+    - post-mortem
+name: python-debugpy
+platforms:
+- linux
+- macos
+version: 1.0.0
 ---
 
 # Python Debugger (pdb + debugpy)
