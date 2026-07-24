@@ -565,18 +565,7 @@ def _embedding_client() -> "EmbeddingClient | None":
             return None
 
     def _reader() -> dict:
-        try:
-            from hermes_cli.config import load_config
-            config = load_config()
-            sg = (
-                (config or {})
-                .get("skills", {})
-                .get("config", {})
-                .get("skill-graph", {})
-            )
-            return sg if isinstance(sg, dict) else {}
-        except Exception:
-            return {}
+        return _skill_graph_config()
 
     return EmbeddingClient(_reader)
 
@@ -837,14 +826,8 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
         return None
 
     # Config gate: injection can be disabled entirely
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-        if isinstance(sg, dict) and sg.get("inject_candidates") is False:
-            return None
-    except Exception:
-        pass
+    if _skill_graph_config().get("inject_candidates") is False:
+        return None
 
     # Intent split (one lightweight LLM call). Fall back to the raw message
     # as a single intent when split fails.
@@ -975,9 +958,9 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
     try:
         import requests
         from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        config = load_config()
+        config = load_config_readonly() or {}
         sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
         enrichment_cfg = sg_config.get("enrichment", {}) if isinstance(sg_config, dict) else {}
         preferred_provider = enrichment_cfg.get("provider", "")
@@ -1036,10 +1019,7 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
 
         # Resolve model: enrichment config → main agent model → deepseek-v4-flash
         try:
-            config = load_config()
-            sg_config2 = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-            enrichment_cfg2 = sg_config2.get("enrichment", {}) if isinstance(sg_config2, dict) else {}
-            model_name = enrichment_cfg2.get("model", "")
+            model_name = enrichment_cfg.get("model", "")
             if not model_name:
                 # Default to main agent's model, preferring a fast variant
                 main_model = config.get("model", {}).get("default", "")
@@ -1136,12 +1116,12 @@ def _resolve_llm_provider(
     """
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
     except Exception:
         return None
     if config is None:
         try:
-            config = load_config()
+            config = load_config_readonly() or {}
         except Exception:
             return None
     if not isinstance(config, dict):
@@ -1222,8 +1202,8 @@ def _split_intents(user_message: str) -> list[str]:
     # Model: intent_split_model config → enrichment model → main model → default
     model_name = "deepseek-v4-flash"
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
         sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
         if isinstance(sg, dict):
             model_name = (
@@ -1419,9 +1399,9 @@ def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
         )
 
     # Write back to SKILL.md if not read-only
-    _hermes_live = str(Path.home() / ".hermes" / "hermes-agent")
-    if skill_path.startswith(_hermes_live):
-        logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (live dir, DB only)",
+    bundled_skills = get_bundled_skills_dir(Path(__file__).resolve().parents[2] / "skills")
+    if _is_under(Path(skill_path), bundled_skills):
+        logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (bundled dir, DB only)",
                     skill_name, tags, valid_scenes)
     elif not _is_read_only_skill(skill_path):
         wrote = _patch_skill_frontmatter(skill_path, tags, valid_scenes)
@@ -2299,7 +2279,7 @@ def _handle_slash_command(args: str) -> str | None:
             ).fetchone()[0]
             if pending > 0:
                 import subprocess as _sp
-                _log_dir = Path.home() / ".hermes" / "personal" / "skill-graph"
+                _log_dir = get_hermes_home() / "personal" / "skill-graph"
                 _log_dir.mkdir(parents=True, exist_ok=True)
                 _log_file = str(_log_dir / "enrichment.log")
                 _lock_file = _log_dir / ".enrichment.lock"
