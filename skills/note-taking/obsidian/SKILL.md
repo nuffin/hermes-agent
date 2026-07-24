@@ -4,11 +4,28 @@ description: Read, search, create, and edit notes in the Obsidian vault.
 version: 1.0.0
 author: Teknium (teknium1), Hermes Agent
 license: MIT
-platforms: [linux, macos, windows]
+platforms:
+- linux
+- macos
+- windows
 metadata:
   hermes:
-    tags: [Obsidian, Notes, Markdown, Vault]
+    tags:
+    - Obsidian
+    - Notes
+    - Markdown
+    - Vault
+    - obsidian
+    - notes
+    - markdown
+    - vault
+    - writing
+    - searching
+    - file-operations
     related_skills: []
+    scenes:
+    - writing
+    - research
 ---
 
 # Obsidian Vault

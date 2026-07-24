@@ -4,12 +4,33 @@ description: Create, read, merge, fill, and secure PDF files.
 version: 1.0.0
 author: Nous Research
 license: MIT
-platforms: [linux, macos, windows]
+platforms:
+- linux
+- macos
+- windows
 metadata:
   hermes:
-    tags: [pdf, documents, forms, reportlab, pypdf, pdfplumber]
+    tags:
+    - pdf
+    - documents
+    - forms
+    - reportlab
+    - pypdf
+    - pdfplumber
+    - python
+    - text-extraction
+    - table-extraction
+    - productivity
     category: productivity
-    related_skills: [docx, xlsx, powerpoint, ocr-and-documents]
+    related_skills:
+    - docx
+    - xlsx
+    - powerpoint
+    - ocr-and-documents
+    - nano-pdf
+    scenes:
+    - coding
+    - common
 ---
 
 # PDF Skill

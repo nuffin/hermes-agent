@@ -1,19 +1,41 @@
 ---
 name: songwriting-and-ai-music
-description: "Songwriting craft and Suno AI music prompts."
+description: Songwriting craft and Suno AI music prompts.
 version: 1.0.0
 author: Teknium (teknium1), Hermes Agent
 license: MIT
-tags: [songwriting, music, suno, parody, lyrics, creative]
-platforms: [linux, macos, windows]
+tags:
+- songwriting
+- music
+- suno
+- parody
+- lyrics
+- creative
+platforms:
+- linux
+- macos
+- windows
 triggers:
-  - writing a song
-  - song lyrics
-  - music prompt
-  - suno prompt
-  - parody song
-  - adapting a song
-  - AI music generation
+- writing a song
+- song lyrics
+- music prompt
+- suno prompt
+- parody song
+- adapting a song
+- AI music generation
+metadata:
+  hermes:
+    tags:
+    - songwriting
+    - music
+    - suno
+    - ai
+    - lyrics
+    - creative
+    - parody
+    scenes:
+    - writing
+    - media
 ---
 
 # Songwriting & AI Music Generation
