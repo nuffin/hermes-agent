@@ -216,6 +216,7 @@ VALID_HOOKS: Set[str] = {
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
+    "on_session_resume",
     # CLI session-switch hooks (observer, no mutation).
     #
     # session_switch_starting:
