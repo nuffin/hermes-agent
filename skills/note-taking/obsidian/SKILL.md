@@ -1,7 +1,23 @@
 ---
-name: obsidian
 description: Read, search, create, and edit notes in the Obsidian vault.
-platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    scenes:
+    - writing
+    - research
+    tags:
+    - obsidian
+    - notes
+    - markdown
+    - vault
+    - writing
+    - searching
+    - file-operations
+name: obsidian
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # Obsidian Vault

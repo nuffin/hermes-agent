@@ -1,16 +1,29 @@
 ---
-name: ascii-art
-description: "ASCII art: pyfiglet, cowsay, boxes, image-to-ascii."
-version: 4.0.0
 author: 0xbyt4, Hermes Agent
-license: MIT
 dependencies: []
-platforms: [linux, macos, windows]
+description: 'ASCII art: pyfiglet, cowsay, boxes, image-to-ascii.'
+license: MIT
 metadata:
   hermes:
-    tags: [ASCII, Art, Banners, Creative, Unicode, Text-Art, pyfiglet, figlet, cowsay, boxes]
-    related_skills: [excalidraw]
-
+    related_skills:
+    - excalidraw
+    scenes:
+    - coding
+    - writing
+    tags:
+    - ascii-art
+    - pyfiglet
+    - cowsay
+    - boxes
+    - cli
+    - text-art
+    - banners
+name: ascii-art
+platforms:
+- linux
+- macos
+- windows
+version: 4.0.0
 ---
 
 # ASCII Art Skill

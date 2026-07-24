@@ -1,30 +1,43 @@
 ---
-name: comfyui
-description: Generate images, video, and audio via diffusion workflows.
-version: 5.1.0
-author: [kshitijk4poor, alt-glitch, purzbeats]
+author:
+- kshitijk4poor
+- alt-glitch
+- purzbeats
+compatibility: Requires ComfyUI (local, Comfy Desktop, or Comfy Cloud) and comfy-cli
+  (auto-installed via pipx/uvx by the setup script).
+description: Generate images, video, and audio with ComfyUI — install, launch, manage
+  nodes/models, run workflows with parameter injection. Uses the official comfy-cli
+  for lifecycle and direct REST/WebSocket API for execution.
 license: MIT
-platforms: [macos, linux, windows]
-compatibility: "Requires ComfyUI (local, Comfy Desktop, or Comfy Cloud) and comfy-cli (auto-installed via pipx/uvx by the setup script)."
-prerequisites:
-  commands: ["python3"]
-setup:
-  help: "Run scripts/hardware_check.py FIRST to decide local vs Comfy Cloud; then scripts/comfyui_setup.sh auto-installs locally (or use Cloud API key for platform.comfy.org)."
 metadata:
   hermes:
-    tags:
-      - comfyui
-      - image-generation
-      - stable-diffusion
-      - flux
-      - sd3
-      - wan-video
-      - hunyuan-video
-      - creative
-      - generative-ai
-      - video-generation
-    related_skills: [stable-diffusion-image-generation]
     category: creative
+    related_skills:
+    - stable-diffusion-image-generation
+    - image_gen
+    scenes:
+    - media
+    - devops
+    tags:
+    - comfyui
+    - image-generation
+    - video-generation
+    - stable-diffusion
+    - generative-ai
+    - creative
+    - workflow
+name: comfyui
+platforms:
+- macos
+- linux
+- windows
+prerequisites:
+  commands:
+  - python3
+setup:
+  help: Run scripts/hardware_check.py FIRST to decide local vs Comfy Cloud; then scripts/comfyui_setup.sh
+    auto-installs locally (or use Cloud API key for platform.comfy.org).
+version: 5.1.0
 ---
 
 # ComfyUI

@@ -1,7 +1,23 @@
 ---
+description: YouTube transcripts to summaries, threads, blogs.
+metadata:
+  hermes:
+    scenes:
+    - media
+    - writing
+    tags:
+    - youtube
+    - transcript
+    - summarization
+    - content-extraction
+    - python
+    - media
+    - writing
 name: youtube-content
-description: "YouTube transcripts to summaries, threads, blogs."
-platforms: [linux, macos, windows]
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # YouTube Content Tool

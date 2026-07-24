@@ -1,20 +1,34 @@
 ---
-name: google-workspace
-description: "Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python."
-version: 1.1.0
 author: Nous Research
+description: Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python.
 license: MIT
-platforms: [linux, macos, windows]
-required_credential_files:
-  - path: google_token.json
-    description: Google OAuth2 token (created by setup script)
-  - path: google_client_secret.json
-    description: Google OAuth2 client credentials (downloaded from Google Cloud Console)
 metadata:
   hermes:
-    tags: [Google, Gmail, Calendar, Drive, Sheets, Docs, Contacts, Email, OAuth]
     homepage: https://github.com/NousResearch/hermes-agent
-    related_skills: [himalaya]
+    related_skills:
+    - himalaya
+    scenes:
+    - writing
+    - hermes
+    tags:
+    - google-workspace
+    - productivity
+    - email
+    - calendar
+    - docs
+    - oauth
+    - cli
+name: google-workspace
+platforms:
+- linux
+- macos
+- windows
+required_credential_files:
+- description: Google OAuth2 token (created by setup script)
+  path: google_token.json
+- description: Google OAuth2 client credentials (downloaded from Google Cloud Console)
+  path: google_client_secret.json
+version: 1.1.0
 ---
 
 # Google Workspace
