@@ -161,6 +161,7 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    "on_session_resume",
     # CLI session-switch hooks (observer, no mutation).
     #
     # session_switch_starting:
