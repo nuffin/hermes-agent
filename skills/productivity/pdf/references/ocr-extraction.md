@@ -1,6 +1,31 @@
-# OCR & Document Text Extraction (merged from the ocr-and-documents skill)
+---
+author: Hermes Agent
+description: Extract text from PDFs/scans (pymupdf, marker-pdf).
+license: MIT
+metadata:
+  hermes:
+    related_skills:
+    - pdf
+    - docx
+    - powerpoint
+    scenes:
+    - research
+    tags:
+    - ocr
+    - pdf
+    - document-processing
+    - text-extraction
+    - pymupdf
+    - marker-pdf
+    - python
+name: ocr-and-documents
+platforms:
+- linux
+- macos
+- windows
+version: 2.3.0
+---
 
-Scripts referenced below live in this skill's scripts/ directory.
 # PDF & Document Extraction
 
 For DOCX: see the `docx` skill (create/edit) or use `python-docx` for structured reads.

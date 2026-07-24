@@ -1,3 +1,32 @@
+---
+author: Hermes Agent
+description: Create, triage, label, assign GitHub issues via gh or REST.
+license: MIT
+metadata:
+  hermes:
+    related_skills:
+    - github-auth
+    - github-pr-workflow
+    scenes:
+    - coding
+    - research
+    tags:
+    - github
+    - issues
+    - project-management
+    - bug-tracking
+    - triage
+    - gh
+    - curl
+    - api
+name: github-issues
+platforms:
+- linux
+- macos
+- windows
+version: 1.1.0
+---
+
 # GitHub Issues Management
 
 Create, search, triage, and manage GitHub issues. Each section shows `gh` first, then the `curl` fallback.

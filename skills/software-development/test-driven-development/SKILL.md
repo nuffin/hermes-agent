@@ -1,14 +1,28 @@
 ---
-name: test-driven-development
-description: "TDD: enforce RED-GREEN-REFACTOR, tests before code."
-version: 1.1.0
 author: Hermes Agent (adapted from obra/superpowers)
+description: 'TDD: enforce RED-GREEN-REFACTOR, tests before code.'
 license: MIT
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [testing, tdd, development, quality, red-green-refactor]
-    related_skills: [systematic-debugging, subagent-driven-development]
+    related_skills:
+    - systematic-debugging
+    - plan
+    - subagent-driven-development
+    scenes:
+    - coding
+    tags:
+    - tdd
+    - testing
+    - development
+    - methodology
+    - red-green-refactor
+    - pytest
+name: test-driven-development
+platforms:
+- linux
+- macos
+- windows
+version: 1.1.0
 ---
 
 # Test-Driven Development (TDD)

@@ -1,14 +1,31 @@
 ---
-name: spike
-description: "Throwaway experiments to validate an idea before build."
-version: 1.0.0
 author: Hermes Agent (adapted from gsd-build/get-shit-done)
+description: Throwaway experiments to validate an idea before build.
 license: MIT
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [spike, prototype, experiment, feasibility, throwaway, exploration, research, planning, mvp, proof-of-concept]
-    related_skills: [sketch, subagent-driven-development]
+    related_skills:
+    - sketch
+    - subagent-driven-development
+    - plan
+    scenes:
+    - research
+    - coding
+    - design
+    tags:
+    - spike
+    - prototype
+    - feasibility
+    - experiment
+    - software-development
+    - planning
+    - proof-of-concept
+name: spike
+platforms:
+- linux
+- macos
+- windows
+version: 1.0.0
 ---
 
 # Spike
