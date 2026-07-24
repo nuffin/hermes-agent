@@ -1,3 +1,31 @@
+---
+author: Hermes Agent
+description: Clone/create/fork repos; manage remotes, releases.
+license: MIT
+metadata:
+  hermes:
+    related_skills:
+    - github-auth
+    - github-pr-workflow
+    - github-issues
+    scenes:
+    - coding
+    - devops
+    tags:
+    - github
+    - git
+    - repository-management
+    - cli
+    - devops
+    - automation
+name: github-repo-management
+platforms:
+- linux
+- macos
+- windows
+version: 1.1.0
+---
+
 # GitHub Repository Management
 
 Create, clone, fork, configure, and manage GitHub repositories. Each section shows `gh` first, then the `git` + `curl` fallback.
