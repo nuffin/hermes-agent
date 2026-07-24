@@ -1,16 +1,27 @@
 ---
-name: apple-notes
-description: "Manage Apple Notes via memo CLI: create, search, edit."
-version: 1.0.1
 author: Hermes Agent
+description: 'Manage Apple Notes via memo CLI: create, search, edit.'
 license: MIT
-platforms: [macos]
 metadata:
   hermes:
-    tags: [Notes, Apple, macOS, note-taking]
-    related_skills: [obsidian]
+    related_skills:
+    - obsidian
+    scenes:
+    - writing
+    - research
+    tags:
+    - apple-notes
+    - note-taking
+    - macos
+    - cli
+    - memo
+name: apple-notes
+platforms:
+- macos
 prerequisites:
-  commands: [memo]
+  commands:
+  - memo
+version: 1.0.0
 ---
 
 # Apple Notes
@@ -49,13 +60,9 @@ memo notes -s "query"             # Search notes (fuzzy)
 ### Create Notes
 
 ```bash
-memo notes -a                     # Add a note (opens your $EDITOR)
-memo notes -a -f "Folder Name"    # Add a note into a specific folder
+memo notes -a                     # Interactive editor
+memo notes -a "Note Title"        # Quick add with title
 ```
-
-`-a`/`--add` is a bare flag — it opens your `$EDITOR` to compose the note; it does
-not take a title argument. Use `-f/--folder` to target a folder. Set `$EDITOR`
-first (e.g. `export EDITOR=vim`).
 
 ### Edit Notes
 
