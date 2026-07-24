@@ -356,15 +356,24 @@ class InsightsEngine:
         # Reconcile against the aggregate row: covers legacy sessions,
         # interrupted migrations, and absolute cumulative updates without
         # double-counting already-attributed route deltas.
+
+        def _safe_int(val):
+            """Coerce to int, returning 0 for non-numeric values (defensive)."""
+            try:
+                return int(val) if val is not None else 0
+            except (ValueError, TypeError):
+                return 0
+
         for s in sessions:
             totals = usage_totals[s["id"]]
-            residual = {k: max(0, (s.get(k) or 0) - totals[k]) for k in _TOKEN_KEYS + ("api_call_count",)}
+            residual = {k: max(0, _safe_int(s.get(k)) - totals[k]) for k in _TOKEN_KEYS + ("api_call_count",)}
             residual["reasoning_tokens"] = 0
             residual_cost = max(0.0, float(s.get("estimated_cost_usd") or 0.0) - totals["estimated_cost_usd"])
             residual_actual = max(0.0, float(s.get("actual_cost_usd") or 0.0) - totals["actual_cost_usd"])
             if any(residual.values()) or residual_cost or residual_actual:
                 _accumulate(s.get("model"), s.get("billing_provider"), s.get("billing_base_url"), s["id"], residual,
                             stored_cost=residual_cost, actual_cost=residual_actual, cost_status=s.get("cost_status"))
+        # Tool calls are attributed by the session's recorded model.
         for s in sessions:
             if s.get("tool_call_count"):
                 model_data[_short_model(s.get("model"))]["tool_calls"] += s["tool_call_count"]
