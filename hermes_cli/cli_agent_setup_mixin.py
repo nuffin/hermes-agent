@@ -541,6 +541,10 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            # Mark the agent when resuming a session so the first turn
+            # fires on_session_resume instead of on_session_start.
+            if self.conversation_history:
+                self.agent._is_first_turn_after_resume = True
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

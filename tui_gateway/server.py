@@ -2314,6 +2314,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
                 kw = {"session_db": session_db}
+                _is_resume_session = bool(current.get("resume_session_id"))
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -2336,6 +2337,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
+                # Mark the agent when resuming a session so the first turn
+                # fires on_session_resume instead of on_session_start.
+                if _is_resume_session:
+                    agent._is_first_turn_after_resume = True
             finally:
                 _clear_session_context(tokens)
 

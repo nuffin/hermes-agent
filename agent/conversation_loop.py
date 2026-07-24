@@ -756,6 +756,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+
+    # Capture and consume the one-shot resume flag.  Set by callers
+    # (CLI / Gateway / TUI) when conversation_history was loaded from
+    # the session DB.  Consumed immediately so the hook fires exactly
+    # once per session resumption, regardless of which branch this
+    # function takes.
+    _is_resume = getattr(agent, '_is_first_turn_after_resume', False)
+    if _is_resume:
+        agent._is_first_turn_after_resume = False
+
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:
@@ -802,6 +812,22 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         from agent.system_prompt import reconstruct_static_prefix
 
         reconstruct_static_prefix(agent, system_message=system_message)
+        # Plugin hook: on_session_resume — fired once on the first turn
+        # after a session is resumed from the session DB.  Plugins can use
+        # this to re-initialise session-scoped state (e.g. baseline message
+        # counts).  Only fires when the agent carries the one-shot
+        # _is_first_turn_after_resume flag (set by the resume path).
+        if _is_resume:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook_r
+                _invoke_hook_r(
+                    "on_session_resume",
+                    session_id=agent.session_id,
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                )
+            except Exception as exc:
+                logger.warning("on_session_resume hook failed: %s", exc)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -830,19 +856,22 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
-    # Plugin hook: on_session_start — fired once when a brand-new
-    # session is created (not on continuation).  Plugins can use this
-    # to initialise session-scoped state (e.g. warm a memory cache).
+    # Plugin hook: on_session_start / on_session_resume — fired once when a
+    # session begins.  on_session_resume is used when the session was loaded
+    # from the session DB (the one-shot _is_first_turn_after_resume flag),
+    # falling back to on_session_start for brand-new sessions.  Plugins can
+    # use this to initialise session-scoped state.
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _hook_name = "on_session_resume" if _is_resume else "on_session_start"
         _invoke_hook(
-            "on_session_start",
+            _hook_name,
             session_id=agent.session_id,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
         )
     except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+        logger.warning("%s hook failed: %s", _hook_name, exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
