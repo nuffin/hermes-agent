@@ -1,17 +1,29 @@
 ---
-name: jupyter-notebook
-description: "Iterative Python via live Jupyter kernel (hamelnb)."
-version: 1.0.0
 author: Hermes Agent
+description: Iterative Python via live Jupyter kernel (hamelnb).
 license: MIT
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [jupyter, notebook, repl, data-science, exploration, iterative]
     category: data-science
+    scenes:
+    - research
+    tags:
+    - jupyter
+    - python
+    - data-science
+    - repl
+    - exploration
+    - iterative
+    - stateful
+name: jupyter-live-kernel
+platforms:
+- linux
+- macos
+- windows
+version: 1.0.0
 ---
 
-# Jupyter Notebook (hamelnb live kernel)
+# Jupyter Live Kernel (hamelnb)
 
 Gives you a **stateful Python REPL** via a live Jupyter kernel. Variables persist
 across executions. Use this instead of `execute_code` when you need to build up
@@ -159,17 +171,6 @@ uv run "$SCRIPT" restart-run-all --path <notebook.ipynb> --save-outputs --compac
 
 8. **Occasional websocket timeouts** — some operations may timeout on first try,
    especially after a kernel restart. Retry once before escalating.
-
-9. **If websocket consistently times out on this host**, force zmq transport:
-   `uv run "$SCRIPT" execute --transport zmq ...`. Symptom: every execute returns
-   "Websocket execution may already have reached the kernel, so auto fallback was
-   skipped". The kernel actually ran fine (REST shows execution_state=idle and
-   execution_count increments) — only the websocket reply channel is broken.
-   zmq transport uses jupyter_client directly and sidesteps the issue.
-
-10. **When starting a fresh server for REST-only use**, add
-    `--ServerApp.disable_check_xsrf=True` — otherwise POST /api/sessions returns
-    `"'_xsrf' argument missing from POST"` and kernel session creation fails.
 
 ## Timeout Defaults
 
