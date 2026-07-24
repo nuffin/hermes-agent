@@ -1,15 +1,29 @@
 ---
-name: architecture-diagram
-description: "Dark-themed SVG architecture/cloud/infra diagrams as HTML."
-version: 1.0.0
 author: Cocoon AI (hello@cocoon-ai.com), ported by Hermes Agent
-license: MIT
 dependencies: []
-platforms: [linux, macos, windows]
+description: Dark-themed SVG architecture/cloud/infra diagrams as HTML.
+license: MIT
 metadata:
   hermes:
-    tags: [architecture, diagrams, SVG, HTML, visualization, infrastructure, cloud]
-    related_skills: [concept-diagrams, excalidraw]
+    related_skills:
+    - concept-diagrams
+    - excalidraw
+    scenes:
+    - design
+    tags:
+    - architecture
+    - diagrams
+    - svg
+    - html
+    - visualization
+    - infrastructure
+    - cloud
+name: architecture-diagram
+platforms:
+- linux
+- macos
+- windows
+version: 1.0.0
 ---
 
 # Architecture Diagram Skill

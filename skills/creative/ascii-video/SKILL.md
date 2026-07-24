@@ -1,7 +1,23 @@
 ---
+description: 'ASCII video: convert video/audio to colored ASCII MP4/GIF.'
+metadata:
+  hermes:
+    scenes:
+    - media
+    tags:
+    - ascii-art
+    - video
+    - audio
+    - python
+    - ffmpeg
+    - multimedia
+    - generative-art
+    - creative
 name: ascii-video
-description: "ASCII video: convert video/audio to colored ASCII MP4/GIF."
-platforms: [linux, macos, windows]
+platforms:
+- linux
+- macos
+- windows
 ---
 
 # ASCII Video Production Pipeline
