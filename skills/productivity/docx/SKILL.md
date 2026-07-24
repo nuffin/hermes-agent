@@ -7,9 +7,11 @@ license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [word, docx, documents, office, templates, revisions, comments]
+    tags: [word, docx, documents, office, templates, revisions, comments,
+      document-generation, word-processing, xml-editing, pandoc, python]
     category: productivity
-    related_skills: [pdf, xlsx, powerpoint]
+    related_skills: [pdf, xlsx, powerpoint, ocr-and-documents]
+    scenes: [coding, writing]
 ---
 
 # Docx Skill
