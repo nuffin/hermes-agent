@@ -1,15 +1,31 @@
 ---
-name: xlsx
-description: "Create, read, edit Excel .xlsx spreadsheets and CSVs."
-version: 1.0.0
 author: Anthropic (adapted by Nous Research)
+description: Create, read, edit Excel .xlsx spreadsheets and CSVs.
 license: Proprietary. LICENSE.txt has complete terms
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [Excel, XLSX, Spreadsheets, Office, Productivity]
     category: productivity
-    related_skills: [docx, pdf, powerpoint]
+    related_skills:
+    - docx
+    - pdf
+    - powerpoint
+    scenes:
+    - writing
+    - common
+    tags:
+    - excel
+    - xlsx
+    - spreadsheets
+    - openpyxl
+    - pandas
+    - data-cleaning
+    - format-conversion
+name: xlsx
+platforms:
+- linux
+- macos
+- windows
+version: 1.0.0
 ---
 
 # XLSX Skill
