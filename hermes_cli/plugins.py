@@ -161,6 +161,11 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Fired on the first turn after a session is resumed (continued from DB).
+    # Same kwargs as on_session_start (session_id, model, platform).
+    # Plugins can use this to initialise session-scoped state that needs
+    # re-initialisation after a process restart (e.g. baseline message counts).
+    "on_session_resume",
     "subagent_start",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
