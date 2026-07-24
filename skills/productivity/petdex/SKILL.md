@@ -1,15 +1,27 @@
 ---
-name: petdex
-description: Install and select animated petdex mascots for Hermes.
-version: 1.0.0
 author: Hermes Agent
+description: Install and select animated petdex mascots for Hermes.
 license: MIT
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [petdex, mascot, display, cli, tui, desktop]
     category: productivity
     homepage: https://petdex.dev
+    scenes:
+    - hermes
+    tags:
+    - petdex
+    - mascot
+    - cli
+    - terminal
+    - display
+    - hermes
+    - config
+name: petdex
+platforms:
+- linux
+- macos
+- windows
+version: 1.0.0
 ---
 
 # Petdex Skill

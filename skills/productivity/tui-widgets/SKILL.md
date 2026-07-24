@@ -1,13 +1,22 @@
 ---
-name: tui-widgets
-description: Author live widget apps for the Hermes TUI dock.
-version: 1.0.0
 author: Hermes Agent
+description: Author live widget apps for the Hermes TUI dock.
 license: MIT
 metadata:
   hermes:
-    tags: [tui, widgets, sdk, ui]
     category: productivity
+    scenes:
+    - coding
+    - hermes
+    tags:
+    - tui
+    - widgets
+    - hermes
+    - javascript
+    - sdk
+    - terminal-ui
+name: tui-widgets
+version: 1.0.0
 ---
 
 # TUI Widgets Skill
