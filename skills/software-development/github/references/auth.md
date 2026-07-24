@@ -1,3 +1,33 @@
+---
+author: Hermes Agent
+description: 'GitHub auth setup: HTTPS tokens, SSH keys, gh CLI login.'
+license: MIT
+metadata:
+  hermes:
+    related_skills:
+    - github-pr-workflow
+    - github-code-review
+    - github-issues
+    - github-repo-management
+    scenes:
+    - coding
+    - devops
+    tags:
+    - github
+    - authentication
+    - git
+    - ssh
+    - gh-cli
+    - setup
+    - configuration
+name: github-auth
+platforms:
+- linux
+- macos
+- windows
+version: 1.1.0
+---
+
 # GitHub Authentication Setup
 
 This skill sets up authentication so the agent can work with GitHub repositories, PRs, issues, and CI. It covers two paths:
