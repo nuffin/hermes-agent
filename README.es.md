@@ -2,6 +2,93 @@
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
+## Integration Branch — Features Not Yet in Upstream
+
+> This section is **integration-branch-only**. It documents changes that exist
+> on `integration` (120 commits ahead of `upstream/main`) but have not been
+> upstreamed. Do not copy into PR branches.
+
+### Skill-Graph Plugin (`plugins/skill-graph/`)
+
+Bundled plugin providing a knowledge-graph-based skill discovery engine.
+
+- **Graph search**: `skill_graph_search(query)` replaces `skills_list()` —
+  FTS5 + graph expansion + tag matching + term matching, 903 skills indexed.
+- **Scene-aware filtering**: skills tagged with scenes (`coding`, `writing`,
+  `research`, `design`, `devops`, `hermes`, `media`, `common`) for
+  context-sensitive discovery.
+- **LLM enrichment**: `/sg rebuild` auto-enriches skills with tags and scenes
+  via `deepseek-v4-flash`. Runs in background subprocess with PID lock to
+  prevent concurrent runs. Model configurable via
+  `skills.config.skill-graph.enrichment.model`.
+- **Tool gating**: `read_file`/`search_files` blocked until
+  `skill_graph_search()` is called, gated by `agent.skill_graph_mode`.
+- **Gateway extension injection**: skills declared in
+  `routing-extensions.md` are injected into system prompt as pre-installed
+  gateways.
+- **skill_graph_config tool**: runtime `source_dirs` management without
+  restart.
+- **Proxy slash commands**: every graph-discovered skill gets a `/` command.
+- **Lifecycle**: soft-delete + `needs_organizing` for curator integration.
+- **Config**: `agent.skill_graph_mode: false` in DEFAULT_CONFIG (opt-in).
+
+### CLI
+
+- `--no-streaming` flag for `hermes chat` (`display.streaming` override).
+- Interim assistant messages with box frame (non-streaming visibility).
+- `display.editor_auto_submit` config toggle for Ctrl+G behavior.
+- Resume note: agent is informed when session resumes after process restart.
+
+### Plugin Hooks
+
+- `on_session_pre_switch` / `on_session_post_switch` hooks.
+- Skill lifecycle hooks: `pre_skill_create`, `post_skill_create`,
+  `pre_skill_edit`, `post_skill_edit`, `pre_skill_patch`,
+  `pre_skill_write_file`, `pre_skill_remove_file`, `pre_skill_delete`.
+- `pre_command`, `post_command`, `on_quit` hooks for slash-command lifecycle.
+
+### Agent
+
+- `memory_mode` parameter with `'on_demand'` option: sub-agents can inherit
+  memory toolset when `memory_mode != off`.
+- `skip_memory` backward compatibility in AIAgent forwarder.
+
+### Auth / Providers
+
+- `providers.<name>.enabled: false` to disable built-in providers.
+- Provider credential guard: `_is_provider_enabled` gates credential
+  resolution.
+- Disabled providers skipped in model-switch picker.
+
+### Profile Config
+
+- `inherited_from` config inheritance for profiles.
+- Interactive conflict resolution for inheriting and multi-source clone.
+
+### Sessions
+
+- `--sort` flag for `hermes sessions list`.
+- `sessions.list_sort` config (`newest`/`oldest`).
+
+### Kanban
+
+- `allow_session_board_switch` config opt-out.
+- Config check takes priority over env var for dispatcher pin.
+
+### Curator / Skills-Sync
+
+- Curator rejects symlinked skills (protect external content).
+- Windows symlink compatibility (`target_is_directory` + PermissionError
+  hint).
+
+### Fixes (integration-specific)
+
+- `delegate_task` subprocess import: using temp `.py` file instead of `-c`
+  (compound statements not allowed in semicolon-separated one-liners).
+- Skill-graph: `max_tokens` 512→2048 (deepseek reasoning consumed all tokens).
+- Removed `reasoning_content` fallback (chain-of-thought is not JSON output).
+- Synchronous enrichment removed from `_full_rebuild` and `_incremental_sync`.
+
 # Hermes Agent ☤
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
