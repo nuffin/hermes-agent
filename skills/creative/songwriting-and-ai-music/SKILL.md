@@ -1,16 +1,38 @@
 ---
+description: Songwriting craft and Suno AI music prompts.
+metadata:
+  hermes:
+    scenes:
+    - writing
+    - media
+    tags:
+    - songwriting
+    - music
+    - suno
+    - ai
+    - lyrics
+    - creative
+    - parody
 name: songwriting-and-ai-music
-description: "Songwriting craft and Suno AI music prompts."
-tags: [songwriting, music, suno, parody, lyrics, creative]
-platforms: [linux, macos, windows]
+platforms:
+- linux
+- macos
+- windows
+tags:
+- songwriting
+- music
+- suno
+- parody
+- lyrics
+- creative
 triggers:
-  - writing a song
-  - song lyrics
-  - music prompt
-  - suno prompt
-  - parody song
-  - adapting a song
-  - AI music generation
+- writing a song
+- song lyrics
+- music prompt
+- suno prompt
+- parody song
+- adapting a song
+- AI music generation
 ---
 
 # Songwriting & AI Music Generation
