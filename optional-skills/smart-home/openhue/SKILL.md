@@ -1,16 +1,29 @@
 ---
-name: openhue
-description: "Control Philips Hue lights, scenes, rooms via OpenHue CLI."
-version: 1.0.1
 author: community
+description: Control Philips Hue lights, scenes, rooms via OpenHue CLI.
 license: MIT
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [Smart-Home, Hue, Lights, IoT, Automation]
     homepage: https://www.openhue.io/cli
+    scenes:
+    - hermes
+    tags:
+    - smart-home
+    - philips-hue
+    - iot
+    - automation
+    - cli
+    - lighting
+    - home-automation
+name: openhue
+platforms:
+- linux
+- macos
+- windows
 prerequisites:
-  commands: [openhue]
+  commands:
+  - openhue
+version: 1.0.0
 ---
 
 # OpenHue CLI
