@@ -13,8 +13,8 @@ Moonshot wire shape that DeepSeek's OpenAI-compat endpoint expects:
     {"reasoning_effort": "<low|medium|high|max>",
      "extra_body": {"thinking": {"type": "enabled" | "disabled"}}}
 
-Non-thinking models (only ``deepseek-chat`` today, which is V3) are left as
-no-ops so we don't perturb the V3 wire format.
+Non-thinking models (``deepseek-v4-flash`` with thinking disabled) are left
+as no-ops so we don't perturb the wire format.
 """
 
 from __future__ import annotations
@@ -90,11 +90,10 @@ deepseek = DeepSeekProfile(
     description="DeepSeek — native DeepSeek API",
     signup_url="https://platform.deepseek.com/",
     fallback_models=(
-        "deepseek-chat",
-        "deepseek-reasoner",
+        "deepseek-v4-flash",
     ),
     base_url="https://api.deepseek.com/v1",
-    default_aux_model="deepseek-chat",
+    default_aux_model="deepseek-v4-flash",
 )
 
 register_provider(deepseek)
