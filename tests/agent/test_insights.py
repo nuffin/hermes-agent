@@ -9,6 +9,7 @@ from agent.insights import (
     InsightsEngine,
     _estimate_cost,
     _bar_chart,
+    _safe_float,
 )
 from agent.usage_pricing import (
     format_duration_compact as _format_duration,
@@ -774,3 +775,8 @@ class TestEdgeCases:
         assert "Unknown" in text
 
 
+def test_safe_float_handles_corrupt_values():
+    assert _safe_float(3.14) == 3.14
+    assert _safe_float("3.14") == 3.14
+    assert _safe_float(None) == 0.0
+    assert _safe_float("corrupted") == 0.0
