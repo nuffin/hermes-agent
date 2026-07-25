@@ -45,6 +45,14 @@ def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
     return ["" for _ in values] if peak == 0 else ["█" * max(1, int(v / peak * max_width)) if v > 0 else "" for v in values]
 
 
+def _safe_float(val):
+    """Coerce to float, returning 0.0 for non-numeric values (defensive)."""
+    try:
+        return float(val) if val is not None else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _short_model(model: Optional[str]) -> str:
     """Display name: strip the provider prefix; empty → "unknown"."""
     return (model or "unknown").split("/")[-1]
@@ -283,7 +291,7 @@ class InsightsEngine:
             model = s.get("model") or ""
             estimated, status = _estimate_cost(s)
             total_cost += estimated
-            actual_cost += s.get("actual_cost_usd") or 0.0
+            actual_cost += _safe_float(s.get("actual_cost_usd"))
             status_counts[status] += 1
             known = has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url"))
             (models_with_pricing if known else models_without_pricing).add(_short_model(model))
@@ -337,25 +345,11 @@ class InsightsEngine:
                 estimate, status = _estimate_cost(model, counts["input_tokens"], counts["output_tokens"], cache_read_tokens=counts["cache_read_tokens"],
                                                   cache_write_tokens=counts["cache_write_tokens"], provider=provider or None, base_url=base_url)
             else:
-                estimate, status = float(stored_cost or 0.0), cost_status or "unknown"
+                estimate, status = _safe_float(stored_cost), cost_status or "unknown"
             d["cost"] += estimate
-            d["actual_cost"] += float(actual_cost or 0.0)
+            d["actual_cost"] += _safe_float(actual_cost)
             d["cost_status"] = status
             d["has_pricing"] = has_known_pricing(model, provider or None, base_url) or d.get("has_pricing", False)
-        usage_totals = defaultdict(lambda: dict.fromkeys(count_keys, 0) | {"estimated_cost_usd": 0.0, "actual_cost_usd": 0.0})
-        for r in self._get_model_usage(cutoff, source):
-            totals: Dict[str, Any] = usage_totals[r["session_id"]]
-            counts = {key: r[key] or 0 for key in count_keys}
-            for key in count_keys:
-                totals[key] += counts[key]
-            totals["estimated_cost_usd"] += r["estimated_cost_usd"] or 0.0
-            totals["actual_cost_usd"] += r["actual_cost_usd"] or 0.0
-            _accumulate(r["model"], r["billing_provider"], r.get("billing_base_url"), r["session_id"], counts,
-                        stored_cost=r["estimated_cost_usd"] if r.get("cost_status") or r.get("cost_source") else None,
-                        actual_cost=r["actual_cost_usd"], cost_status=r.get("cost_status"))
-        # Reconcile against the aggregate row: covers legacy sessions,
-        # interrupted migrations, and absolute cumulative updates without
-        # double-counting already-attributed route deltas.
 
         def _safe_int(val):
             """Coerce to int, returning 0 for non-numeric values (defensive)."""
@@ -364,12 +358,27 @@ class InsightsEngine:
             except (ValueError, TypeError):
                 return 0
 
+        usage_totals = defaultdict(lambda: dict.fromkeys(count_keys, 0) | {"estimated_cost_usd": 0.0, "actual_cost_usd": 0.0})
+        for r in self._get_model_usage(cutoff, source):
+            totals: Dict[str, Any] = usage_totals[r["session_id"]]
+            counts = {key: _safe_int(r[key]) for key in count_keys}
+            for key in count_keys:
+                totals[key] += counts[key]
+            totals["estimated_cost_usd"] += _safe_float(r["estimated_cost_usd"])
+            totals["actual_cost_usd"] += _safe_float(r["actual_cost_usd"])
+            _accumulate(r["model"], r["billing_provider"], r.get("billing_base_url"), r["session_id"], counts,
+                        stored_cost=r["estimated_cost_usd"] if r.get("cost_status") or r.get("cost_source") else None,
+                        actual_cost=r["actual_cost_usd"], cost_status=r.get("cost_status"))
+        # Reconcile against the aggregate row: covers legacy sessions,
+        # interrupted migrations, and absolute cumulative updates without
+        # double-counting already-attributed route deltas.
+
         for s in sessions:
             totals = usage_totals[s["id"]]
             residual = {k: max(0, _safe_int(s.get(k)) - totals[k]) for k in _TOKEN_KEYS + ("api_call_count",)}
             residual["reasoning_tokens"] = 0
-            residual_cost = max(0.0, float(s.get("estimated_cost_usd") or 0.0) - totals["estimated_cost_usd"])
-            residual_actual = max(0.0, float(s.get("actual_cost_usd") or 0.0) - totals["actual_cost_usd"])
+            residual_cost = max(0.0, _safe_float(s.get("estimated_cost_usd")) - totals["estimated_cost_usd"])
+            residual_actual = max(0.0, _safe_float(s.get("actual_cost_usd")) - totals["actual_cost_usd"])
             if any(residual.values()) or residual_cost or residual_actual:
                 _accumulate(s.get("model"), s.get("billing_provider"), s.get("billing_base_url"), s["id"], residual,
                             stored_cost=residual_cost, actual_cost=residual_actual, cost_status=s.get("cost_status"))
