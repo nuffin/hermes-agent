@@ -818,7 +818,7 @@ class AIAgent(
 
     def _ensure_topic_for_session(self) -> None:
         """Ensure a first topic exists before persistence acquires its write lock."""
-        if self._active_topic_id is not None:
+        if getattr(self, "_active_topic_id", None) is not None:
             return
         db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
         if not db or not sid:
