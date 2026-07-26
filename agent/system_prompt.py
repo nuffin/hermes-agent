@@ -304,24 +304,19 @@ def _build_topic_detection_block(agent: Any) -> str:
             lines.extend(("", f"... and {len(topics) - 5} more archived topics."))
         lines.append("")
 
-    lines.extend((
-        "After your response, append exactly one or two lines to help track "
-        "conversation topics. These lines are parsed by the system and "
-        "stripped before the user sees your output:",
-        "",
-        "```",
-        "TOPIC_SHIFT: <score 0-10> | <suggested_name or ->",
-        "TOPIC_MATCH: <topic_id or -> | <score 0-10>",
-        "```",
-        "",
-        "TOPIC_SHIFT — conversation has moved to a NEW topic. Score 6+ means "
-        "a clear shift. suggested_name: short English name (2-5 words).",
-        "TOPIC_MATCH — conversation has RETURNED to a topic in the table above. "
-        "topic_id: the # from the table. Score 6+ means a clear match.",
-        "For ongoing discussion on the same topic, use low scores (0-2). "
-        "Brief tangents score 3-5. Only score 6+ on consecutive turns "
-        "triggers a switch.",
-    ))
+    # Ask agent to classify the topic as part of its response
+    lines.append(
+        "Before responding, identify which topic from the table above "
+        "this message belongs to. Append exactly:"
+    )
+    lines.append("")
+    lines.append("TOPIC: <id>")
+    lines.append("")
+    lines.append(
+        "Pick the matching topic ID (e.g. TOPIC: 1). If this is a NEW topic "
+        "not in the table, use TOPIC: new <2-5 word name>. "
+        "If no topics exist yet, use TOPIC: new <name>."
+    )
     return "\n".join(lines)
 
 
