@@ -271,6 +271,60 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _build_topic_detection_block(agent: Any) -> str:
+    """Build the session topic index and auto-detection instruction.
+
+    Returns an empty string if topic segmentation is not active or no
+    topics exist yet. Placed in the volatile prompt tail so it does not alter
+    the stable cached prefix.
+    """
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not db or not session_id:
+        return ""
+
+    try:
+        topics = db.get_topics(session_id)
+    except Exception:
+        return ""
+
+    topic_rows = topics[:5]
+    lines = []
+    if topic_rows:
+        lines.append("## Session Topics")
+        lines.append("")
+        lines.append("| # | Topic | Msgs | State |")
+        lines.append("|---|-------|------|-------|")
+        for topic in topic_rows:
+            state_marker = "**active**" if topic["state"] == "active" else topic["state"]
+            lines.append(
+                f"| {topic['id']} | {topic['title']} | {topic['message_count']} | {state_marker} |"
+            )
+        if len(topics) > 5:
+            lines.extend(("", f"... and {len(topics) - 5} more archived topics."))
+        lines.append("")
+
+    lines.extend((
+        "After your response, append exactly one or two lines to help track "
+        "conversation topics. These lines are parsed by the system and "
+        "stripped before the user sees your output:",
+        "",
+        "```",
+        "TOPIC_SHIFT: <score 0-10> | <suggested_name or ->",
+        "TOPIC_MATCH: <topic_id or -> | <score 0-10>",
+        "```",
+        "",
+        "TOPIC_SHIFT — conversation has moved to a NEW topic. Score 6+ means "
+        "a clear shift. suggested_name: short English name (2-5 words).",
+        "TOPIC_MATCH — conversation has RETURNED to a topic in the table above. "
+        "topic_id: the # from the table. Score 6+ means a clear match.",
+        "For ongoing discussion on the same topic, use low scores (0-2). "
+        "Brief tangents score 3-5. Only score 6+ on consecutive turns "
+        "triggers a switch.",
+    ))
+    return "\n".join(lines)
+
+
 def _tool_guidance_block(agent: Any) -> Optional[str]:
     """Tool-aware behavioral guidance, injected only when the tools are loaded."""
     names = agent.valid_tool_names
@@ -726,6 +780,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # a resumed process can reconstruct the stable prefix without re-running plugins.
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
     volatile_parts.append(_timestamp_line(agent))
+    _topic_detection = _build_topic_detection_block(agent)
+    if _topic_detection:
+        volatile_parts.append(_topic_detection)
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
     if environment_hints:
