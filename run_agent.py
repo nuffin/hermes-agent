@@ -1718,6 +1718,27 @@ class AIAgent:
         except Exception:
             pass
 
+    def _auto_create_first_topic(self, first_message: str) -> Optional[int]:
+        """Create initial topic on first user message if none exists."""
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if not db or not sid:
+            return None
+        try:
+            existing = db.get_topics(sid)
+            if existing:
+                return existing[0]["id"] if existing[0]["state"] == "active" else None
+            # Derive topic name from first message (first 40 chars)
+            name = first_message[:40].strip() if first_message else "new session"
+            if not name:
+                name = "new session"
+            topic_id = db.create_topic(sid, name)
+            self._active_topic_id = topic_id
+            db.update_topic_message_count(topic_id, 0)
+            return topic_id
+        except Exception:
+            return None
+
     def _is_ollama_glm_backend(self) -> bool:
         """Detect Ollama-hosted GLM models affected by stop misreports.
 
@@ -2202,6 +2223,11 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                _row_topic_id = self._active_topic_id
+                if _row_topic_id is None and role == "user":
+                    _row_topic_id = self._auto_create_first_topic(
+                        msg.get("content", "")
+                    )
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -2210,6 +2236,7 @@ class AIAgent:
                         if role == "assistant" and isinstance(content, str)
                         else content
                     ),
+                    topic_id=_row_topic_id,
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
