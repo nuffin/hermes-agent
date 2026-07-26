@@ -435,6 +435,7 @@ CREATE TABLE IF NOT EXISTS session_topics (
     normalized_title TEXT,
     summary TEXT,
     state TEXT NOT NULL DEFAULT 'active',
+    message_count INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     last_active_at REAL NOT NULL
 );
