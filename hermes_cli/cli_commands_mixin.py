@@ -48,6 +48,44 @@ class CLICommandsMixin:
     ``HermesCLI`` via the MRO.
     """
 
+    def _handle_topic_command(self, cmd_original: str) -> None:
+        """Handle /topic [list|switch N|new name] — session topic management."""
+        from cli import _cprint
+        parts = cmd_original.split(None, 2)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+        arg = parts[2].strip() if len(parts) > 2 else ""
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if not db or not sid:
+            _cprint("  Session database not available.")
+            return
+        if sub == "list" or not sub:
+            topics = db.get_topics(sid)
+            if not topics:
+                _cprint("  No topics in this session yet.")
+                return
+            _cprint("  Session Topics:")
+            for topic in topics:
+                marker = " *" if topic["state"] == "active" else "  "
+                _cprint(f"  {marker} [{topic['id']}] {topic['title']} ({topic['message_count']} msgs, {topic['state']})")
+        elif sub in {"switch", "sw"}:
+            if not arg:
+                _cprint("  Usage: /topic switch <id>")
+                return
+            try:
+                topic_id = int(arg)
+            except ValueError:
+                _cprint(f"  Invalid topic id: {arg}")
+                return
+            _cprint(f"  Switched to topic {topic_id}." if db.set_active_topic(sid, topic_id) else f"  Topic {topic_id} not found.")
+        elif sub == "new":
+            name = arg if arg else "unnamed"
+            topic_id = db.create_topic(sid, name)
+            db.set_topic_session_title(sid)
+            _cprint(f"  Created topic [{topic_id}] '{name}'.")
+        else:
+            _cprint("  Usage: /topic [list|switch N|new name]")
+
     def _handle_rollback_command(self, command: str):
         """Handle /rollback — list, diff, or restore filesystem checkpoints.
 
