@@ -338,16 +338,33 @@ def _profile_name_for_home(home: Path) -> str:
 
 
 def _build_topic_detection_block(agent: Any) -> str:
-    """Build the session topic index and auto-detection instruction."""
-    if not getattr(agent, "_topic_segmentation_enabled", False):
+    """Build the active session topic index and detection instructions."""
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not db or not session_id:
         return ""
-    topics = getattr(agent, "_active_topics", []) or []
-    lines = ["## Session topics"]
-    for topic in topics:
-        if isinstance(topic, dict):
-            lines.append(f"- {topic.get('id', '')}: {topic.get('name', '')}")
-    lines.append("Emit TOPIC_SHIFT when the conversation enters a new topic.")
-    lines.append("Emit TOPIC_MATCH when it returns to an existing topic.")
+    try:
+        topics = db.get_topics(session_id)
+    except Exception:
+        return ""
+    rows = topics[:5]
+    lines = []
+    if rows:
+        lines.extend(["## Session Topics", "", "| # | Topic | Msgs | State |", "|---|-------|------|-------|"])
+        for topic in rows:
+            state = "**active**" if topic["state"] == "active" else topic["state"]
+            lines.append(f"| {topic['id']} | {topic['title']} | {topic['message_count']} | {state} |")
+        if len(topics) > 5:
+            lines.append(f"\n... and {len(topics) - 5} more archived topics.")
+    lines.extend([
+        "",
+        "After your response, append exactly one or two lines for topic tracking; the system strips them before display:",
+        "```",
+        "TOPIC_SHIFT: <score 0-10> | <suggested_name or ->",
+        "TOPIC_MATCH: <topic_id or -> | <score 0-10>",
+        "```",
+        "TOPIC_SHIFT means a new topic; TOPIC_MATCH means returning to a listed topic. Use scores 6+ only for clear changes.",
+    ])
     return "\n".join(lines)
 
 
