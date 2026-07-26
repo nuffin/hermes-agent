@@ -2464,6 +2464,19 @@ class AIAgent:
             return 50000
 
     @staticmethod
+    def _hook_max_string_chars() -> int:
+        """Max chars for individual string values in hook payloads.
+
+        Configurable via HERMES_HOOK_MAX_STRING_CHARS (default 8000).
+        Controls truncation of message content, tool output, etc.
+        """
+        raw = os.getenv("HERMES_HOOK_MAX_STRING_CHARS", "8000")
+        try:
+            return max(100, int(raw))
+        except (TypeError, ValueError):
+            return 8000
+
+    @staticmethod
     def _is_sensitive_hook_key(key: Any) -> bool:
         if not isinstance(key, str):
             return False
@@ -2484,9 +2497,11 @@ class AIAgent:
         *,
         depth: int = 0,
         max_depth: int = 8,
-        max_string: int = 8000,
+        max_string: int | None = None,
         max_sequence: int = 200,
     ) -> Any:
+        if max_string is None:
+            max_string = cls._hook_max_string_chars()
         if depth > max_depth:
             return f"<{type(value).__name__} depth limit>"
         if value is None or isinstance(value, (bool, int, float)):
