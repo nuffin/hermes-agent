@@ -226,6 +226,33 @@ class _StreamErrorEvent(Exception):
         self.body: Dict[str, Any] = {"error": {"message": message, "code": code, "param": param, "type": "error"}}
 
 
+# ── Topic Signal Parser ───────────────────────────────────────────
+_TOPIC_SHIFT_RE = re.compile(r"^TOPIC_SHIFT:\s*(\d{1,2})\s*\|\s*(.+?)\s*$", re.MULTILINE)
+_TOPIC_MATCH_RE = re.compile(r"^TOPIC_MATCH:\s*(\d{1,2}|\-)\s*\|\s*(\d{1,2})\s*$", re.MULTILINE)
+_TOPIC_SHIFT_THRESHOLD = 6
+_TOPIC_CONSECUTIVE_THRESHOLD = 3
+
+
+def _parse_topic_signals(content: str) -> tuple[str, Optional[dict], Optional[dict]]:
+    """Extract and strip TOPIC_SHIFT and TOPIC_MATCH lines from content."""
+    shift_info = match_info = None
+    match = _TOPIC_SHIFT_RE.search(content)
+    if match:
+        name = match.group(2).strip()
+        shift_info = {"score": int(match.group(1)), "name": "" if name == "-" else name}
+        content = content[:match.start()] + content[match.end():]
+    match = _TOPIC_MATCH_RE.search(content)
+    if match:
+        topic_id_str = match.group(1).strip()
+        if topic_id_str != "-":
+            try:
+                match_info = {"topic_id": int(topic_id_str), "score": int(match.group(2))}
+            except ValueError:
+                pass
+        content = content[:match.start()] + content[match.end():]
+    return content.strip(), shift_info, match_info
+
+
 class AIAgent(
     ClientLifecycleMixin, StreamDeliveryMixin, StatusOutputMixin, ApiRequestHooksMixin, ApiErrorSummaryMixin,
     InterruptControlMixin, TurnExplainersMixin, ActivityTrackingMixin, RateLimitCreditsMixin,
@@ -422,6 +449,11 @@ class AIAgent(
 
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+        self._topic_shift_counter = 0
+        self._topic_shift_candidate_name: Optional[str] = None
+        self._topic_match_counter = 0
+        self._topic_match_candidate_id: Optional[int] = None
+        self._active_topic_id: Optional[int] = None
         # The drifted-prompt compaction INFO is once per session, so a /new or /resume re-arms it.
         self._compaction_prompt_drift_logged = False
         # Who wrote the current turn. build_turn_context() sets it at the start of every turn.
@@ -715,6 +747,57 @@ class AIAgent(
         last = stripped[-1]
         # Closing punctuation/brackets, a fenced-code close, or an emoji (Misc Symbols, Dingbats, Emoticons, ...).
         return stripped.endswith("```") or last in '.!?:)"\']}。！？：）】」』》^' or ord(last) >= 0x1F300
+
+    def _process_topic_signals(self, content: str) -> str:
+        """Parse TOPIC_SHIFT/MATCH from assistant content and update counters."""
+        cleaned, shift, match = _parse_topic_signals(content)
+        if shift and shift["score"] >= _TOPIC_SHIFT_THRESHOLD:
+            self._topic_shift_counter += 1
+            if shift["name"]:
+                self._topic_shift_candidate_name = shift["name"]
+        else:
+            self._topic_shift_counter = 0
+            self._topic_shift_candidate_name = None
+        if self._topic_shift_counter >= _TOPIC_CONSECUTIVE_THRESHOLD:
+            self._create_topic_from_shift()
+            self._topic_shift_counter = self._topic_match_counter = 0
+            return cleaned
+        if match and match["score"] >= _TOPIC_SHIFT_THRESHOLD:
+            self._topic_match_counter += 1
+            self._topic_match_candidate_id = match["topic_id"]
+        else:
+            self._topic_match_counter = 0
+            self._topic_match_candidate_id = None
+        if self._topic_match_counter >= _TOPIC_CONSECUTIVE_THRESHOLD:
+            if self._topic_match_candidate_id is not None:
+                self._switch_to_topic(self._topic_match_candidate_id)
+            self._topic_match_counter = self._topic_shift_counter = 0
+        return cleaned
+
+    def _create_topic_from_shift(self) -> None:
+        """Create a new topic from accumulated shift signal."""
+        db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        if not db or not sid:
+            return
+        try:
+            if self._active_topic_id is not None:
+                db.set_active_topic(sid, 0)
+            self._active_topic_id = db.create_topic(sid, self._topic_shift_candidate_name or "unnamed")
+            self._invalidate_system_prompt()
+        except Exception:
+            pass
+
+    def _switch_to_topic(self, topic_id: int) -> None:
+        """Switch active topic to an existing one."""
+        db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        if not db or not sid:
+            return
+        try:
+            if db.set_active_topic(sid, topic_id):
+                self._active_topic_id = topic_id
+                self._invalidate_system_prompt()
+        except Exception:
+            pass
 
     def _is_ollama_glm_backend(self) -> bool:
         """Ollama-hosted GLM models misreport finish_reason='stop'. Matches only explicit Ollama signatures
