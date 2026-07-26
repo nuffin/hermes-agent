@@ -2285,7 +2285,11 @@ class AIAgent:
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
-                    content=content,
+                    content=(
+                        self._process_topic_signals(content)
+                        if role == "assistant" and isinstance(content, str)
+                        else content
+                    ),
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
