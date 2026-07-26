@@ -337,6 +337,20 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _build_topic_detection_block(agent: Any) -> str:
+    """Build the session topic index and auto-detection instruction."""
+    if not getattr(agent, "_topic_segmentation_enabled", False):
+        return ""
+    topics = getattr(agent, "_active_topics", []) or []
+    lines = ["## Session topics"]
+    for topic in topics:
+        if isinstance(topic, dict):
+            lines.append(f"- {topic.get('id', '')}: {topic.get('name', '')}")
+    lines.append("Emit TOPIC_SHIFT when the conversation enters a new topic.")
+    lines.append("Emit TOPIC_MATCH when it returns to an existing topic.")
+    return "\n".join(lines)
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -863,6 +877,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
+    topic_block = _build_topic_detection_block(agent)
+    if topic_block:
+        volatile_parts.append(topic_block)
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
