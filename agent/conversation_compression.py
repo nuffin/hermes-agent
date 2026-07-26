@@ -3549,7 +3549,7 @@ def _commit_compaction(
                 # Tail rows tagged by compress() are archived as superseded duplicates, not
                 # compacted=1. Count against the FINAL list — salvage may have dropped rows.
                 agent._session_db.archive_and_compact(
-                    agent.session_id, compressed, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
+                    agent.session_id, compressed, topic_id=getattr(agent, "_active_topic_id", None), model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder,
                     tail_count=sum(1 for m in compressed if id(m) in _tail_tagged_ids),
                 )
