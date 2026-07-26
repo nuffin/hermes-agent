@@ -2452,6 +2452,12 @@ class AIAgent:
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
+                    _written_topic_id = _written.get("topic_id")
+                    if _written_topic_id is not None:
+                        try:
+                            self._session_db.update_topic_message_count(_written_topic_id, 1)
+                        except Exception:
+                            pass
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
