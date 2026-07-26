@@ -355,6 +355,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
             f"WHERE parent_session_id IN ({ph})",
             ids,
         )
+        conn.execute(f"DELETE FROM session_topics WHERE session_id IN ({ph})", ids)
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
 
@@ -9473,6 +9474,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
+                    f"DELETE FROM session_topics WHERE session_id IN ({placeholders})", ids
+                )
+                conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
                 self._delete_unreferenced_system_prompts(conn)
@@ -13972,6 +13976,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_topics WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True
@@ -14005,7 +14010,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             cursor = conn.execute(
                 """
-                DELETE FROM sessions
+                SELECT 1 FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (
@@ -14018,9 +14023,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """,
                 (session_id,),
             )
-            if cursor.rowcount > 0:
-                self._delete_unreferenced_system_prompts(conn)
-            return cursor.rowcount > 0
+            if cursor.fetchone() is None:
+                return False
+            conn.execute("DELETE FROM session_topics WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._delete_unreferenced_system_prompts(conn)
+            return True
 
         deleted = self._execute_write(_do)
         if deleted:
@@ -14094,6 +14102,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
+                existing,
+            )
+            conn.execute(
+                f"DELETE FROM session_topics WHERE session_id IN ({existing_placeholders})",
                 existing,
             )
             conn.execute(
@@ -14211,6 +14223,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # still leave a clean FK state.
                 conn.execute(
                     "DELETE FROM messages WHERE session_id = ?", (sid,)
+                )
+                conn.execute(
+                    "DELETE FROM session_topics WHERE session_id = ?", (sid,)
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
@@ -14601,6 +14616,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_topics WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             self._delete_unreferenced_system_prompts(conn)
