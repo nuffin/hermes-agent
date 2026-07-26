@@ -2378,8 +2378,12 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                _row_topic_id = self._active_topic_id
+                if _row_topic_id is None and role == "user":
+                    _row_topic_id = self._auto_create_first_topic(content or "")
                 _batch_rows.append({
                     "role": role,
+                    "topic_id": _row_topic_id,
                     "content": (
                         self._process_topic_signals(content)
                         if role == "assistant" and isinstance(content, str)
