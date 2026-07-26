@@ -3422,6 +3422,7 @@ def compress_context(
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        topic_id=getattr(agent, "_active_topic_id", None),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are

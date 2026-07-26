@@ -9636,6 +9636,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        topic_id: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9680,10 +9681,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them.
+            where = "session_id = ? AND active = 1"
+            params: List[Any] = [session_id]
+            if topic_id is not None:
+                where += " AND topic_id = ?"
+                params.append(topic_id)
             conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
+                f"UPDATE messages SET active = 0, compacted = 1 WHERE {where}",
+                params,
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
