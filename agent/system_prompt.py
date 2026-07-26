@@ -362,7 +362,7 @@ def _build_topic_detection_block(agent: Any) -> str:
         "",
         "TOPIC: <id>",
         "",
-        "Pick the matching topic ID (for example, TOPIC: 1). If this is a NEW topic not in the table, use TOPIC: new <2-5 word name>. If no topics exist yet, use TOPIC: new <name>.",
+        "Before responding, identify which topic this belongs to. If it continues an existing topic from the table above, use TOPIC: <id> (just the number). Only if the subject has CLEARLY changed to something unrelated, use TOPIC: new <2-4 word name>. Follow-up questions on the same subject are NOT new topics.",
     ])
     return "\n".join(lines)
 
