@@ -255,6 +255,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
             f"WHERE parent_session_id IN ({ph})",
             ids,
         )
+        conn.execute(f"DELETE FROM session_topics WHERE session_id IN ({ph})", ids)
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
 
@@ -5310,6 +5311,9 @@ class SessionDB:
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
+                    f"DELETE FROM session_topics WHERE session_id IN ({placeholders})", ids
+                )
+                conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
             return ids
@@ -9511,6 +9515,7 @@ class SessionDB:
                 (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_topics WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
 
@@ -9543,7 +9548,7 @@ class SessionDB:
         def _do(conn):
             cursor = conn.execute(
                 """
-                DELETE FROM sessions
+                SELECT 1 FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (
@@ -9556,7 +9561,11 @@ class SessionDB:
                 """,
                 (session_id,),
             )
-            return cursor.rowcount > 0
+            if cursor.fetchone() is None:
+                return False
+            conn.execute("DELETE FROM session_topics WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
 
         deleted = self._execute_write(_do)
         if deleted:
@@ -9630,6 +9639,10 @@ class SessionDB:
             )
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
+                existing,
+            )
+            conn.execute(
+                f"DELETE FROM session_topics WHERE session_id IN ({existing_placeholders})",
                 existing,
             )
             conn.execute(
@@ -9728,6 +9741,9 @@ class SessionDB:
                 # real row count, we still leave a clean FK state.
                 conn.execute(
                     "DELETE FROM messages WHERE session_id = ?", (sid,)
+                )
+                conn.execute(
+                    "DELETE FROM session_topics WHERE session_id = ?", (sid,)
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
@@ -10024,6 +10040,7 @@ class SessionDB:
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_topics WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
