@@ -12494,6 +12494,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
+        topic_id: Optional[int] = None,
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
@@ -12588,11 +12589,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             tail_ids: list[int] = []
             tail_tool_calls = 0
             if watermark is not None:
+                tail_where = "session_id = ? AND active = 1 AND id > ?"
+                tail_params: list = [session_id, int(watermark)]
+                if topic_id is not None:
+                    tail_where += " AND topic_id = ?"
+                    tail_params.append(topic_id)
                 for row in conn.execute(
-                    "SELECT id, tool_calls FROM messages "
-                    "WHERE session_id = ? AND active = 1 AND id > ? "
+                    f"SELECT id, tool_calls FROM messages WHERE {tail_where} "
                     "ORDER BY id",
-                    (session_id, int(watermark)),
+                    tail_params,
                 ).fetchall():
                     tail_ids.append(int(row["id"]))
                     raw = row["tool_calls"]
@@ -12612,55 +12617,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # verbatim clones ride inside *compacted_messages* (tail_count)
             # are superseded duplicates instead (#86366): they get the
             # rewind-style flags so they stop matching the recall filter.
-            # Rewind-target ids: the originals of the carried-forward tail
-            # rows (tail_count), captured BEFORE any flag flips. Named apart
-            # from the watermark `tail_ids` below on purpose — the two are
-            # different sets (#86366): rewind targets sit AT/BELOW the
-            # watermark (the compressor only saw rows up to it), while
-            # `tail_ids` are concurrent appends ABOVE it. Without the bound,
-            # a concurrent append would steal a LIMIT slot and leave a real
-            # carried-forward original stamped compacted=1.
+            # Scope both carried-forward and concurrent tails to the selected
+            # topic. This preserves upstream's duplicate-recall prevention
+            # without consuming a different topic's rows as a tail.
+            where = "session_id = ? AND active = 1"
+            params: list = [session_id]
+            if topic_id is not None:
+                where += " AND topic_id = ?"
+                params.append(topic_id)
+
             rewind_tail_ids: Optional[list[int]] = None
             if tail_count > 0:
+                rewind_where = where
+                rewind_params = list(params)
                 if watermark is not None:
-                    tail_rows = conn.execute(
-                        "SELECT id FROM messages "
-                        "WHERE session_id = ? AND active = 1 AND id <= ? "
-                        "ORDER BY id DESC LIMIT ?",
-                        (session_id, int(watermark), int(tail_count)),
-                    ).fetchall()
-                else:
-                    tail_rows = conn.execute(
-                        "SELECT id FROM messages "
-                        "WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT ?",
-                        (session_id, int(tail_count)),
-                    ).fetchall()
+                    rewind_where += " AND id <= ?"
+                    rewind_params.append(int(watermark))
+                tail_rows = conn.execute(
+                    f"SELECT id FROM messages WHERE {rewind_where} "
+                    "ORDER BY id DESC LIMIT ?",
+                    [*rewind_params, int(tail_count)],
+                ).fetchall()
                 rewind_tail_ids = [int(row["id"]) for row in tail_rows]
 
-            # The watermark clone below re-inserts `tail_ids` rows byte-exact
-            # as live rows — their originals are the SAME superseded-duplicate
-            # class as the carried-forward tail (#86366), so they take the
-            # rewind flags too instead of double-matching the recall filter.
+            # The watermark clones below and carried-forward tail originals are
+            # rewind-style duplicates, while all other selected rows remain
+            # searchable compacted history.
             rewind_ids = [*(rewind_tail_ids or []), *tail_ids]
-
             if rewind_ids:
                 placeholders = ",".join("?" for _ in rewind_ids)
                 conn.execute(
                     "UPDATE messages SET active = 0, compacted = 0 "
-                    f"WHERE session_id = ? AND id IN ({placeholders})",
-                    [session_id, *rewind_ids],
+                    f"WHERE id IN ({placeholders})",
+                    rewind_ids,
                 )
                 conn.execute(
                     "UPDATE messages SET active = 0, compacted = 1 "
-                    "WHERE session_id = ? AND active = 1 "
-                    f"AND id NOT IN ({placeholders})",
-                    [session_id, *rewind_ids],
+                    f"WHERE {where} AND id NOT IN ({placeholders})",
+                    [*params, *rewind_ids],
                 )
             else:
                 conn.execute(
-                    "UPDATE messages SET active = 0, compacted = 1 "
-                    "WHERE session_id = ? AND active = 1",
-                    (session_id,),
+                    f"UPDATE messages SET active = 0, compacted = 1 WHERE {where}",
+                    params,
                 )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
