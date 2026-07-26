@@ -799,6 +799,23 @@ class AIAgent(
         except Exception:
             pass
 
+    def _auto_create_first_topic(self, first_message: str) -> Optional[int]:
+        """Create the initial topic before a first user row enters the DB write lock."""
+        db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        if not db or not sid:
+            return None
+        try:
+            existing = db.get_topics(sid)
+            if existing:
+                active = next((topic for topic in existing if topic["state"] == "active"), None)
+                return active["id"] if active else None
+            name = first_message[:40].strip() if first_message else "new session"
+            topic_id = db.create_topic(sid, name or "new session")
+            self._active_topic_id = topic_id
+            return topic_id
+        except Exception:
+            return None
+
     def _is_ollama_glm_backend(self) -> bool:
         """Ollama-hosted GLM models misreport finish_reason='stop'. Matches only explicit Ollama signatures
         (port 11434, "ollama" in URL, provider ollama), never arbitrary local proxies; excludes Ollama Cloud

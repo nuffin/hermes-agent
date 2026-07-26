@@ -155,6 +155,9 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
     role = msg.get("role", "unknown")
     content = msg.get("content")
+    topic_id = getattr(agent, "_active_topic_id", None)
+    if topic_id is None and role == "user":
+        topic_id = agent._auto_create_first_topic(content if isinstance(content, str) else "")
     if role == "assistant" and isinstance(content, str):
         content = agent._process_topic_signals(content)
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
@@ -183,6 +186,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         "timestamp": timestamp, "api_content": api_content,
         "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
         "platform_message_id": msg.get("platform_message_id"),  # load-bearing for restart drain-window recovery dedup
+        "topic_id": topic_id,
     }
     if isinstance(msg.get("_row_id"), int):
         row["_row_id"] = msg["_row_id"]
