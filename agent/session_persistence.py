@@ -241,6 +241,13 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
+    for written_row in batch_rows:
+        topic_id = written_row.get("topic_id")
+        if topic_id is not None:
+            try:
+                agent._session_db.update_topic_message_count(topic_id, 1)
+            except Exception:
+                pass
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
