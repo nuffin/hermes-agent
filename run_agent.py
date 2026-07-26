@@ -1833,6 +1833,39 @@ class AIAgent:
         except Exception:
             pass
 
+    def _auto_create_first_topic(self, first_message: str) -> Optional[int]:
+        """Create initial topic on first user message if none exists."""
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if not db or not sid:
+            return None
+        try:
+            existing = db.get_topics(sid)
+            if existing:
+                return existing[0]["id"] if existing[0]["state"] == "active" else None
+            name = first_message[:40].strip() if first_message else "new session"
+            topic_id = db.create_topic(sid, name or "new session")
+            self._active_topic_id = topic_id
+            return topic_id
+        except Exception:
+            return None
+
+    def _ensure_topic_for_session(self) -> None:
+        """Create first topic if none exists. Called outside write lock."""
+        if self._active_topic_id is not None:
+            return
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if not db or not sid:
+            return
+        try:
+            existing = db.get_topics(sid)
+            if not existing:
+                self._active_topic_id = db.create_topic(sid, "new session")
+        except Exception:
+            pass
+
+
     def _is_ollama_glm_backend(self) -> bool:
         """Detect Ollama-hosted GLM models affected by stop misreports.
 
@@ -2045,14 +2078,16 @@ class AIAgent:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
-
-        Trailing empty-response scaffolding is dropped from the live list in
-        place (it is ephemeral junk the real transcript should shed). The
-        persist user-message *override* is NOT applied here — it is resolved
-        inside ``_flush_messages_to_session_db`` and written only to the DB row,
-        never mutating the live message list used by the API call (#48677 is
-        thus closed for every persist caller, not just this one).
         """
+        # Ensure a topic exists before persisting messages
+        self._ensure_topic_for_session()
+
+        # Trailing empty-response scaffolding is dropped from the live list in
+        # place (it is ephemeral junk the real transcript should shed). The
+        # persist user-message *override* is NOT applied here — it is resolved
+        # inside ``_flush_messages_to_session_db`` and written only to the DB row,
+        # never mutating the live message list used by the API call (#48677 is
+        # thus closed for every persist caller, not just this one).
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
