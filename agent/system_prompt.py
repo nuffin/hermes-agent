@@ -358,8 +358,8 @@ def _build_topic_detection_block(agent: Any) -> str:
             lines.append(f"\n... and {len(topics) - 5} more archived topics.")
     lines.extend([
         "",
-        "Append exactly one line to every response: TOPIC: <id or new name>.",
-        "Pick from the table above, or use TOPIC: new <name> for a new subject. Follow-ups reuse the same topic ID. Do not skip.",
+        "Append exactly one line to every response: TOPIC: <name>.",
+        "Use the same name for follow-ups on the same subject.",
     ])
     return "\n".join(lines)
 
