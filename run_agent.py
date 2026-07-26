@@ -816,6 +816,23 @@ class AIAgent(
         except Exception:
             return None
 
+    def _ensure_topic_for_session(self) -> None:
+        """Ensure a first topic exists before persistence acquires its write lock."""
+        if self._active_topic_id is not None:
+            return
+        db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        if not db or not sid:
+            return
+        try:
+            existing = db.get_topics(sid)
+            active = next((topic for topic in existing if topic["state"] == "active"), None)
+            if active:
+                self._active_topic_id = active["id"]
+            elif not existing:
+                self._active_topic_id = db.create_topic(sid, "new session")
+        except Exception:
+            pass
+
     def _is_ollama_glm_backend(self) -> bool:
         """Ollama-hosted GLM models misreport finish_reason='stop'. Matches only explicit Ollama signatures
         (port 11434, "ollama" in URL, provider ollama), never arbitrary local proxies; excludes Ollama Cloud

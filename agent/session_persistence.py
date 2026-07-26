@@ -322,6 +322,7 @@ class SessionPersistenceMixin:
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
+        self._ensure_topic_for_session()
         with _persist_lock(self):
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
