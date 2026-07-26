@@ -2666,6 +2666,15 @@ class AIAgent:
                 from agent.transcript_repair import sync_flushed_message_markers
 
                 sync_flushed_message_markers(_batch_msgs, _batch_rows)
+                for _written_row in _batch_rows:
+                    _written_topic_id = _written_row.get("topic_id")
+                    if _written_topic_id is not None:
+                        try:
+                            self._session_db.update_topic_message_count(
+                                _written_topic_id, 1
+                            )
+                        except Exception:
+                            pass
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
