@@ -137,6 +137,17 @@ class SessionTitlesMixin:
             raise ValueError(f"invalid automatic title source: {source!r}")
         return self._set_session_title(session_id, title, source=source)
 
+    def set_topic_session_title(self, session_id: str) -> Optional[str]:
+        """Set session title from the first topic name plus an optional count suffix."""
+        topics = self.get_topics(session_id)
+        if not topics:
+            return None
+        first = topics[0]["title"]
+        total = len(topics)
+        title = first if total == 1 else f"{first} (+{total - 1} topics)"
+        self.set_session_title(session_id, title)
+        return title
+
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
         row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
