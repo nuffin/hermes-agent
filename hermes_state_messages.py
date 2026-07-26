@@ -1027,13 +1027,12 @@ class SessionMessagesMixin:
              *((patched_model_config,) if patch else ()), session_id))
         return active_count
 
-    def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
-        model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
+    def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]], topic_id: Optional[int] = None,
+       model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
         lock_holder: Optional[str] = None, tail_count: int = 0,
         carried_messages: Optional[List[Dict[str, Any]]] = None,
         covered_ids: Optional[List[int]] = None,
-        unresolved_held: Optional[List[Dict[str, Any]]] = None,
-        topic_id: Optional[int] = None) -> int:
+        unresolved_held: Optional[List[Dict[str, Any]]] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -1091,14 +1090,15 @@ class SessionMessagesMixin:
             if proved is not None:
                 return self._archive_named_rows(
                     conn, session_id, compacted_messages, proved, tail_count=tail_count,
-                    carried_messages=carried_messages,
-                    patched_model_config=patched_model_config, patch=patch,
-                    topic_id=selected_topic_id)
-            tail_ids, _tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
-                conn,
-                "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 "
-                f"AND id > ?{topic_clause} ORDER BY id",
-                (session_id, int(watermark), *topic_params))
+                    carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch)
+            topic_where = "session_id = ? AND active = 1"
+            topic_params: list[Any] = [session_id]
+            if topic_id is not None:
+                topic_where += " AND topic_id = ?"
+                topic_params.append(topic_id)
+            tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
+                conn, f"SELECT id, tool_calls FROM messages WHERE {topic_where} AND id > ? ORDER BY id",
+                (*topic_params, int(watermark)))
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
@@ -1106,28 +1106,19 @@ class SessionMessagesMixin:
             if tail_count > 0:
                 bound = watermark is not None
                 rewind_ids += [int(row["id"]) for row in conn.execute(
-                    f"SELECT id FROM messages WHERE session_id = ? AND active = 1"
-                    f"{' AND id <= ?' if bound else ''}{topic_clause} "
+                    f"SELECT id FROM messages WHERE {topic_where}{' AND id <= ?' if bound else ''} "
                     "ORDER BY id DESC LIMIT ?",
-                    (session_id, *((int(watermark),) if bound else ()), *topic_params,
-                     int(tail_count))).fetchall()]
+                    (*topic_params, *((int(watermark or 0),) if bound else ()), int(tail_count))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
             if rewind_ids:
                 placeholders = _placeholders(rewind_ids)
                 conn.execute("UPDATE messages SET active = 0, compacted = 0 "
-                    f"WHERE session_id = ? AND id IN ({placeholders})", [session_id, *rewind_ids])
-                conn.execute(
-                    f"{_ARCHIVE_ACTIVE_SQL}{topic_clause} AND id NOT IN ({placeholders})",
-                    [session_id, *topic_params, *rewind_ids],
-                )
+                    f"WHERE id IN ({placeholders})", rewind_ids)
+                conn.execute(f"UPDATE messages SET active = 0, compacted = 1 WHERE {topic_where} AND id NOT IN ({placeholders})", [*topic_params, *rewind_ids])
             else:
-                conn.execute(f"{_ARCHIVE_ACTIVE_SQL}{topic_clause}", (session_id, *topic_params))
-            if selected_topic_id is not None:
-                for message in compacted_messages:
-                    if isinstance(message, dict):
-                        message["_topic_id"] = selected_topic_id
-            self._insert_message_rows(conn, session_id, compacted_messages)
+                conn.execute(f"UPDATE messages SET active = 0, compacted = 1 WHERE {topic_where}", topic_params)
+            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
             if tail_ids:
                 self._clone_message_rows(conn, tail_ids)
             active_count, active_tool_calls = self._active_transcript_counts(conn, session_id)
