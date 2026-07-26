@@ -359,7 +359,7 @@ def _build_topic_detection_block(agent: Any) -> str:
     lines.extend([
         "",
         "Append exactly one line to every response: TOPIC: <name>.",
-        "Use the same name for follow-ups on the same subject.",
+        "For brief asides or one-off questions, stay on the current topic name. Only introduce a new name when the conversation shifts to a sustained new subject. Same name for follow-ups on the same subject.",
     ])
     return "\n".join(lines)
 
