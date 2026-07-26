@@ -80,6 +80,8 @@ class CLICommandsMixin:
             _cprint(f"  Switched to topic {topic_id}." if db.set_active_topic(sid, topic_id) else f"  Topic {topic_id} not found.")
         elif sub == "new":
             name = arg if arg else "unnamed"
+            # Archive the current active topic before creating a new one.
+            db.set_active_topic(sid, 0)
             topic_id = db.create_topic(sid, name)
             db.set_topic_session_title(sid)
             _cprint(f"  Created topic [{topic_id}] '{name}'.")

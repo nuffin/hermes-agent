@@ -358,12 +358,12 @@ def _build_topic_detection_block(agent: Any) -> str:
             lines.append(f"\n... and {len(topics) - 5} more archived topics.")
     lines.extend([
         "",
-        "After your response, append exactly one or two lines for topic tracking; the system strips them before display:",
+        "After EVERY response — even short ones — append exactly one line (and optionally a second) for topic tracking; the system strips them before display:",
         "```",
         "TOPIC_SHIFT: <score 0-10> | <suggested_name or ->",
         "TOPIC_MATCH: <topic_id or -> | <score 0-10>",
         "```",
-        "TOPIC_SHIFT means a new topic; TOPIC_MATCH means returning to a listed topic. Use scores 6+ only for clear changes.",
+        "TOPIC_SHIFT is REQUIRED on every response. Use score 1-2 when staying on the same topic; use score 6+ for a clear new subject. suggested_name: 2-5 words. TOPIC_MATCH is optional when returning to a listed topic. Never skip this line: even for the same topic emit TOPIC_SHIFT: 1 | -.",
     ])
     return "\n".join(lines)
 
