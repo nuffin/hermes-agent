@@ -358,11 +358,8 @@ def _build_topic_detection_block(agent: Any) -> str:
             lines.append(f"\n... and {len(topics) - 5} more archived topics.")
     lines.extend([
         "",
-        "Before responding, identify which topic from the table above this message belongs to. Append exactly:",
-        "",
-        "TOPIC: <id>",
-        "",
-        "Before responding, identify which topic this belongs to. If it continues an existing topic from the table above, use TOPIC: <id> (just the number). Only if the subject has CLEARLY changed to something unrelated, use TOPIC: new <2-4 word name>. Follow-up questions on the same subject are NOT new topics.",
+        "Append exactly one line to every response: TOPIC: <id or new name>.",
+        "Pick from the table above, or use TOPIC: new <name> for a new subject. Follow-ups reuse the same topic ID. Do not skip.",
     ])
     return "\n".join(lines)
 
