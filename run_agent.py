@@ -1419,6 +1419,8 @@ class AIAgent(
         tool_calls = assistant_message.tool_calls
         args = (assistant_message, messages, effective_task_id, api_call_count)
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
+        from agent.tool_guardrails import _set_active_subagent_guardrail
+        _set_active_subagent_guardrail(self._tool_guardrails)
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(*args)
@@ -1433,6 +1435,7 @@ class AIAgent(
             from agent.tool_executor import execute_tool_calls_segmented
             return execute_tool_calls_segmented(self, *args, segments=segments)
         finally:
+            _set_active_subagent_guardrail(None)
             self._executing_tools = False
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:

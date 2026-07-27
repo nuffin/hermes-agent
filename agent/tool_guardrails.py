@@ -302,6 +302,39 @@ _LOOP_CAPS: dict[str, tuple[str, str, str]] = {
 }
 
 
+# ── Subagent spawn reservation/commit (#72550) ────────────────────────────
+# delegate_task normalises its arguments AFTER the guardrail check, so the
+# guardrail cannot know the actual spawn count at before_call() time.  We
+# defer charging to commit_subagent_spawn(), which delegate_tool calls
+# after normalisation.  The active controller is wired in by _execute_tool_calls.
+
+_active_subagent_guardrail: "ToolCallGuardrailController | None" = None
+
+
+def _set_active_subagent_guardrail(ctrl: "ToolCallGuardrailController | None") -> None:
+    global _active_subagent_guardrail
+    _active_subagent_guardrail = ctrl
+
+
+def commit_subagent_spawn(count: int) -> None:
+    """Commit the *actual* subagent spawn count after delegate_task normalisation.
+
+    Called from delegate_tool.py after JSON-string recovery and
+    max_concurrent_children validation.  Caps at the configured
+    max_subagents so an oversized (then rejection-trimmed) batch does
+    not consume spendable budget.
+    """
+    global _active_subagent_guardrail
+    if _active_subagent_guardrail is None:
+        return
+    cap = _active_subagent_guardrail.config.loop_caps.max_subagents
+    if cap:
+        available = cap - _active_subagent_guardrail._turn_subagent_count
+        _active_subagent_guardrail._turn_subagent_count += min(count, available)
+    else:
+        _active_subagent_guardrail._turn_subagent_count += count
+
+
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
@@ -550,12 +583,26 @@ class ToolCallGuardrailController:
         spec = _LOOP_CAPS.get(tool_name)
         if spec is None:
             return None
-        cap_field, count_attr, code = spec
-        cap, count = getattr(self.config.loop_caps, cap_field), getattr(self, count_attr)
-        increment = 1 if tool_name == "web_search" else (_subagent_spawn_count(args) if cap else 0)
-        if increment and cap and count >= cap:
-            return self._decide("block", code, tool_name, count, signature, cap=cap)
-        setattr(self, count_attr, count + increment)
+        if tool_name == "delegate_task":
+            spawn_count = _subagent_spawn_count(args)
+            if spawn_count == 0:
+                # Control action (list/steer/stop) — spawns nothing. Never
+                # block: once the spawn cap is hit, steering/stopping the
+                # existing children is exactly what should still work.
+                return None
+            cap = self.config.loop_caps.max_subagents
+            count = self._turn_subagent_count
+            if cap and count >= cap:
+                return self._decide("block", "loop_subagent_cap", tool_name, count, signature, cap=cap)
+            # Defer charging: commit_subagent_spawn() is called after
+            # delegate_tool normalisation (JSON-string recovery +
+            # max_concurrent_children validation).  (#72550)
+            return None
+        cap = self.config.loop_caps.max_web_searches
+        count = self._turn_web_search_count
+        if cap and count >= cap:
+            return self._decide("block", "loop_web_search_cap", tool_name, count, signature, cap=cap)
+        self._turn_web_search_count += 1
         return None
 
 
