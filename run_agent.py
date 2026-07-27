@@ -805,6 +805,7 @@ class AIAgent:
         # Topic segmentation state
         self._active_topic_id: Optional[int] = None
         self._topic_drift: _TopicDriftTracker = _TopicDriftTracker()
+        self._topic_retitle_threshold: int = 3
 
         # Copilot x-initiator: True for the first API call of a user turn,
         # False for tool-loop follow-ups (#3040).
@@ -1675,6 +1676,17 @@ class AIAgent:
         try:
             existing = db.get_topics(sid)
             name_lower = confirmed.lower()
+
+            # Retitle default topic in-place instead of creating a new one
+            DEFAULT_TOPIC_TITLES = {"misc", "new session"}
+            if confirmed.lower() not in DEFAULT_TOPIC_TITLES and self._active_topic_id is not None:
+                current = next((t for t in existing if t["id"] == self._active_topic_id), None)
+                if current and current["title"].lower() in DEFAULT_TOPIC_TITLES and current.get("message_count", 0) >= self._topic_retitle_threshold:
+                    db.update_topic_title(self._active_topic_id, confirmed)
+                    db.update_topic_message_count(self._active_topic_id, 0)
+                    self._invalidate_system_prompt()
+                    return cleaned
+
             for t in existing:
                 t_lower = t["title"].lower()
                 # Exact match or one contains the other
@@ -1727,9 +1739,9 @@ class AIAgent:
             existing = db.get_topics(sid)
             if existing:
                 return existing[0]["id"] if existing[0]["state"] == "active" else None
-            name = first_message[:40].strip() if first_message else "new session"
+            name = first_message[:40].strip() if first_message else "misc"
             if not name:
-                name = "new session"
+                name = "misc"
             topic_id = db.create_topic(sid, name)
             self._active_topic_id = topic_id
             return topic_id
@@ -1747,7 +1759,7 @@ class AIAgent:
         try:
             existing = db.get_topics(sid)
             if not existing:
-                topic_id = db.create_topic(sid, "new session")
+                topic_id = db.create_topic(sid, "misc")
                 self._active_topic_id = topic_id
         except Exception:
             pass

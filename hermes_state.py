@@ -8816,6 +8816,17 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def update_topic_title(self, topic_id: int, title: str) -> None:
+        """Update a topic's title."""
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE session_topics SET title = ? WHERE id = ?""",
+                (title, topic_id),
+            )
+
+        self._execute_write(_do)
+
     def get_topic_messages(
         self,
         session_id: str,
