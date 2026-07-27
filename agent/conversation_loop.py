@@ -1295,6 +1295,10 @@ def run_conversation(
     # agent_init); default 3 preserves the prior hardcoded behavior for
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
+    # Track whether the most recent compression in this attempt materially
+    # reduced context.  Only effective compactions followed by a successful
+    # model response reset the consecutive-failure streak (#72451).
+    _last_compression_effective = False
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
@@ -2011,6 +2015,10 @@ def run_conversation(
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
+                # Track whether this compression materially reduced context.
+                # Only effective compactions reset the failure streak (#72451).
+                if messages is not _pre_api_input:
+                    _last_compression_effective = True
                 # Reset retry/empty-response state so the compacted request
                 # gets a fresh chance instead of inheriting stale recovery
                 # counters from the pre-compaction history.
@@ -4351,6 +4359,7 @@ def run_conversation(
                                 )
                             )
                             time.sleep(2)
+                            _last_compression_effective = True
                             _retry.restart_with_compressed_messages = True
                             break
                     # Fall through to normal error handling if compression
@@ -4626,6 +4635,7 @@ def run_conversation(
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
+                        _last_compression_effective = True
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -4887,6 +4897,7 @@ def run_conversation(
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
+                        _last_compression_effective = True
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -5585,6 +5596,15 @@ def run_conversation(
             print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
             agent._persist_session(messages, conversation_history)
             break
+
+        # Reset the compression attempt counter after a successful model
+        # response, but only when the preceding compression materially
+        # reduced context.  Identity/no-progress compactions that return
+        # the same messages unchanged do not reset — they still count
+        # toward the consecutive-failure cap.  (#72451)
+        if _last_compression_effective:
+            compression_attempts = 0
+            _last_compression_effective = False
 
         try:
             _transport = agent._get_transport()
@@ -6366,6 +6386,10 @@ def run_conversation(
                         # compression_exhausted (#9893/#35809).
                         compression_attempts -= 1
                     else:
+                        # Track whether this compression materially reduced
+                        # context (#72451).
+                        if messages is not _post_tool_input:
+                            _last_compression_effective = True
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
