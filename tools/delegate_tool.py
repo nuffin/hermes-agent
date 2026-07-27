@@ -32,6 +32,8 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.tool_guardrails import commit_subagent_spawn
+
 from toolsets import TOOLSETS
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -2907,6 +2909,8 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    commit_subagent_spawn(len(task_list))
 
     overall_start = time.monotonic()
     results = []
