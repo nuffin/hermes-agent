@@ -891,11 +891,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in).
-    # It follows the tool exposure gate and is omitted for on_demand mode.
+    # It follows the tool exposure gate and is omitted for on_demand/off modes.
     if (
         agent._memory_manager
-        and getattr(agent, "_memory_mode", "full") != "on_demand"
+        and getattr(agent, "_memory_mode", "full") not in ("on_demand", "off")
     ):
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
