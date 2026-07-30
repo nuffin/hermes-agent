@@ -53,6 +53,14 @@ def _safe_float(val):
         return 0.0
 
 
+def _safe_int(val):
+    """Coerce to int, returning 0 for non-numeric values (defensive)."""
+    try:
+        return int(val) if val is not None else 0
+    except (ValueError, TypeError):
+        return 0
+
+
 def _short_model(model: Optional[str]) -> str:
     """Display name: strip the provider prefix; empty → "unknown"."""
     return (model or "unknown").split("/")[-1]
@@ -281,7 +289,7 @@ class InsightsEngine:
         # main-loop usage only — sum the breakdown when available so overview
         # totals match the per-model table and aux spend isn't undercounted.
         rows = models or sessions
-        total_input, total_output, total_cache_read, total_cache_write = (sum(int(r.get(k) or 0) for r in rows) for k in _TOKEN_KEYS)
+        total_input, total_output, total_cache_read, total_cache_write = (sum(_safe_int(r.get(k)) for r in rows) for k in _TOKEN_KEYS)
         total_tokens = total_input + total_output + total_cache_read + total_cache_write
         total_tool_calls = sum(s.get("tool_call_count") or 0 for s in sessions)
         total_messages = sum(s.get("message_count") or 0 for s in sessions)
@@ -351,13 +359,6 @@ class InsightsEngine:
             d["cost_status"] = status
             d["has_pricing"] = has_known_pricing(model, provider or None, base_url) or d.get("has_pricing", False)
 
-        def _safe_int(val):
-            """Coerce to int, returning 0 for non-numeric values (defensive)."""
-            try:
-                return int(val) if val is not None else 0
-            except (ValueError, TypeError):
-                return 0
-
         usage_totals = defaultdict(lambda: dict.fromkeys(count_keys, 0) | {"estimated_cost_usd": 0.0, "actual_cost_usd": 0.0})
         for r in self._get_model_usage(cutoff, source):
             totals: Dict[str, Any] = usage_totals[r["session_id"]]
@@ -400,8 +401,9 @@ class InsightsEngine:
             d["sessions"] += 1
             d["messages"] += s.get("message_count") or 0
             for k in _TOKEN_KEYS:
-                d[k] += s.get(k) or 0
-                d["total_tokens"] += s.get(k) or 0
+                value = _safe_int(s.get(k))
+                d[k] += value
+                d["total_tokens"] += value
             d["tool_calls"] += s.get("tool_call_count") or 0
         return sorted(({"platform": platform, **data} for platform, data in platform_data.items()), key=lambda x: x["sessions"], reverse=True)
 
