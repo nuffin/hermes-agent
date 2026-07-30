@@ -4,7 +4,7 @@ Hooks: pre_skill_create, pre_skill_write_file, pre_tool_call.
 
 Config (in $HERMES_HOME/config.yaml):
 
-  write_guard:
+  write-guard:
     rules:
       - glob: "**/*.log"
         policy: approve
@@ -44,7 +44,7 @@ def register(ctx):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _load_rules() -> tuple[list[dict], str]:
-    """Load write_guard rules from $HERMES_HOME/config.yaml."""
+    """Load write-guard rules from $HERMES_HOME/config.yaml."""
     try:
         import yaml
         cfg_path = _HERMES_HOME / "config.yaml"
@@ -52,7 +52,7 @@ def _load_rules() -> tuple[list[dict], str]:
             return [], "block"
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f) or {}
-        wg = cfg.get("write_guard", {})
+        wg = cfg.get("write-guard", {})
         rules = wg.get("rules", [])
         default = wg.get("default", "block")
         if default not in ("approve", "block", "deny"):
@@ -170,7 +170,7 @@ def _check_tool_file_write(**kw) -> dict | None:
     if policy == "deny":
         return {
             "action": "block",
-            "reason": f"Write denied by write_guard config: {p}",
+            "reason": f"Write denied by write-guard config: {p}",
         }
 
     # File already exists
