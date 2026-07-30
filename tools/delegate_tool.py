@@ -3617,8 +3617,16 @@ def delegate_task(
 
     charged = commit_subagent_spawn(len(task_list))
     if charged < len(task_list):
+        rejected = len(task_list) - charged
+        rejected_goals = [t.get("goal", "")[:60] for t in task_list[charged:]]
         task_list = task_list[:charged]
         task_schemas = task_schemas[:charged]
+        results.append(
+            tool_result(
+                f"{rejected} task(s) rejected: per-turn subagent spawn cap "
+                f"reached (budget: {charged} this turn). Dropped: {rejected_goals}"
+            )
+        )
 
 
     n_tasks = len(task_list)
