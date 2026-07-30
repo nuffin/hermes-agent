@@ -1070,9 +1070,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(user_block)
 
     # The provider prompt must only appear when its tools are exposed, and never
-    # for on_demand sub-agents: they may call the tools but must not receive the
-    # provider's full context in their initial prompt.
-    if agent._memory_manager and getattr(agent, "_memory_mode", "full") != "on_demand":
+    # for on_demand or off sub-agents: on_demand may call provider tools but must
+    # not receive the provider's full context in its initial prompt.
+    if agent._memory_manager and getattr(agent, "_memory_mode", "full") not in (
+        "on_demand",
+        "off",
+    ):
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
