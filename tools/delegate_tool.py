@@ -51,7 +51,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
         "clarify",  # no user interaction
-        "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
     ]
@@ -4638,6 +4637,15 @@ DELEGATE_TASK_SCHEMA = {
                     "the work finishes; just continue working in the meantime. "
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
+                ),
+            },
+            "memory_mode": {
+                "type": "string",
+                "enum": ["full", "on_demand", "off"],
+                "description": (
+                    "Memory access mode for sub-agents. 'full' injects memory; "
+                    "'on_demand' exposes memory tools without prompt injection; "
+                    "'off' disables memory access. Default: 'on_demand'."
                 ),
             },
             "action": {
