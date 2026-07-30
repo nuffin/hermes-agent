@@ -402,8 +402,8 @@ VALID_HOOKS: Set[str] = {
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
     # Skill lifecycle hooks. Fired before and after a new SKILL.md is written.
-    # pre_skill_create is observer-only in this merged taxonomy; the skill
-    # manager remains the authority for filesystem writes.
+    # pre_skill_create may return handled, redirect, or block directives;
+    # post_skill_create is observer-only.
     "pre_skill_create",
     "post_skill_create",
     # Skill lifecycle — edit. Fired by skill_manage(action='edit') before
