@@ -4022,8 +4022,8 @@ def delegate_task(
     results = []
     rejected_tasks = []
     if rejected > 0:
-        # Report the dropped task labels separately from child results. The
-        # aggregation path requires each ``results`` entry to have a task_index.
+        # Report dropped task labels separately: aggregation requires each
+        # ``results`` entry to be a child-result mapping with task_index.
         rejected_tasks = [
             {
                 "task_index": index,
