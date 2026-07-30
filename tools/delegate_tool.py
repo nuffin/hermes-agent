@@ -517,8 +517,8 @@ def delegate_task(
     charged = commit_subagent_spawn(len(task_list))
     rejected_tasks = []
     if charged < len(task_list):
-        # Do not construct children that the per-turn cap cannot charge; report
-        # them explicitly rather than silently dropping requested work.
+        # Report dropped task labels separately: aggregation requires each
+        # ``results`` entry to be a child-result mapping with task_index.
         rejected_tasks = [
             {
                 "task_index": index,
