@@ -4017,10 +4017,25 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
-    commit_subagent_spawn(len(task_list))
+    charged = commit_subagent_spawn(len(task_list))
+    rejected = len(task_list) - charged
+    results = []
+    rejected_tasks = []
+    if rejected > 0:
+        # Report the dropped task labels separately from child results. The
+        # aggregation path requires each ``results`` entry to have a task_index.
+        rejected_tasks = [
+            {
+                "task_index": index,
+                "goal": task.get("goal", ""),
+                "status": "rejected",
+                "reason": "per-turn subagent spawn cap reached",
+            }
+            for index, task in enumerate(task_list[charged:], start=charged)
+        ]
+        task_list = task_list[:charged]
 
     overall_start = time.monotonic()
-    results = []
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -4326,6 +4341,8 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        if rejected_tasks:
+            combined["rejected_tasks"] = rejected_tasks
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined
