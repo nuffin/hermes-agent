@@ -988,7 +988,11 @@ def current_profile_key() -> str:
 
 def _load_nemo_relay() -> Any:
     """Load the binding only when a producer or consumer needs Relay."""
-    return importlib.import_module("nemo_relay")
+    try:
+        return importlib.import_module("nemo_relay")
+    except ModuleNotFoundError:
+        logger.debug("nemo_relay not installed — relay features unavailable")
+        return None
 
 
 def _session_id(event: dict[str, Any]) -> str:
