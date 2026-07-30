@@ -26,8 +26,8 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind,
-                   display_metadata, display_identity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                   display_metadata, display_identity, topic_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
@@ -266,7 +266,7 @@ class SessionMessagesMixin:
             msg.get("platform_message_id") or msg.get("message_id"),
             1 if msg.get("observed") else 0, 1 if msg.get("_compressed_summary") else 0, 1,
             _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
-            display_metadata, self._display_identity(self._display_dedupe_key(identity_row)))
+            display_metadata, self._display_identity(self._display_dedupe_key(identity_row)), msg.get("topic_id"))
 
     @staticmethod
     def _bump_session_counters(conn, session_id: str, inserted: int, tool_calls: int, *, unit: bool) -> None:
@@ -289,7 +289,8 @@ class SessionMessagesMixin:
         effect_disposition: Optional[str] = None, _compressed_summary: bool = False, timestamp: Any = None,
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
-        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
+        topic_id: Optional[int] = None) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
         it differed from ``content``, stored as sent except lone surrogates."""
@@ -309,6 +310,91 @@ class SessionMessagesMixin:
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    # ── Topic persistence ───────────────────────────────────────────────
+
+    def create_topic(self, session_id: str, title: str, summary: Optional[str] = None) -> int:
+        """Create an active topic for *session_id* and return its row id."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO session_topics
+                   (session_id, title, summary, state, created_at, last_active_at)
+                   VALUES (?, ?, ?, 'active', ?, ?)""",
+                (session_id, title, summary, now, now),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def get_topics(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return session topics in most-recently-active order."""
+        rows = self._read_all(
+            """SELECT id, title, summary, message_count, state, created_at, last_active_at
+               FROM session_topics WHERE session_id = ? ORDER BY last_active_at DESC""",
+            (session_id,),
+        )
+        return [dict(row) for row in rows]
+
+    def get_active_topic(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current active topic, if any."""
+        row = self._read_one(
+            """SELECT id, title, summary, message_count, state, created_at, last_active_at
+               FROM session_topics WHERE session_id = ? AND state = 'active'
+               ORDER BY last_active_at DESC LIMIT 1""",
+            (session_id,),
+        )
+        return dict(row) if row else None
+
+    def set_active_topic(self, session_id: str, topic_id: int) -> bool:
+        """Atomically select an existing topic, warming the previous active topic."""
+        now = time.time()
+
+        def _do(conn):
+            target = conn.execute(
+                "SELECT id FROM session_topics WHERE id = ? AND session_id = ?",
+                (topic_id, session_id),
+            ).fetchone()
+            if target is None:
+                return False
+            conn.execute(
+                """UPDATE session_topics SET state = 'warm', last_active_at = ?
+                   WHERE session_id = ? AND state = 'active'""",
+                (now, session_id),
+            )
+            conn.execute(
+                """UPDATE session_topics SET state = 'active', last_active_at = ?
+                   WHERE id = ? AND session_id = ?""",
+                (now, topic_id, session_id),
+            )
+            return True
+
+        return self._execute_write(_do)
+
+    def update_topic_message_count(self, topic_id: int, count_delta: int = 1) -> None:
+        """Adjust one topic's persisted message count."""
+        def _do(conn):
+            conn.execute(
+                """UPDATE session_topics SET message_count = message_count + ?, last_active_at = ?
+                   WHERE id = ?""",
+                (count_delta, time.time(), topic_id),
+            )
+        self._execute_write(_do)
+
+    def get_topic_messages(self, session_id: str, topic_id: int, include_inactive: bool = False) -> List[Dict[str, Any]]:
+        """Load one topic's transcript rows, decoding stored message content."""
+        active_clause = "" if include_inactive else " AND active = 1"
+        rows = self._read_all(
+            f"SELECT * FROM messages WHERE session_id = ? AND topic_id = ?{active_clause} ORDER BY id",
+            (session_id, topic_id),
+        )
+        result = []
+        for row in rows:
+            message = dict(row)
+            message["content"] = self._decode_content(message["content"])
+            result.append(message)
+        return result
 
     def append_delegation_delivery(self, session_id: str, content: str, metadata: Dict[str, Any]) -> int:
         """Record a detached API result once, between client turns, including replay after rotation.
