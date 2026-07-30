@@ -34,7 +34,7 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
 # key (and its typed decoder) even when a row holds a BLOB, so no reader ever loses msg["content"].
 _MESSAGE_SCHEMA_KEYS = frozenset(
     re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0])
-) | {"id", "compacted", "display_order"}
+) | {"id", "compacted", "display_order", "topic_id"}
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
