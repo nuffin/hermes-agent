@@ -6300,6 +6300,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
+        topic_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -6323,6 +6324,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             f"{active_clause} ORDER BY id"
         )
         params: list = [session_id]
+        if topic_id is not None:
+            sql = sql.replace("ORDER BY", "AND topic_id = ? ORDER BY")
+            params.append(topic_id)
         if limit is not None or offset:
             # SQLite's OFFSET requires LIMIT; -1 means "no limit".
             sql += " LIMIT ? OFFSET ?"
