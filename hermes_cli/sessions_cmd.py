@@ -263,11 +263,19 @@ def _default_exclude(args):
 
 def _cmd_list(db, args):
     from hermes_state_sessions import workspace_key as _ws_key
+    # CLI --sort wins; otherwise use the user's runtime config, then the default.
+    sort_order = getattr(args, "sort", None)
+    if sort_order is None:
+        from hermes_cli.config import load_config
+        sort_order = load_config().get("sessions", {}).get("list_sort", "last-active")
     # LIMIT lives in the query, so probe one row past the cap: it is the only way to know the
     # page was cut without a second COUNT query (``--limit 0`` is ``LIMIT 0``: no rows, no probe).
     limit = args.limit
     sessions = db.list_sessions_rich(
-        source=args.source, exclude_sources=_default_exclude(args), limit=limit + 1 if limit > 0 else limit,
+        source=args.source,
+        exclude_sources=_default_exclude(args),
+        limit=limit + 1 if limit > 0 else limit,
+        order_by_last_active=(sort_order == "last-active"),
     )
     truncated = limit > 0 and len(sessions) > limit
     sessions = sessions[:limit] if truncated else sessions
