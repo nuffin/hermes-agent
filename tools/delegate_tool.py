@@ -716,6 +716,13 @@ DELEGATE_TASK_SCHEMA = {
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
             ),
+            "memory_mode": _p(
+                "string",
+                "Memory access mode for subagents: 'full' injects memory into the system prompt; "
+                "'on_demand' exposes memory tools without initial prompt injection; 'off' disables memory. "
+                "Default: 'on_demand'.",
+                enum=["full", "on_demand", "off"],
+            ),
         },
         "required": [],
     },
@@ -751,6 +758,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        memory_mode=args.get("memory_mode"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

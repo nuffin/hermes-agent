@@ -576,7 +576,7 @@ def _memory_parts(agent: Any) -> List[str]:
     # External memory provider system prompt block (additive to built-in). Gated on the same check
     # ``inject_memory_provider_tools`` uses so we never advertise provider tools that the agent's toolset
     # configuration has already gated off (#81014).
-    if agent._memory_manager:
+    if agent._memory_manager and getattr(agent, "_memory_mode", "full") != "on_demand":
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
