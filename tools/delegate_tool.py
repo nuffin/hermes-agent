@@ -514,7 +514,21 @@ def delegate_task(
     if err:
         return tool_error(err)
 
-    commit_subagent_spawn(len(task_list))
+    charged = commit_subagent_spawn(len(task_list))
+    rejected_tasks = []
+    if charged < len(task_list):
+        # Do not construct children that the per-turn cap cannot charge; report
+        # them explicitly rather than silently dropping requested work.
+        rejected_tasks = [
+            {
+                "task_index": index,
+                "goal": task.get("goal", ""),
+                "status": "rejected",
+                "reason": "per-turn subagent spawn cap reached",
+            }
+            for index, task in enumerate(task_list[charged:], start=charged)
+        ]
+        task_list = task_list[:charged]
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -535,7 +549,7 @@ def delegate_task(
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        live_deleg_id, live_writers, live_paths, *origin, overall_start, rejected_tasks=rejected_tasks,
     )
     return _run_batch(batch, background)
 
