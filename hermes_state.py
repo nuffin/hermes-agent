@@ -14400,6 +14400,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            # Validate target exists first
+            row = conn.execute(
+                "SELECT id FROM session_topics WHERE id = ? AND session_id = ?",
+                (topic_id, session_id),
+            ).fetchone()
+            if not row:
+                return False
             # Archive current active topic
             conn.execute(
                 """UPDATE session_topics
@@ -14408,13 +14415,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (now, session_id),
             )
             # Activate the target topic
-            cursor = conn.execute(
+            conn.execute(
                 """UPDATE session_topics
                    SET state = 'active', last_active_at = ?
                    WHERE id = ? AND session_id = ?""",
                 (now, topic_id, session_id),
             )
-            return cursor.rowcount > 0
+            return True
 
         return self._execute_write(_do)
 
