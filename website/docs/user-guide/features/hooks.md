@@ -381,6 +381,8 @@ def register(ctx):
 
 **General rules for all hooks:**
 
+Callbacks that return `{"action": "handled"}` for `pre_skill_create` signal that the plugin created the skill itself; Hermes skips the default directory/file creation and fires `post_skill_create` with `path=""` and `success=True`.
+
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
 - Callback exceptions are logged and skipped; later callbacks continue.
 - The skill lifecycle hooks expose the full pre-edit/patch context where applicable, including `old_content` for edit operations; `pre_skill_*` hooks may return documented `block`, `handled`, or `redirect` directives, while `post_skill_*` hooks are observers.
