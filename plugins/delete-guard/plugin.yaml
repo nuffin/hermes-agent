@@ -1,0 +1,8 @@
+name: delete-guard
+version: 1.0.0
+description: "Block skill file/directory deletions without confirmation."
+author: "Hauzer S. Lee"
+license: MIT
+hooks:
+  - pre_skill_delete
+  - pre_skill_remove_file
