@@ -10,6 +10,7 @@ from agent.insights import (
     _estimate_cost,
     _bar_chart,
     _safe_float,
+    _safe_int,
 )
 from agent.usage_pricing import (
     format_duration_compact as _format_duration,
@@ -780,3 +781,10 @@ def test_safe_float_handles_corrupt_values():
     assert _safe_float("3.14") == 3.14
     assert _safe_float(None) == 0.0
     assert _safe_float("corrupted") == 0.0
+
+
+def test_safe_int_handles_corrupt_values():
+    assert _safe_int(3) == 3
+    assert _safe_int("3") == 3
+    assert _safe_int(None) == 0
+    assert _safe_int("corrupted") == 0
