@@ -1,0 +1,9 @@
+name: write-guard
+version: 1.2.0
+description: "Block skill file/directory writes when target already exists."
+author: "Hauzer S. Lee"
+license: MIT
+hooks:
+  - pre_skill_create
+  - pre_skill_write_file
+  - pre_tool_call
