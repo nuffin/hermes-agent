@@ -22,7 +22,6 @@ Policies:
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import os
 import subprocess
@@ -69,7 +68,9 @@ def _match(target: str, rules: list[dict]) -> str | None:
         glob = rule.get("glob", "")
         if not glob:
             continue
-        if fnmatch.fnmatch(target, os.path.expanduser(glob)):
+        expanded = os.path.expanduser(glob)
+        # Use Path.match() which supports ** recursive matching
+        if Path(target).match(expanded):
             return rule.get("policy", "block")
     return None
 
