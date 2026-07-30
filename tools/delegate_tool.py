@@ -3612,11 +3612,14 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
-    # Count only validated delegations that are about to enter the spawn path.
-    commit_subagent_spawn(len(task_list))
-
     overall_start = time.monotonic()
     results = []
+
+    charged = commit_subagent_spawn(len(task_list))
+    if charged < len(task_list):
+        task_list = task_list[:charged]
+        task_schemas = task_schemas[:charged]
+
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
