@@ -53,7 +53,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
         "clarify",  # no user interaction
-        "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
     ]
@@ -5201,6 +5200,17 @@ DELEGATE_TASK_SCHEMA = {
                     "For action='steer': the course correction, appended to "
                     "the child's next tool result mid-run. Be directive and "
                     "specific."
+                ),
+            },
+            "memory_mode": {
+                "type": "string",
+                "enum": ["full", "on_demand", "off"],
+                "description": (
+                    "Memory access mode for sub-agents. 'full': memory is "
+                    "injected into the system prompt. 'on_demand': memory "
+                    "tools are available but not injected into the prompt. "
+                    "'off': no memory access at all. Default for sub-agents "
+                    "is 'on_demand'."
                 ),
             },
         },
