@@ -1289,7 +1289,7 @@ class SessionMessagesMixin:
         return bool(self._execute_write(_do))
 
     def _legacy_display_page(self, session_id: str, *, active_clause: str, limit: Optional[int], offset: int,
-                             latest: bool) -> List[Any]:
+                             latest: bool, topic_id: Optional[int] = None) -> List[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
         representatives: Dict[bytes, Tuple[int, int]] = {}
         with self._read_ctx() as conn:
@@ -1300,11 +1300,13 @@ class SessionMessagesMixin:
                     ("idx_messages_session_id",),
                 ).fetchone() is not None
                 index_hint = "INDEXED BY idx_messages_session_id" if has_session_index else "NOT INDEXED"
+                topic_clause = " AND topic_id = ?" if topic_id is not None else ""
+                topic_params = (topic_id,) if topic_id is not None else ()
                 rows = conn.execute(
                     "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, "
                     f"display_kind, display_metadata FROM messages {index_hint} "
-                    f"WHERE session_id = ?{active_clause} ORDER BY id ASC",
-                    (session_id,))
+                    f"WHERE session_id = ?{active_clause}{topic_clause} ORDER BY id ASC",
+                    (session_id, *topic_params))
                 for row in rows:
                     if self._is_model_only_row(row):
                         continue
@@ -1322,9 +1324,9 @@ class SessionMessagesMixin:
                 for start in range(0, len(selected_ids), 900):
                     chunk = selected_ids[start:start + 900]
                     selected.update({row["id"]: row for row in conn.execute(
-                        f"SELECT * FROM messages WHERE session_id = ?{active_clause} "
+                        f"SELECT * FROM messages WHERE session_id = ?{active_clause}{topic_clause} "
                         f"AND id IN ({_placeholders(chunk)})",
-                        (session_id, *chunk))})
+                        (session_id, *topic_params, *chunk))})
                 return [selected[row_id] for row_id in selected_ids if row_id in selected]
             finally:
                 if conn.in_transaction:
@@ -1356,26 +1358,29 @@ class SessionMessagesMixin:
 
     @staticmethod
     def _display_rows_from_conn(conn, session_id: str, *, limit: Optional[int] = None,
-                                offset: int = 0, latest: bool = False):
+                                offset: int = 0, latest: bool = False,
+                                topic_id: Optional[int] = None):
         """One display-history projection for normal reads and transactional verification."""
         direction = "DESC" if latest else "ASC"
+        topic_clause = " AND topic_id = ?" if topic_id is not None else ""
+        topic_params = [topic_id] if topic_id is not None else []
         return conn.execute(
             f"""WITH page AS (
                    SELECT display_order FROM messages
-                   WHERE session_id = ? AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}
+                   WHERE session_id = ? AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}{topic_clause}
                    GROUP BY display_order ORDER BY display_order {direction}
                    LIMIT ? OFFSET ?
                )
                SELECT chosen.* FROM page
                JOIN messages AS chosen ON chosen.id = (
                    SELECT candidate.id FROM messages AS candidate
-                   WHERE candidate.session_id = ?
+                   WHERE candidate.session_id = ?{topic_clause}
                      AND candidate.display_order = page.display_order
                      AND (candidate.active = 1 OR candidate.compacted = 1){DISPLAY_VISIBLE_SQL}
                    ORDER BY candidate.active DESC, candidate.id DESC LIMIT 1
                )
                ORDER BY page.display_order ASC""",
-            (session_id, -1 if limit is None else limit, offset, session_id),
+            (session_id, *topic_params, -1 if limit is None else limit, offset, session_id, *topic_params),
         ).fetchall()
 
     def _display_messages_from_conn(self, conn, session_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -1396,29 +1401,34 @@ class SessionMessagesMixin:
 
     def get_messages(self, session_id: str, include_inactive: bool = False, include_compacted: bool = False,
                      limit: Optional[int] = None, offset: int = 0, latest: bool = False,
-                     after_id: Optional[int] = None) -> List[Dict[str, Any]]:
+                     after_id: Optional[int] = None, topic_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Load messages in insertion order (id, never timestamp: clocks regress). ``include_inactive``:
         rewind rows too; ``include_compacted``: compaction-archived display history (not rewind rows).
-        ``latest`` pages back from the newest but returns chronological order; ``after_id``: keyset paging."""
+        ``latest`` pages back from the newest but returns chronological order; ``after_id``: keyset paging.
+        ``topic_id`` scopes every read path, including deduplicated compaction display reads."""
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
         active_clause = self._active_clause(include_inactive, include_compacted)
+        topic_clause = " AND topic_id = ?" if topic_id is not None else ""
+        topic_params = [topic_id] if topic_id is not None else []
         if include_compacted and not include_inactive and self._ensure_display_order(session_id):
             # _read_retrying_ioerr: mode=ro pooled readers see a transient IOERR mid-checkpoint (#100871).
             rows = self._read_retrying_ioerr(
                 lambda conn: self._display_rows_from_conn(
-                    conn, session_id, limit=limit, offset=offset, latest=latest))
+                    conn, session_id, limit=limit, offset=offset, latest=latest, topic_id=topic_id))
         elif include_compacted:
             # Read-only legacy stores cannot persist display identities; keep only fixed-width
             # identities and representative ids while scanning, then fetch the selected payloads.
             rows = self._legacy_display_page(
-                session_id, active_clause=active_clause, limit=limit, offset=offset, latest=latest)
+                session_id, active_clause=active_clause, limit=limit, offset=offset, latest=latest, topic_id=topic_id)
         else:
-            sql = (f"SELECT * FROM messages WHERE session_id = ?{active_clause}"
+            sql = (f"SELECT * FROM messages WHERE session_id = ?{active_clause}{topic_clause}"
                 f"{' AND id > ?' if after_id is not None else ''} ORDER BY id {'DESC' if latest else 'ASC'}")
-            params: list = [session_id] if after_id is None else [session_id, after_id]
+            params: list = [session_id, *topic_params]
+            if after_id is not None:
+                params.append(after_id)
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
                 sql += " LIMIT ? OFFSET ?"
