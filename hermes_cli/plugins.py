@@ -231,6 +231,9 @@ VALID_HOOKS: Set[str] = {
     #   None / {}              → default: _find_skill + in-place patch
     # Kwargs: name, old_string, new_string, file_path (str or None), replace_all (bool)
     "pre_skill_patch",
+    # Skill lifecycle — post-patch. Observer-only, fires after successful
+    # patch. Kwargs: name, path (abs str), success (bool)
+    "post_skill_patch",
     # Skill lifecycle — write_file (add/overwrite a supporting file).
     # Fired by skill_manage(action='write_file') before searching for the skill.
     # Plugins may return:
@@ -239,6 +242,9 @@ VALID_HOOKS: Set[str] = {
     #   None / {}              → default: _find_skill + normal write
     # Kwargs: name, file_path, file_content
     "pre_skill_write_file",
+    # Skill lifecycle — post-write_file. Observer-only, fires after successful
+    # file write. Kwargs: name, file_path (str), success (bool)
+    "post_skill_write_file",
     # Skill lifecycle — remove_file (delete a supporting file).
     # Fired by skill_manage(action='remove_file') before searching for the skill.
     # Plugins may return:
@@ -247,6 +253,9 @@ VALID_HOOKS: Set[str] = {
     #   None / {}              → default: _find_skill + normal removal
     # Kwargs: name, file_path
     "pre_skill_remove_file",
+    # Skill lifecycle — post-remove_file. Observer-only, fires after successful
+    # file removal. Kwargs: name, file_path (str), success (bool)
+    "post_skill_remove_file",
     # Skill lifecycle — delete. Fired by skill_manage(action='delete') before
     # searching for the skill. Plugins may return:
     #   {"action": "handled"}  → plugin handled the delete; skip Hermes delete
@@ -254,13 +263,15 @@ VALID_HOOKS: Set[str] = {
     #   None / {}              → default: _find_skill + delete/archive
     # Kwargs: name
     "pre_skill_delete",
+# Skill lifecycle — post-delete. Observer-only, fires after successful
+    # deletion. Kwargs: name, success (bool)
+    "post_skill_delete",
 
     # CLI-local lifecycle observers. ``pre_command`` above is the shared
     # CLI/gateway observer; these two retain the CLI's post-dispatch and
     # successful-exit boundaries without changing command control flow.
     "post_command",
     "on_quit",
-
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as

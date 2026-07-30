@@ -395,6 +395,13 @@ def _run_pre_skill_hook(hook_name: str, **kwargs) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _run_post_skill_hook(hook_name: str, **kwargs) -> None:
+    """Notify observers only after a mutation has succeeded."""
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+    if has_hook(hook_name):
+        invoke_hook(hook_name, **kwargs)
+
+
 def _attach_org_note(result: Dict[str, Any], name: str, skill_dir: Path) -> Dict[str, Any]:
     if org_note := _maybe_auto_propose_org_edit(name, skill_dir):
         result["org_sharing"] = org_note
@@ -569,7 +576,9 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         "success": True,
         "message": f"Patched {target_label} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
         "_change": {"old": _clip(old_string, 200, "…"), "new": _clip(new_string, 200, "…")}}
-    return _attach_org_note(result, name, skill_dir)
+    result = _attach_org_note(result, name, skill_dir)
+    _run_post_skill_hook("post_skill_patch", name=name, file_path=file_path, success=True)
+    return result
 
 
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
@@ -605,12 +614,16 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             return _err(f"failed to archive '{name}': {e}")
         if not ok:
             return _err(archive_msg)
-        return {"success": True,
-                "message": f"Skill '{name}' archived ({archive_msg}).{absorbed_note}",
-                "_archived": True}
+        result = {"success": True,
+                  "message": f"Skill '{name}' archived ({archive_msg}).{absorbed_note}",
+                  "_archived": True}
+        _run_post_skill_hook("post_skill_delete", name=name, success=True)
+        return result
     shutil.rmtree(skill_dir)
     _rmdir_if_empty(skill_dir.parent, skills_root)  # empty category dir, never the root
-    return {"success": True, "message": f"Skill '{name}' deleted.{absorbed_note}"}
+    result = {"success": True, "message": f"Skill '{name}' deleted.{absorbed_note}"}
+    _run_post_skill_hook("post_skill_delete", name=name, success=True)
+    return result
 
 
 def _rmdir_if_empty(parent: Path, stop: Path) -> None:
@@ -629,14 +642,14 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
                     f"bytes / 1 MiB). Consider splitting into smaller files.")
     if err := _validate_content_size(file_content, label=file_path):
         return _err(err)
-    skill_dir, guard = _locate_for_write(name, "write_file", " Create it first with action='create'.")
-    if guard:
-        return guard
     if hook_result := _run_pre_skill_hook(
             "pre_skill_write_file", name=name, file_path=file_path, file_content=file_content):
         if hook_result.get("hook_handled"):
             hook_result["message"] = f"File '{file_path}' written to skill '{name}' by plugin."
         return hook_result
+    skill_dir, guard = _locate_for_write(name, "write_file", " Create it first with action='create'.")
+    if guard:
+        return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
@@ -646,6 +659,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     # that crosses the line so the review fork sees it in the same turn.
     if file_path.startswith("references/") and (skill_dir / "SKILL.md").exists():
         _attach_lint_findings(result, skill_dir / "SKILL.md")
+    _run_post_skill_hook("post_skill_write_file", name=name, file_path=file_path, success=True)
     return result
 
 
@@ -653,13 +667,13 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
     if err := _validate_file_path(file_path):
         return _err(err)
-    skill_dir, guard = _locate_for_write(name, "remove_file", org_guard=False)
-    if guard:
-        return guard
     if hook_result := _run_pre_skill_hook("pre_skill_remove_file", name=name, file_path=file_path):
         if hook_result.get("hook_handled"):
             hook_result["message"] = f"File '{file_path}' removed from skill '{name}' by plugin."
         return hook_result
+    skill_dir, guard = _locate_for_write(name, "remove_file", org_guard=False)
+    if guard:
+        return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if err:
         return err
@@ -671,7 +685,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return read_guard
     target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
-    return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
+    result = {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
+    _run_post_skill_hook("post_skill_remove_file", name=name, file_path=file_path, success=True)
+    return result
 
 
 # --- Main entry point ---------------------------------------------------------
