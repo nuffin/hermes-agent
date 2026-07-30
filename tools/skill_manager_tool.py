@@ -1120,32 +1120,31 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
-    # ── pre_skill_edit hook (allow plugin handle / block) ──
-    from hermes_cli.plugins import has_hook as _has_hook, invoke_hook as _invoke_skill_hook
+    existing = _find_skill(name)
 
-    # Resolve old content for the hook payload (best-effort, may be None)
+    # ── pre_skill_edit hook (allow plugin handle / block) ──
+    from hermes_cli.plugins import invoke_hook as _invoke_skill_hook
+
+    # Resolve old content for the hook payload
     _old_content = None
-    _existing = _find_skill(name)
-    if _existing:
-        _md = _existing["path"] / "SKILL.md"
+    if existing:
+        _md = existing["path"] / "SKILL.md"
         if _md.exists():
             try:
                 _old_content = _md.read_text(encoding="utf-8")
             except Exception:
                 pass
 
-    if _has_hook("pre_skill_edit"):
-        for _hr in _invoke_skill_hook("pre_skill_edit", name=name, content=content,
-                                       old_content=_old_content):
-            if not isinstance(_hr, dict):
-                continue
-            _act = _hr.get("action")
-            if _act == "block":
-                return {"success": False, "error": _hr.get("reason", "Skill edit blocked by plugin")}
-            if _act == "handled":
-                return {"success": True, "message": f"Skill '{name}' edited by plugin.", "hook_handled": True}
+    for _hr in _invoke_skill_hook("pre_skill_edit", name=name, content=content,
+                                   old_content=_old_content):
+        if not isinstance(_hr, dict):
+            continue
+        _act = _hr.get("action")
+        if _act == "block":
+            return {"success": False, "error": _hr.get("reason", "Skill edit blocked by plugin")}
+        if _act == "handled":
+            return {"success": True, "message": f"Skill '{name}' edited by plugin.", "hook_handled": True}
 
-    existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
@@ -1240,6 +1239,8 @@ def _patch_skill(
     # (tools/fuzzy_match.py), and its error carries a file_preview this layer
     # cannot produce. Duplicating it here would only shadow the richer message.
 
+    existing = _find_skill(name)
+
     # ── pre_skill_patch hook (allow plugin handle / block) ──
     from hermes_cli.plugins import invoke_hook as _invoke_patch_hook
 
@@ -1254,7 +1255,6 @@ def _patch_skill(
         if _act == "handled":
             return {"success": True, "message": f"Skill '{name}' patched by plugin.", "hook_handled": True}
 
-    existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
@@ -1369,6 +1369,8 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         target must exist on disk. Validated here so the model can't claim an
         umbrella that doesn't exist.
     """
+    existing = _find_skill(name)
+
     # ── pre_skill_delete hook (allow plugin handle / block) ──
     from hermes_cli.plugins import invoke_hook as _invoke_del_hook
 
@@ -1381,7 +1383,6 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         if _act == "handled":
             return {"success": True, "message": f"Skill '{name}' deleted by plugin.", "hook_handled": True}
 
-    existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
@@ -1501,6 +1502,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
+    existing = _find_skill(name)
+
     # ── pre_skill_write_file hook (allow plugin handle / block) ──
     from hermes_cli.plugins import invoke_hook as _invoke_wf_hook
 
@@ -1514,7 +1517,6 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         if _act == "handled":
             return {"success": True, "message": f"File '{file_path}' written to skill '{name}' by plugin.", "hook_handled": True}
 
-    existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
@@ -1534,6 +1536,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         )
         if read_guard:
             return read_guard
+
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
@@ -1566,6 +1569,8 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
+    existing = _find_skill(name)
+
     # ── pre_skill_remove_file hook (allow plugin handle / block) ──
     from hermes_cli.plugins import invoke_hook as _invoke_rf_hook
 
@@ -1578,7 +1583,6 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         if _act == "handled":
             return {"success": True, "message": f"File '{file_path}' removed from skill '{name}' by plugin.", "hook_handled": True}
 
-    existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
