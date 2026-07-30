@@ -892,10 +892,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in).
-    # Gated on the same check ``inject_memory_provider_tools`` uses so we
-    # never advertise provider tools that the agent's toolset configuration
-    # has already gated off (#81014).
-    if agent._memory_manager:
+    # It follows the tool exposure gate and is omitted for on_demand mode.
+    if (
+        agent._memory_manager
+        and getattr(agent, "_memory_mode", "full") != "on_demand"
+    ):
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
