@@ -1904,6 +1904,56 @@ def register(ctx):
 
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 
+    # Let native skill_view serve local skills first, then fall back to the
+    # graph index for a graph-discovered top-level skill.
+    try:
+        import tools.skills_tool as _skills_tool
+        _original_skill_view = _skills_tool.skill_view
+
+        def _graph_skill_view(
+            name: str,
+            file_path: str = None,
+            task_id: str = None,
+            preprocess: bool = True,
+        ) -> str:
+            result = _original_skill_view(
+                name, file_path=file_path or "", task_id=task_id or "", preprocess=preprocess,
+            )
+            data = json.loads(result)
+            if data.get("success") or file_path:
+                return result
+            graph_result = _handle_skill_load({"name": name})
+            return graph_result if json.loads(graph_result).get("success") else result
+
+        _skills_tool.skill_view = _graph_skill_view
+        logger.info("skill-graph: patched skill_view with graph fallback")
+    except Exception:
+        logger.exception("skill-graph: failed to patch skill_view")
+
+    # skill_manage resolves local skills first. For a local miss, resolve the
+    # graph-managed SKILL.md path so graph-discovered skills remain editable.
+    try:
+        import tools.skill_manager_tool as _skill_manager_tool
+        _original_find_skill = _skill_manager_tool._find_skill
+
+        def _graph_find_skill(name: str):
+            result = _original_find_skill(name)
+            if result is not None:
+                return result
+            graph_path = _find_skill_path(name)
+            if graph_path is not None:
+                logger.info(
+                    "skill-graph: _find_skill graph fallback resolved '%s' → %s",
+                    name, graph_path,
+                )
+                return {"path": graph_path.parent}
+            return None
+
+        _skill_manager_tool._find_skill = _graph_find_skill
+        logger.info("skill-graph: patched _find_skill with graph fallback")
+    except Exception:
+        logger.exception("skill-graph: failed to patch _find_skill")
+
     logger.info(
         "skill-graph plugin registered: tools=skill_graph_search+skill_load+skill_graph_config, "
         "cmd=/skill-graph, hooks=on_session_start+post_tool_call+pre_tool_call"
