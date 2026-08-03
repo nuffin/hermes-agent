@@ -151,7 +151,7 @@ Phase 4: 路由（讨论也需要 skill 指导）
   → 加载相关 design skill 获取框架
   → 基于框架讨论，不执行
 
-post-flight: 
+post-flight:
   - 检测到是设计讨论 → 不执行操作 → 不需要后续
 ```
 
