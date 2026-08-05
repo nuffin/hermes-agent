@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS skill_term_stats (
     last_loaded   TEXT,
     PRIMARY KEY (skill_name, term)
 );
+
+CREATE TABLE IF NOT EXISTS skill_embeddings (
+    skill_name  TEXT PRIMARY KEY REFERENCES skill_nodes(name),
+    vector      BLOB NOT NULL,          -- 1024 × float32 = 4096 bytes
+    model       TEXT NOT NULL,          -- 'bge-m3' (record model for invalidation)
+    dim         INTEGER NOT NULL,       -- 1024
+    updated_at  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON skill_embeddings(model);
 """
 
 # ── Database helpers ────────────────────────────────────────────────────────
@@ -568,7 +578,441 @@ def _upsert_skill(conn: sqlite3.Connection, name: str, path: Path, now: float) -
     return info
 
 
-# ── LLM Enrichment ───────────────────────────────────────────────────────────
+# ── Embedding ──────────────────────────────────────────────────────────────
+
+
+def _embedding_client() -> "EmbeddingClient | None":
+    """Build the EmbeddingClient from skills.config.skill-graph config."""
+    try:
+        from .embedding_client import EmbeddingClient
+    except ImportError:
+        try:
+            from embedding_client import EmbeddingClient
+        except ImportError:
+            logger.warning("skill-graph: embedding_client.py not importable")
+            return None
+
+    def _reader() -> dict:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+            sg = (
+                (config or {})
+                .get("skills", {})
+                .get("config", {})
+                .get("skill-graph", {})
+            )
+            return sg if isinstance(sg, dict) else {}
+        except Exception:
+            return {}
+
+    return EmbeddingClient(_reader)
+
+
+def _embedding_text(name: str, info: dict[str, Any]) -> str:
+    """Build the text to embed for a skill (name + category + description + tags)."""
+    parts = [name]
+    if info.get("category"):
+        parts.append(info["category"])
+    if info.get("description"):
+        parts.append(str(info["description"]))
+    tags = info.get("tags") or []
+    if tags:
+        parts.append(" ".join(str(t) for t in tags))
+    return "\n".join(parts)
+
+
+def _compute_embedding_for_skill(
+    conn: sqlite3.Connection, name: str, info: dict[str, Any]
+) -> bool:
+    """Compute + store embedding for one skill. Returns True on success.
+
+    Uses the configured backend (auto → TEI, CPU fallback). Failure is
+    non-fatal — logs a warning and leaves the row absent (retried next rebuild).
+    """
+    client = _embedding_client()
+    if client is None:
+        return False
+    try:
+        from .embedding_client import to_blob
+    except ImportError:
+        try:
+            from embedding_client import to_blob  # noqa: F401
+        except ImportError:
+            logger.warning("skill-graph: embedding_client.py not importable")
+            return False
+    try:
+        if not client.is_available():
+            logger.info("skill-graph: embedding backend unavailable, skipping '%s'", name)
+            return False
+        text = _embedding_text(name, info)
+        vec = client.embed([text])[0]
+        model = client.model_name()
+        blob = to_blob(vec)
+        dim = len(vec)
+        conn.execute(
+            """INSERT OR REPLACE INTO skill_embeddings
+               (skill_name, vector, model, dim, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (name, blob, model, dim, time.time()),
+        )
+        return True
+    except Exception as e:
+        logger.warning("skill-graph: embedding failed for '%s': %s", name, e)
+        return False
+
+
+def _rebuild_embeddings(conn: sqlite3.Connection) -> int:
+    """Compute embeddings for all skills that lack one (batch, best-effort).
+
+    Called after full rebuild / incremental sync. Skips skills that already
+    have an embedding for the current model. Returns count computed.
+    """
+    try:
+        from .embedding_client import to_blob
+    except ImportError:
+        try:
+            from embedding_client import to_blob  # noqa: F401
+        except ImportError:
+            logger.warning("skill-graph: embedding_client.py not importable")
+            return 0
+
+    client = _embedding_client()
+    if client is None:
+        return 0
+    try:
+        if not client.is_available():
+            logger.info("skill-graph: embedding backend unavailable — embeddings deferred")
+            return 0
+    except Exception as e:
+        logger.warning("skill-graph: embedding availability check failed: %s", e)
+        return 0
+
+    model = client.model_name()
+    # Skills missing an embedding for the current model
+    rows = conn.execute(
+        """SELECT n.name, n.category, n.description, n.tags
+           FROM skill_nodes n
+           LEFT JOIN skill_embeddings e ON e.skill_name = n.name
+           WHERE e.skill_name IS NULL OR e.model != ?
+             AND (n.is_deleted IS NULL OR n.is_deleted = 0)""",
+        (model,),
+    ).fetchall()
+
+    if not rows:
+        return 0
+
+    texts = []
+    for row in rows:
+        name = row["name"]
+        info = {
+            "category": row["category"],
+            "description": row["description"],
+            "tags": json.loads(row["tags"]) if row["tags"] else [],
+        }
+        texts.append(_embedding_text(name, info))
+
+    logger.info("skill-graph: computing embeddings for %d skills (%s)", len(texts), model)
+    # TEI max_client_batch_size is 32 — chunk to avoid oversized POSTs
+    BATCH = 32
+    vecs: list[list[float] | None] = []
+    try:
+        for i in range(0, len(texts), BATCH):
+            chunk = texts[i : i + BATCH]
+            try:
+                chunk_vecs = client.embed(chunk)
+                vecs.extend(chunk_vecs)
+            except Exception as e:
+                logger.warning(
+                    "skill-graph: batch embedding failed at chunk %d: %s", i // BATCH, e
+                )
+                vecs.extend([None] * len(chunk))
+                break
+    except Exception as e:
+        logger.warning("skill-graph: batch embedding failed: %s", e)
+        return 0
+
+    now = time.time()
+    count = 0
+    expected_dim = len(vecs[0]) if vecs and vecs[0] is not None else 0
+    for row, vec in zip(rows, vecs):
+        if vec is None or (expected_dim and len(vec) != expected_dim):
+            continue
+        name = row["name"]
+        blob = to_blob(vec)
+        conn.execute(
+            """INSERT OR REPLACE INTO skill_embeddings
+               (skill_name, vector, model, dim, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (name, blob, model, len(vec), now),
+        )
+        count += 1
+    conn.commit()
+    logger.info("skill-graph: stored %d embeddings", count)
+    return count
+
+
+def _drop_embeddings(conn: sqlite3.Connection, name: str) -> None:
+    """Remove embedding rows for a skill (on delete)."""
+    try:
+        conn.execute("DELETE FROM skill_embeddings WHERE skill_name = ?", (name,))
+    except Exception:
+        pass
+
+
+def _embedding_search(
+    query: str, topk: int = 5, scenes: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Semantic search over skill embeddings.
+
+    Returns top-k skills ranked by cosine similarity, each with name,
+    description, and score. Falls back to the lexical graph search when
+    embeddings are unavailable.
+    """
+    try:
+        from .embedding_client import EmbeddingClient, to_blob, cosine_batch
+    except ImportError:
+        try:
+            from embedding_client import EmbeddingClient, to_blob, cosine_batch  # noqa: F401
+        except ImportError:
+            return []
+
+    client = _embedding_client()
+    if client is None:
+        return []
+    try:
+        if not client.is_available():
+            return []
+    except Exception:
+        return []
+
+    try:
+        conn = _ensure_graph()
+        conn.row_factory = sqlite3.Row
+        qvec = client.embed([query])[0]
+        if not qvec:
+            return []
+        qblob = to_blob(qvec)
+        rows = conn.execute(
+            "SELECT skill_name, vector FROM skill_embeddings"
+        ).fetchall()
+        if not rows:
+            return []
+        names = [r["skill_name"] for r in rows]
+        blobs = [r["vector"] for r in rows]
+        scores = cosine_batch(qblob, blobs)
+        ranked = sorted(zip(names, scores), key=lambda x: -x[1])
+
+        # Scene soft-boost (×1.3) for skills whose scenes overlap the intent's
+        scenes_set = set(scenes or [])
+        out: list[dict[str, Any]] = []
+        for name, score in ranked[: topk * 3]:
+            info = _get_node_info(conn, name) or {}
+            skill_scenes = info.get("scenes") or []
+            effective = score
+            if scenes_set and any(s in scenes_set for s in skill_scenes):
+                effective = min(1.0, score * 1.3)
+            out.append(
+                {
+                    "name": name,
+                    "description": info.get("description", ""),
+                    "score": round(effective, 4),
+                    "scenes": skill_scenes,
+                }
+            )
+        out.sort(key=lambda x: -x["score"])
+        return out[:topk]
+    except Exception as e:
+        logger.warning("skill-graph: embedding search failed: %s", e)
+        return []
+
+
+# ── pre_llm_call: candidate injection (Plan A) ─────────────────────────────
+
+# Per-session state for delta injection: session_id → set of injected skill names
+_injected_names_cache: dict[str, set[str]] = {}
+
+
+def _build_skill_candidates_context(
+    user_message: str,
+    session_id: str = "",
+    is_first_turn: bool = False,
+    prev_msg: str | None = None,
+    prev_intents: list[str] | None = None,
+) -> str | None:
+    """Build the skill-candidates context block for the current user message.
+
+    Returns None when nothing should be injected (skip conditions, no
+    candidates, retrieval unavailable) — the caller injects nothing.
+
+    Incremental injection: when topic detection judges the message as a
+    continuation of the previous topic, only candidates not yet injected
+    in this session are included (delta). On topic shift or first turn,
+    the full candidate list is injected and the tracking set is reset.
+
+    Cost guards (every user message would otherwise pay an intent-split LLM
+    call + embedding retrieval):
+      - Trivial / short / conversational messages skip the pipeline.
+      - Intent-split failure falls back to the raw message as one intent.
+      - Embedding unavailability falls back to lexical search.
+    """
+    if not user_message or not isinstance(user_message, str):
+        return None, []
+    msg = user_message.strip()
+    if not msg:
+        return None, []
+
+    # Cost guard: skip conversational filler and very short messages.
+    if len(msg) < 12:
+        return None, []
+    lowered = msg.lower()
+    _trivial_prefixes = (
+        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
+        "好的", "谢谢", "你好", "嗯", "okay", "知道了", "收到",
+    )
+    if lowered in _trivial_prefixes or any(
+        lowered.startswith(p) for p in _trivial_prefixes
+    ):
+        return None, []
+    # Pure confirmation / single-word replies
+    if msg in ("好", "可以", "行", "ok", "yes", "no", "y", "n", "done", "完成", "继续"):
+        return None, []
+
+    # Config gate: injection can be disabled entirely
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
+        if isinstance(sg, dict) and sg.get("inject_candidates") is False:
+            return None, []
+    except Exception:
+        pass
+
+    # Intent split (one lightweight LLM call). Pass prev_intents to get
+    # topic_continuation judgment (piggy-backed, zero extra cost).
+    intents, scene, llm_tc = _split_intents(msg, prev_intents=prev_intents)
+    if not intents:
+        intents = [msg]
+
+    # ── Topic detection (AND gate) ──
+    topic_result = None
+    llm_tc_for_detect = llm_tc if prev_intents else None
+
+    # Build embed_fn if embedding backend is available
+    embed_fn = None
+    try:
+        _ec = _embedding_client()
+        if _ec:
+            def embed_fn(text):
+                results = _ec.embed([text])
+                return results[0] if results else None
+    except Exception:
+        pass
+
+    try:
+        import importlib.util as _ilu
+        _td_path = str(Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py")
+        if Path(_td_path).exists():
+            _spec = _ilu.spec_from_file_location("topic_detection", _td_path)
+            _td = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_td)
+            topic_result = _td.detect_topic_shift(
+                msg, prev_msg=prev_msg,
+                llm_topic_continuation=llm_tc_for_detect,
+                embed_fn=embed_fn,
+            )
+    except Exception:
+        pass
+
+    # Determine injection mode: full or delta
+    force_full = True  # default: full injection
+    if is_first_turn:
+        force_full = True
+    elif topic_result and topic_result.get("method") != "fallback":
+        force_full = not topic_result.get("topic_continuation", False)
+
+    # Retrieve candidates per intent, merge, dedupe.
+    merged: dict[str, dict[str, Any]] = {}
+    for intent in intents[:6]:
+        hits = _embedding_search(intent, topk=5)
+        if not hits:
+            # Fallback: lexical graph search
+            try:
+                conn = _ensure_graph()
+                lex = _search_graph(intent, conn, limit=5)
+                for r in lex:
+                    hits.append(
+                        {
+                            "name": r.get("name", ""),
+                            "description": r.get("description", ""),
+                            "score": 0.5,
+                            "scenes": [],
+                        }
+                    )
+            except Exception:
+                pass
+        for hit in hits:
+            name = hit.get("name", "")
+            if not name:
+                continue
+            if name not in merged:
+                merged[name] = hit
+            elif hit.get("score", 0) > merged[name].get("score", 0):
+                merged[name] = hit
+
+    ranked = sorted(merged.values(), key=lambda x: -x.get("score", 0))
+    if not ranked:
+        return None, []
+
+    # ── Delta filtering ──
+    injected_key = f"_injected:{session_id}"
+    if force_full:
+        # Reset: inject all, rebuild tracking set
+        candidates = ranked[:10]
+        _injected_names_cache[injected_key] = set(
+            c["name"] for c in candidates
+        )
+        mode_label = "full"
+    else:
+        # Delta: only inject candidates not yet seen this session
+        already = _injected_names_cache.get(injected_key, set())
+        delta = [c for c in ranked[:10] if c["name"] not in already]
+        if not delta:
+            logger.info(
+                "skill-graph: no new candidates (all %d already injected in session %s)",
+                len(already), session_id,
+            )
+            return None, []
+        candidates = delta
+        _injected_names_cache[injected_key] = already | set(
+            c["name"] for c in candidates
+        )
+        mode_label = "delta"
+
+    # Cap the injection budget (~2K tokens ≈ keep candidates lean).
+    lines = []
+    for c in candidates:
+        desc = (c.get("description") or "")[:120]
+        lines.append(f"- {c['name']}: {desc}  (score={c.get('score', 0):.2f})")
+    block = (
+        "Relevant skills you may want to load (skill_load) for this request:\n"
+        + "\n".join(lines)
+    )
+
+    tc_str = ""
+    if topic_result:
+        tc_str = f" [topic={topic_result.get('method')}, cont={topic_result.get('topic_continuation')}]"
+
+    logger.info(
+        "skill-graph: injected %d skill candidates (%s mode, from %d intents): %s%s",
+        len(candidates), mode_label, len(intents),
+        ", ".join(c["name"] for c in candidates),
+        tc_str,
+    )
+    return block, intents
+
+
+# ── LLM Enrichment ────────────────────────────────────────────────────────────
 
 # Scene vocabulary — fixed set of valid scene values for LLM enrichment
 SCENE_VOCABULARY = [
@@ -789,6 +1233,229 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
         return None
 
 
+# ── Intent Split ───────────────────────────────────────────────────────────
+
+
+def _resolve_llm_provider(
+    config: dict | None = None,
+) -> tuple[str, str, str] | None:
+    """Resolve (provider_name, api_key, base_url) for LLM calls.
+
+    Mirrors enrichment's provider resolution: preferred provider from
+    config → main agent provider → first provider with a usable API key.
+    """
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
+        from hermes_cli.config import load_config
+    except Exception:
+        return None
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return None
+    if not isinstance(config, dict):
+        return None
+
+    sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
+    if not isinstance(sg_config, dict):
+        sg_config = {}
+
+    def _resolve_provider(pid: str) -> tuple[str, str] | None:
+        pconfig = PROVIDER_REGISTRY.get(pid)
+        if not pconfig:
+            return None
+        for env_var in pconfig.api_key_env_vars:
+            key_val = os.environ.get(env_var, "")
+            if has_usable_secret(key_val):
+                url = os.environ.get(pconfig.base_url_env_var, "") if pconfig.base_url_env_var else ""
+                if not url:
+                    url = pconfig.inference_base_url or ""
+                return key_val, url
+        return None
+
+    provider_name = ""
+    api_key = ""
+    base_url = ""
+    preferred = sg_config.get("enrichment", {}).get("provider", "") if isinstance(sg_config.get("enrichment"), dict) else ""
+    if preferred:
+        resolved = _resolve_provider(preferred)
+        if resolved:
+            provider_name = preferred
+            api_key, base_url = resolved
+    if not provider_name:
+        main_provider = config.get("model", {}).get("provider", "")
+        if main_provider:
+            resolved = _resolve_provider(main_provider)
+            if resolved:
+                provider_name = main_provider
+                api_key, base_url = resolved
+    if not provider_name:
+        for pid in PROVIDER_REGISTRY:
+            if pid in ("copilot", "lmstudio"):
+                continue
+            resolved = _resolve_provider(pid)
+            if resolved:
+                provider_name = pid
+                api_key, base_url = resolved
+                break
+    if not provider_name:
+        return None
+    return provider_name, api_key, base_url
+
+
+def _split_intents(
+    user_message: str,
+    prev_intents: list[str] | None = None,
+) -> tuple[list[str], str | None, bool | None]:
+    """Split a user message into intent sentences via one lightweight LLM call.
+
+    Returns ``(intents, scene, topic_continuation)``:
+
+    - ``intents``: list of intent sentences (``[]`` on failure — caller falls
+      back to treating the whole message as one intent).
+    - ``scene``: one of coding|writing|research|design|devops|hermes|media|common,
+      or ``None`` if the LLM didn't return it.
+    - ``topic_continuation``: ``True``/``False`` from the LLM when
+      ``prev_intents`` is provided, ``None`` if unavailable. Piggy-backed onto
+      the intent-split call (zero extra API cost).
+
+    Multi-intent: each intent is a *sentence* (embedding-friendly), not a
+    keyword list. When ``prev_intents`` is given, the prompt includes the
+    previous message's intents so the model can judge topic continuity.
+    """
+    if not user_message or not user_message.strip():
+        return [], None, None
+
+    try:
+        import requests
+    except ImportError:
+        logger.warning("skill-graph: intent split skipped — requests not installed")
+        return [], None, None
+
+    resolved = _resolve_llm_provider()
+    if resolved is None:
+        logger.warning("skill-graph: intent split skipped — no provider with API key")
+        return [], None, None
+    provider_name, api_key, base_url = resolved
+
+    # Model: intent_split_model config → enrichment model → main model → default
+    model_name = "deepseek-v4-flash"
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
+        if isinstance(sg, dict):
+            model_name = (
+                sg.get("intent_split_model")
+                or (sg.get("enrichment", {}) or {}).get("model")
+                or config.get("model", {}).get("default")
+                or "deepseek-v4-flash"
+            )
+    except Exception:
+        pass
+
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+
+    # Build topic-continuation prompt section (only when prev_intents given)
+    topic_section = ""
+    if prev_intents:
+        prev_text = " | ".join(prev_intents[:3])
+        topic_section = (
+            f"\n--- PREVIOUS MESSAGE INTENTS ---\n{prev_text}\n--- END ---\n\n"
+            'Also include this field:\n'
+            '"topic_continuation": true/false — is this new message continuing '
+            "the same topic/task as the previous message (whose intents are "
+            "shown above), or is it a new topic?\n"
+            "Judge by the core intent, not surface words. Follow-ups, "
+            'clarifications, and confirmations are "continuation". A brand-new '
+            'task or unrelated question is "new topic".\n\n'
+        )
+
+    prompt = (
+        "Split the user's message into separate intents. Each intent should be "
+        "ONE complete sentence describing a single topic the user wants done. "
+        "Output ONLY JSON:\n"
+        '{"intents": ["<intent 1 as a sentence>", "<intent 2 as a sentence>", ...], '
+        '"scene": "<one of: coding|writing|research|design|devops|hermes|media|common>"'
+        + (', "topic_continuation": true/false}' if prev_intents else "}")
+        + "\nRules:\n"
+        "- Keep the user's original meaning; do not add requirements.\n"
+        "- 1-6 intents. If the message is a single topic, return exactly 1 intent "
+        "with the full message rephrased as a sentence.\n"
+        "- Each intent must be self-contained (no 'it'/'that' references across intents).\n"
+        "- Scene: pick the single most applicable value.\n"
+        + topic_section
+        + "User message:\n"
+        f"{user_message}"
+    )
+
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 1024,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    import time as _time
+    for _attempt in range(3):
+        try:
+            resp = requests.post(
+                f"{base_url}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = (data.get("choices", [{}])[0]
+                    .get("message", {}).get("content", "")).strip()
+            if not text:
+                if _attempt < 2:
+                    _time.sleep(1.5 * (_attempt + 1))
+                    continue
+                return [], None, None
+
+            # Strip markdown code fences if present
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:]) if len(lines) > 1 else text
+                if text.endswith("```"):
+                    text = text[:-3]
+            if text.startswith("json"):
+                text = text[4:].strip()
+
+            result = json.loads(text)
+            intents = result.get("intents", []) if isinstance(result, dict) else []
+            intents = [str(i).strip() for i in intents if str(i).strip()]
+            scene = result.get("scene") if isinstance(result, dict) else None
+            tc = result.get("topic_continuation") if isinstance(result, dict) else None
+            # Coerce tc to bool/None
+            if isinstance(tc, str):
+                tc = tc.lower().strip() in ("true", "yes", "1")
+            elif not isinstance(tc, bool):
+                tc = None
+            if intents:
+                return intents, scene, tc
+            return [], None, None
+
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            logger.warning(
+                "skill-graph: intent split failed (attempt %d/3): %s",
+                _attempt + 1, e,
+            )
+            if _attempt < 2:
+                _time.sleep(1.5 * (_attempt + 1))
+
+    return [], None, None
+
+
 def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]) -> bool:
     """Write tags and scenes back to the SKILL.md frontmatter.
 
@@ -952,7 +1619,6 @@ def _enrich_pending_skills(conn: sqlite3.Connection, limit: int = 10,
 
 
 
-
 def _full_rebuild(conn: sqlite3.Connection) -> int:
     """Full rebuild: scan all skills dirs, rebuild graph from scratch."""
     skill_dirs = _find_all_skills_dirs()
@@ -983,6 +1649,9 @@ def _full_rebuild(conn: sqlite3.Connection) -> int:
     for name, path in deduped.items():
         _upsert_skill(conn, name, path, now)
     conn.commit()
+
+    # Compute embeddings for all skills (best-effort, TEI/CPU)
+    _rebuild_embeddings(conn)
 
     logger.info("Skill graph rebuilt: %d skills", len(deduped))
     return len(deduped)
@@ -1038,8 +1707,12 @@ def _incremental_sync(conn: sqlite3.Connection) -> int:
         conn.execute("DELETE FROM skill_nodes WHERE name = ?", (name,))
         conn.execute("DELETE FROM skill_fts WHERE name = ?", (name,))
         conn.execute("DELETE FROM skill_terms WHERE skill_name = ?", (name,))
+        _drop_embeddings(conn, name)
 
     conn.commit()
+
+    # Compute embeddings for any new/changed skills lacking one
+    _rebuild_embeddings(conn)
 
     logger.info(
         "Skill graph synced: %d parsed, %d unchanged, %d removed, %d total",
@@ -1072,6 +1745,12 @@ def _update_single_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
             (skill_name,),
         )
     conn.commit()
+
+    # Recompute embedding for the changed skill (incremental maintenance)
+    info = _parse_skill_md(skill_path)
+    _compute_embedding_for_skill(conn, skill_name, info)
+    conn.commit()
+
     logger.debug("skill-graph: updated single skill '%s' (%s)", skill_name, skill_path)
     return True
 
@@ -2139,6 +2818,8 @@ def _handle_skill_graph_search(args: dict | None = None, **kw) -> str:
                     })
                 total = len(results)
                 hint = "All skills listed by name. Call skill_load(name) to load full content."
+                logger.info("skill-graph: search list_all=True → %d results (total: %d)", total, total)
+                logger.debug("skill-graph: search list_all=True → skills: %s", [r["name"] for r in results])
                 return json.dumps({
                     "success": True,
                     "query": "",
@@ -2180,6 +2861,9 @@ def _handle_skill_graph_search(args: dict | None = None, **kw) -> str:
             )
         else:
             hint = "Call skill_load(name) to load full content of a discovered skill."
+        logger.info("skill-graph: search query=%r limit=%d scenes=%s → %d results (total: %d)",
+                    query, limit, scenes or [], len(results), total)
+        logger.debug("skill-graph: search query=%r → skills: %s", query, result_names)
         return json.dumps({
             "success": True,
             "query": query,
@@ -2390,9 +3074,16 @@ def register(ctx):
         args_hint="rebuild|status|config [add|remove] <path>",
     )
 
-    # ── Hook: pre_tool_call — block find/read_file/recall if graph not searched ──
-    _gated_tools = frozenset({"find", "read_file"})
-    _graph_searched_turn: dict[str, bool] = {}  # turn_id → searched
+    # ── Hook: pre_tool_call — gate search_files behind skill_graph_search ──
+    # search_files: prevents the model from bypassing skill discovery by
+    #   going straight to filesystem search (e.g. "find project files").
+    # read_file is intentionally excluded — it's the execution step after a
+    #   skill has been loaded (or reading a known config/source file) and
+    #   should not be gated.
+    # find is not a real Hermes tool; search_files replaced it.
+    _gated_tools = frozenset({"search_files"})
+    _graph_searched: bool = False  # per-turn flag
+    _last_turn_id: str = ""  # for per-turn reset detection
 
     # Resolve skill_graph_mode from config at registration time (startup constant)
     _graph_mode = False
@@ -2403,31 +3094,29 @@ def register(ctx):
         pass
 
     def _on_pre_tool_call(tool_name: str, args: dict | None = None, **kw: Any) -> dict | str | None:
-        nonlocal _graph_searched_turn, _graph_mode
+        nonlocal _graph_searched, _graph_mode, _last_turn_id
         turn_id = kw.get("turn_id", "")
-        if not turn_id:
-            return None
 
-        # Turn boundary: reset flag for new turns
-        if turn_id not in _graph_searched_turn:
-            _graph_searched_turn.clear()
-            _graph_searched_turn[turn_id] = False
+        # Per-turn reset: when turn_id changes, clear the flag
+        if turn_id and turn_id != _last_turn_id:
+            _graph_searched = False
+            _last_turn_id = turn_id
 
         # If this IS skill_graph_search, mark it and allow
         if tool_name == "skill_graph_search":
-            _graph_searched_turn[turn_id] = True
+            _graph_searched = True
             return None
 
         # Check gating: skill-graph mode + restricted tool + not yet searched
         if (
             _graph_mode
             and tool_name in _gated_tools
-            and not _graph_searched_turn.get(turn_id, False)
+            and not _graph_searched
         ):
             return {"action": "block", "message":
                 f"Tool '{tool_name}' is blocked until you call "
                 f"skill_graph_search() first. This profile requires graph "
-                f"discovery before filesystem or session searches."
+                f"discovery before filesystem searches."
             }
         return None
 
@@ -2588,6 +3277,58 @@ def register(ctx):
 
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 
+    # ── Hook: pre_llm_call — inject skill candidates (Plan A) ──
+
+    # Per-session state for delta injection (prev message + intents)
+    _pre_llm_session_data: dict[str, dict] = {}  # session_id → {msg, intents}
+
+    def _on_pre_llm_call(**kw):
+        try:
+            user_message = kw.get("user_message") or ""
+            if not user_message or not isinstance(user_message, str):
+                return None
+            session_id = kw.get("session_id") or ""
+            is_first_turn = kw.get("is_first_turn", False)
+
+            # Retrieve previous message/intents for topic detection
+            session_data = _pre_llm_session_data.get(session_id, {})
+            prev_msg = session_data.get("msg")
+            prev_intents = session_data.get("intents")
+
+            block, intents = _build_skill_candidates_context(
+                user_message,
+                session_id=session_id,
+                is_first_turn=is_first_turn,
+                prev_msg=prev_msg,
+                prev_intents=prev_intents,
+            )
+
+            # Update session state with current message + intents for next turn
+            _pre_llm_session_data[session_id] = {
+                "msg": user_message.strip(),
+                "intents": intents,
+            }
+
+            # Cap session_data cache (avoid unbounded growth in long-lived processes)
+            if len(_pre_llm_session_data) > 100:
+                # Drop oldest entries (rough heuristic)
+                oldest = sorted(_pre_llm_session_data.keys())[:20]
+                for k in oldest:
+                    if k != session_id:
+                        del _pre_llm_session_data[k]
+
+            if not block:
+                return None
+            # pre_llm_call context dict: {"context": str} — the core appends
+            # this to the API copy of the user message (api_content sidecar),
+            # never to the stored transcript content.
+            return {"context": block}
+        except Exception:
+            logger.exception("skill-graph: pre_llm_call failed")
+            return None
+
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+
     # ── Monkey-patch skill_view to fall back to skill-graph ──
     try:
         import tools.skills_tool as _st
@@ -2595,27 +3336,72 @@ def register(ctx):
 
         def _patched_skill_view(
             name: str,
-            file_path: str = None,
-            task_id: str = None,
+            file_path: str | None = None,
+            task_id: str | None = None,
             preprocess: bool = True,
         ) -> str:
+            logger.debug("skill-graph: _patched_skill_view called for '%s' (file_path=%s)", name, file_path)
             result = _orig_skill_view(
                 name, file_path=file_path,
                 task_id=task_id, preprocess=preprocess,
             )
             data = json.loads(result)
             if data.get("success") or file_path:
+                logger.debug("skill-graph: skill_view '%s' resolved by original (success=%s)", name, data.get("success"))
                 return result
+            logger.info("skill-graph: skill_view '%s' not found by original, falling back to graph", name)
             sg = _handle_skill_load({"name": name})
             sg_data = json.loads(sg)
-            return sg if sg_data.get("success") else result
+            if sg_data.get("success"):
+                logger.info("skill-graph: skill_view '%s' resolved by graph fallback", name)
+                return sg
+            logger.debug("skill-graph: skill_view '%s' not found in graph either", name)
+            return result
 
         _st.skill_view = _patched_skill_view
         logger.info("skill-graph: patched skill_view with graph fallback")
     except Exception:
         logger.exception("skill-graph: failed to patch skill_view")
 
+    # ── Monkey-patch _find_skill to fall back to skill-graph ──
+    # When skill_graph_mode is on, the agent may receive injected candidates
+    # for skills that live in graph source_dirs (e.g. PS repo) but not in the
+    # local skills/ dir that _find_skill scans. Without this patch, skill_manage
+    # (patch/edit/write_file/delete) fails with "not found in active profile"
+    # for any graph-managed skill.
+    #
+    # Patch strategy: try the original _find_skill first (local skills take
+    # precedence). On miss, delegate to the graph's _find_skill_path, which
+    # scans all configured source_dirs. Read-only skills (hermes bundled,
+    # hermes-agent live install) are allowed to resolve — patch/edit operate
+    # on their physical path and the file system permissions handle protection.
+    try:
+        import tools.skill_manager_tool as _smt
+        _orig_find_skill = _smt._find_skill
+
+        def _patched_find_skill(name: str):
+            logger.debug("skill-graph: _patched_find_skill called for '%s'", name)
+            result = _orig_find_skill(name)
+            if result is not None:
+                logger.debug("skill-graph: _find_skill '%s' resolved by original", name)
+                return result
+            # Graph fallback: resolve physical path from the graph's index
+            graph_path = _find_skill_path(name)
+            if graph_path is not None:
+                logger.info(
+                    "skill-graph: _find_skill graph fallback resolved '%s' → %s",
+                    name, graph_path,
+                )
+                return {"path": graph_path.parent}
+            logger.debug("skill-graph: _find_skill '%s' not found in original or graph", name)
+            return None
+
+        _smt._find_skill = _patched_find_skill
+        logger.info("skill-graph: patched _find_skill with graph fallback")
+    except Exception:
+        logger.exception("skill-graph: failed to patch _find_skill")
+
     logger.info(
         "skill-graph plugin registered: tools=skill_graph_search+skill_load+skill_graph_config, "
-        "cmd=/skill-graph, hooks=on_session_start+post_tool_call+pre_tool_call"
+        "cmd=/skill-graph, hooks=on_session_start+post_tool_call+pre_tool_call+pre_llm_call"
     )
