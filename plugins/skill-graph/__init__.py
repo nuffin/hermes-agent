@@ -829,12 +829,26 @@ def _embedding_search(
 
 # ── pre_llm_call: candidate injection (Plan A) ─────────────────────────────
 
+# Per-session state for delta injection: session_id → set of injected skill names
+_injected_names_cache: dict[str, set[str]] = {}
 
-def _build_skill_candidates_context(user_message: str) -> str | None:
+
+def _build_skill_candidates_context(
+    user_message: str,
+    session_id: str = "",
+    is_first_turn: bool = False,
+    prev_msg: str | None = None,
+    prev_intents: list[str] | None = None,
+) -> str | None:
     """Build the skill-candidates context block for the current user message.
 
     Returns None when nothing should be injected (skip conditions, no
     candidates, retrieval unavailable) — the caller injects nothing.
+
+    Incremental injection: when topic detection judges the message as a
+    continuation of the previous topic, only candidates not yet injected
+    in this session are included (delta). On topic shift or first turn,
+    the full candidate list is injected and the tracking set is reset.
 
     Cost guards (every user message would otherwise pay an intent-split LLM
     call + embedding retrieval):
@@ -843,14 +857,14 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
       - Embedding unavailability falls back to lexical search.
     """
     if not user_message or not isinstance(user_message, str):
-        return None
+        return None, []
     msg = user_message.strip()
     if not msg:
-        return None
+        return None, []
 
     # Cost guard: skip conversational filler and very short messages.
     if len(msg) < 12:
-        return None
+        return None, []
     lowered = msg.lower()
     _trivial_prefixes = (
         "hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
@@ -859,10 +873,10 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
     if lowered in _trivial_prefixes or any(
         lowered.startswith(p) for p in _trivial_prefixes
     ):
-        return None
+        return None, []
     # Pure confirmation / single-word replies
     if msg in ("好", "可以", "行", "ok", "yes", "no", "y", "n", "done", "完成", "继续"):
-        return None
+        return None, []
 
     # Config gate: injection can be disabled entirely
     try:
@@ -870,15 +884,52 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
         config = load_config()
         sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
         if isinstance(sg, dict) and sg.get("inject_candidates") is False:
-            return None
+            return None, []
     except Exception:
         pass
 
-    # Intent split (one lightweight LLM call). Fall back to the raw message
-    # as a single intent when split fails.
-    intents = _split_intents(msg)
+    # Intent split (one lightweight LLM call). Pass prev_intents to get
+    # topic_continuation judgment (piggy-backed, zero extra cost).
+    intents, scene, llm_tc = _split_intents(msg, prev_intents=prev_intents)
     if not intents:
         intents = [msg]
+
+    # ── Topic detection (AND gate) ──
+    topic_result = None
+    llm_tc_for_detect = llm_tc if prev_intents else None
+
+    # Build embed_fn if embedding backend is available
+    embed_fn = None
+    try:
+        _ec = _embedding_client()
+        if _ec:
+            def embed_fn(text):
+                results = _ec.embed([text])
+                return results[0] if results else None
+    except Exception:
+        pass
+
+    try:
+        import importlib.util as _ilu
+        _td_path = str(Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py")
+        if Path(_td_path).exists():
+            _spec = _ilu.spec_from_file_location("topic_detection", _td_path)
+            _td = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_td)
+            topic_result = _td.detect_topic_shift(
+                msg, prev_msg=prev_msg,
+                llm_topic_continuation=llm_tc_for_detect,
+                embed_fn=embed_fn,
+            )
+    except Exception:
+        pass
+
+    # Determine injection mode: full or delta
+    force_full = True  # default: full injection
+    if is_first_turn:
+        force_full = True
+    elif topic_result and topic_result.get("method") != "fallback":
+        force_full = not topic_result.get("topic_continuation", False)
 
     # Retrieve candidates per intent, merge, dedupe.
     merged: dict[str, dict[str, Any]] = {}
@@ -911,10 +962,34 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
 
     ranked = sorted(merged.values(), key=lambda x: -x.get("score", 0))
     if not ranked:
-        return None
+        return None, []
+
+    # ── Delta filtering ──
+    injected_key = f"_injected:{session_id}"
+    if force_full:
+        # Reset: inject all, rebuild tracking set
+        candidates = ranked[:10]
+        _injected_names_cache[injected_key] = set(
+            c["name"] for c in candidates
+        )
+        mode_label = "full"
+    else:
+        # Delta: only inject candidates not yet seen this session
+        already = _injected_names_cache.get(injected_key, set())
+        delta = [c for c in ranked[:10] if c["name"] not in already]
+        if not delta:
+            logger.info(
+                "skill-graph: no new candidates (all %d already injected in session %s)",
+                len(already), session_id,
+            )
+            return None, []
+        candidates = delta
+        _injected_names_cache[injected_key] = already | set(
+            c["name"] for c in candidates
+        )
+        mode_label = "delta"
 
     # Cap the injection budget (~2K tokens ≈ keep candidates lean).
-    candidates = ranked[:10]
     lines = []
     for c in candidates:
         desc = (c.get("description") or "")[:120]
@@ -923,11 +998,18 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
         "Relevant skills you may want to load (skill_load) for this request:\n"
         + "\n".join(lines)
     )
+
+    tc_str = ""
+    if topic_result:
+        tc_str = f" [topic={topic_result.get('method')}, cont={topic_result.get('topic_continuation')}]"
+
     logger.info(
-        "skill-graph: injected %d skill candidates (from %d intents)",
-        len(candidates), len(intents),
+        "skill-graph: injected %d skill candidates (%s mode, from %d intents): %s%s",
+        len(candidates), mode_label, len(intents),
+        ", ".join(c["name"] for c in candidates),
+        tc_str,
     )
-    return block
+    return block, intents
 
 
 # ── LLM Enrichment ────────────────────────────────────────────────────────────
@@ -1222,29 +1304,39 @@ def _resolve_llm_provider(
     return provider_name, api_key, base_url
 
 
-def _split_intents(user_message: str) -> list[str]:
+def _split_intents(
+    user_message: str,
+    prev_intents: list[str] | None = None,
+) -> tuple[list[str], str | None, bool | None]:
     """Split a user message into intent sentences via one lightweight LLM call.
 
-    Returns a list of intent sentences ([] on failure — callers should fall
-    back to treating the whole message as a single intent).
+    Returns ``(intents, scene, topic_continuation)``:
+
+    - ``intents``: list of intent sentences (``[]`` on failure — caller falls
+      back to treating the whole message as one intent).
+    - ``scene``: one of coding|writing|research|design|devops|hermes|media|common,
+      or ``None`` if the LLM didn't return it.
+    - ``topic_continuation``: ``True``/``False`` from the LLM when
+      ``prev_intents`` is provided, ``None`` if unavailable. Piggy-backed onto
+      the intent-split call (zero extra API cost).
 
     Multi-intent: each intent is a *sentence* (embedding-friendly), not a
-    keyword list. Also returns scene in the same call (not used here — the
-    caller applies it as a soft retrieval weight).
+    keyword list. When ``prev_intents`` is given, the prompt includes the
+    previous message's intents so the model can judge topic continuity.
     """
     if not user_message or not user_message.strip():
-        return []
+        return [], None, None
 
     try:
         import requests
     except ImportError:
         logger.warning("skill-graph: intent split skipped — requests not installed")
-        return []
+        return [], None, None
 
     resolved = _resolve_llm_provider()
     if resolved is None:
         logger.warning("skill-graph: intent split skipped — no provider with API key")
-        return []
+        return [], None, None
     provider_name, api_key, base_url = resolved
 
     # Model: intent_split_model config → enrichment model → main model → default
@@ -1267,19 +1359,36 @@ def _split_intents(user_message: str) -> list[str]:
     if base_url.endswith("/v1"):
         base_url = base_url[:-3]
 
+    # Build topic-continuation prompt section (only when prev_intents given)
+    topic_section = ""
+    if prev_intents:
+        prev_text = " | ".join(prev_intents[:3])
+        topic_section = (
+            f"\n--- PREVIOUS MESSAGE INTENTS ---\n{prev_text}\n--- END ---\n\n"
+            'Also include this field:\n'
+            '"topic_continuation": true/false — is this new message continuing '
+            "the same topic/task as the previous message (whose intents are "
+            "shown above), or is it a new topic?\n"
+            "Judge by the core intent, not surface words. Follow-ups, "
+            'clarifications, and confirmations are "continuation". A brand-new '
+            'task or unrelated question is "new topic".\n\n'
+        )
+
     prompt = (
         "Split the user's message into separate intents. Each intent should be "
         "ONE complete sentence describing a single topic the user wants done. "
         "Output ONLY JSON:\n"
         '{"intents": ["<intent 1 as a sentence>", "<intent 2 as a sentence>", ...], '
-        '"scene": "<one of: coding|writing|research|design|devops|hermes|media|common>"}\n'
-        "Rules:\n"
+        '"scene": "<one of: coding|writing|research|design|devops|hermes|media|common>"'
+        + (', "topic_continuation": true/false}' if prev_intents else "}")
+        + "\nRules:\n"
         "- Keep the user's original meaning; do not add requirements.\n"
         "- 1-6 intents. If the message is a single topic, return exactly 1 intent "
         "with the full message rephrased as a sentence.\n"
         "- Each intent must be self-contained (no 'it'/'that' references across intents).\n"
         "- Scene: pick the single most applicable value.\n"
-        "User message:\n"
+        + topic_section
+        + "User message:\n"
         f"{user_message}"
     )
 
@@ -1311,7 +1420,7 @@ def _split_intents(user_message: str) -> list[str]:
                 if _attempt < 2:
                     _time.sleep(1.5 * (_attempt + 1))
                     continue
-                return []
+                return [], None, None
 
             # Strip markdown code fences if present
             if text.startswith("```"):
@@ -1325,9 +1434,16 @@ def _split_intents(user_message: str) -> list[str]:
             result = json.loads(text)
             intents = result.get("intents", []) if isinstance(result, dict) else []
             intents = [str(i).strip() for i in intents if str(i).strip()]
+            scene = result.get("scene") if isinstance(result, dict) else None
+            tc = result.get("topic_continuation") if isinstance(result, dict) else None
+            # Coerce tc to bool/None
+            if isinstance(tc, str):
+                tc = tc.lower().strip() in ("true", "yes", "1")
+            elif not isinstance(tc, bool):
+                tc = None
             if intents:
-                return intents
-            return []
+                return intents, scene, tc
+            return [], None, None
 
         except (requests.RequestException, json.JSONDecodeError) as e:
             logger.warning(
@@ -1337,7 +1453,7 @@ def _split_intents(user_message: str) -> list[str]:
             if _attempt < 2:
                 _time.sleep(1.5 * (_attempt + 1))
 
-    return []
+    return [], None, None
 
 
 def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]) -> bool:
@@ -2958,9 +3074,16 @@ def register(ctx):
         args_hint="rebuild|status|config [add|remove] <path>",
     )
 
-    # ── Hook: pre_tool_call — block find/read_file/recall if graph not searched ──
-    _gated_tools = frozenset({"find", "read_file"})
-    _graph_searched_turn: dict[str, bool] = {}  # turn_id → searched
+    # ── Hook: pre_tool_call — gate search_files behind skill_graph_search ──
+    # search_files: prevents the model from bypassing skill discovery by
+    #   going straight to filesystem search (e.g. "find project files").
+    # read_file is intentionally excluded — it's the execution step after a
+    #   skill has been loaded (or reading a known config/source file) and
+    #   should not be gated.
+    # find is not a real Hermes tool; search_files replaced it.
+    _gated_tools = frozenset({"search_files"})
+    _graph_searched: bool = False  # per-turn flag
+    _last_turn_id: str = ""  # for per-turn reset detection
 
     # Resolve skill_graph_mode from config at registration time (startup constant)
     _graph_mode = False
@@ -2971,31 +3094,29 @@ def register(ctx):
         pass
 
     def _on_pre_tool_call(tool_name: str, args: dict | None = None, **kw: Any) -> dict | str | None:
-        nonlocal _graph_searched_turn, _graph_mode
+        nonlocal _graph_searched, _graph_mode, _last_turn_id
         turn_id = kw.get("turn_id", "")
-        if not turn_id:
-            return None
 
-        # Turn boundary: reset flag for new turns
-        if turn_id not in _graph_searched_turn:
-            _graph_searched_turn.clear()
-            _graph_searched_turn[turn_id] = False
+        # Per-turn reset: when turn_id changes, clear the flag
+        if turn_id and turn_id != _last_turn_id:
+            _graph_searched = False
+            _last_turn_id = turn_id
 
         # If this IS skill_graph_search, mark it and allow
         if tool_name == "skill_graph_search":
-            _graph_searched_turn[turn_id] = True
+            _graph_searched = True
             return None
 
         # Check gating: skill-graph mode + restricted tool + not yet searched
         if (
             _graph_mode
             and tool_name in _gated_tools
-            and not _graph_searched_turn.get(turn_id, False)
+            and not _graph_searched
         ):
             return {"action": "block", "message":
                 f"Tool '{tool_name}' is blocked until you call "
                 f"skill_graph_search() first. This profile requires graph "
-                f"discovery before filesystem or session searches."
+                f"discovery before filesystem searches."
             }
         return None
 
@@ -3157,12 +3278,45 @@ def register(ctx):
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 
     # ── Hook: pre_llm_call — inject skill candidates (Plan A) ──
+
+    # Per-session state for delta injection (prev message + intents)
+    _pre_llm_session_data: dict[str, dict] = {}  # session_id → {msg, intents}
+
     def _on_pre_llm_call(**kw):
         try:
             user_message = kw.get("user_message") or ""
             if not user_message or not isinstance(user_message, str):
                 return None
-            block = _build_skill_candidates_context(user_message)
+            session_id = kw.get("session_id") or ""
+            is_first_turn = kw.get("is_first_turn", False)
+
+            # Retrieve previous message/intents for topic detection
+            session_data = _pre_llm_session_data.get(session_id, {})
+            prev_msg = session_data.get("msg")
+            prev_intents = session_data.get("intents")
+
+            block, intents = _build_skill_candidates_context(
+                user_message,
+                session_id=session_id,
+                is_first_turn=is_first_turn,
+                prev_msg=prev_msg,
+                prev_intents=prev_intents,
+            )
+
+            # Update session state with current message + intents for next turn
+            _pre_llm_session_data[session_id] = {
+                "msg": user_message.strip(),
+                "intents": intents,
+            }
+
+            # Cap session_data cache (avoid unbounded growth in long-lived processes)
+            if len(_pre_llm_session_data) > 100:
+                # Drop oldest entries (rough heuristic)
+                oldest = sorted(_pre_llm_session_data.keys())[:20]
+                for k in oldest:
+                    if k != session_id:
+                        del _pre_llm_session_data[k]
+
             if not block:
                 return None
             # pre_llm_call context dict: {"context": str} — the core appends
@@ -3175,42 +3329,63 @@ def register(ctx):
 
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
 
-    # Let native skill_view serve local skills first, then fall back to the
-    # graph index for a graph-discovered top-level skill.
+    # ── Monkey-patch skill_view to fall back to skill-graph ──
     try:
-        import tools.skills_tool as _skills_tool
-        _original_skill_view = _skills_tool.skill_view
+        import tools.skills_tool as _st
+        _orig_skill_view = _st.skill_view
 
-        def _graph_skill_view(
+        def _patched_skill_view(
             name: str,
             file_path: str | None = None,
             task_id: str | None = None,
             preprocess: bool = True,
         ) -> str:
-            result = _original_skill_view(
-                name, file_path=file_path or "", task_id=task_id or "", preprocess=preprocess,
+            logger.debug("skill-graph: _patched_skill_view called for '%s' (file_path=%s)", name, file_path)
+            result = _orig_skill_view(
+                name, file_path=file_path,
+                task_id=task_id, preprocess=preprocess,
             )
             data = json.loads(result)
             if data.get("success") or file_path:
+                logger.debug("skill-graph: skill_view '%s' resolved by original (success=%s)", name, data.get("success"))
                 return result
-            graph_result = _handle_skill_load({"name": name})
-            return graph_result if json.loads(graph_result).get("success") else result
+            logger.info("skill-graph: skill_view '%s' not found by original, falling back to graph", name)
+            sg = _handle_skill_load({"name": name})
+            sg_data = json.loads(sg)
+            if sg_data.get("success"):
+                logger.info("skill-graph: skill_view '%s' resolved by graph fallback", name)
+                return sg
+            logger.debug("skill-graph: skill_view '%s' not found in graph either", name)
+            return result
 
-        _skills_tool.skill_view = _graph_skill_view
+        _st.skill_view = _patched_skill_view
         logger.info("skill-graph: patched skill_view with graph fallback")
     except Exception:
         logger.exception("skill-graph: failed to patch skill_view")
 
-    # skill_manage resolves local skills first. For a local miss, resolve the
-    # graph-managed SKILL.md path so graph-discovered skills remain editable.
+    # ── Monkey-patch _find_skill to fall back to skill-graph ──
+    # When skill_graph_mode is on, the agent may receive injected candidates
+    # for skills that live in graph source_dirs (e.g. PS repo) but not in the
+    # local skills/ dir that _find_skill scans. Without this patch, skill_manage
+    # (patch/edit/write_file/delete) fails with "not found in active profile"
+    # for any graph-managed skill.
+    #
+    # Patch strategy: try the original _find_skill first (local skills take
+    # precedence). On miss, delegate to the graph's _find_skill_path, which
+    # scans all configured source_dirs. Read-only skills (hermes bundled,
+    # hermes-agent live install) are allowed to resolve — patch/edit operate
+    # on their physical path and the file system permissions handle protection.
     try:
-        import tools.skill_manager_tool as _skill_manager_tool
-        _original_find_skill = _skill_manager_tool._find_skill
+        import tools.skill_manager_tool as _smt
+        _orig_find_skill = _smt._find_skill
 
-        def _graph_find_skill(name: str):
-            result = _original_find_skill(name)
+        def _patched_find_skill(name: str):
+            logger.debug("skill-graph: _patched_find_skill called for '%s'", name)
+            result = _orig_find_skill(name)
             if result is not None:
+                logger.debug("skill-graph: _find_skill '%s' resolved by original", name)
                 return result
+            # Graph fallback: resolve physical path from the graph's index
             graph_path = _find_skill_path(name)
             if graph_path is not None:
                 logger.info(
@@ -3218,13 +3393,13 @@ def register(ctx):
                     name, graph_path,
                 )
                 return {"path": graph_path.parent}
+            logger.debug("skill-graph: _find_skill '%s' not found in original or graph", name)
             return None
 
-        _skill_manager_tool._find_skill = _graph_find_skill
+        _smt._find_skill = _patched_find_skill
         logger.info("skill-graph: patched _find_skill with graph fallback")
     except Exception:
         logger.exception("skill-graph: failed to patch _find_skill")
-
 
     logger.info(
         "skill-graph plugin registered: tools=skill_graph_search+skill_load+skill_graph_config, "
