@@ -434,73 +434,6 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
-def _build_topic_detection_block(agent: Any) -> str:
-    """Build the session topic index and auto-detection instruction.
-
-    Returns an empty string if topic segmentation is not active or no
-    topics exist yet. Placed at the end of the system prompt so changes
-    only invalidate the last few lines of the prefix cache.
-    """
-    db = getattr(agent, "_session_db", None)
-    session_id = getattr(agent, "session_id", None)
-    if not db or not session_id:
-        return ""
-
-    try:
-        topics = db.get_topics(session_id)
-    except Exception:
-        return ""
-
-    topic_rows = []
-    for topic in topics:
-        if len(topic_rows) < 5:
-            topic_rows.append(topic)
-
-    lines = []
-    if topic_rows:
-        lines.append("## Session Topics")
-        lines.append("")
-        lines.append("| # | Topic | Msgs | State |")
-        lines.append("|---|-------|------|-------|")
-        for topic in topic_rows:
-            state_marker = "**active**" if topic["state"] == "active" else topic["state"]
-            lines.append(
-                f"| {topic['id']} | {topic['title']} | {topic['message_count']} | {state_marker} |"
-            )
-        total = len(topics)
-        if total > 5:
-            lines.append("")
-            lines.append(f"... and {total - 5} more archived topics.")
-        lines.append("")
-
-    # Ask agent to classify the topic as part of its response
-    lines.append(
-        "Append exactly one line to every response: TOPIC: <name>"
-    )
-    lines.append(
-        "Format rules (critical):"
-    )
-    lines.append(
-        "- The prefix MUST be the literal English word 'TOPIC:' — never "
-        "'主题：', '话题：', or any localized equivalent."
-    )
-    lines.append(
-        "- The topic <name> MUST be in English (kebab-case: "
-        "'docker-setup', 'pr-review', 'curriculum-design')."
-    )
-    lines.append(
-        "- One line, no trailing punctuation, placed at the very end of "
-        "your response."
-    )
-    lines.append(
-        "For brief asides or one-off questions, stay on the"
-        " current topic name. Only introduce a new name when"
-        " the conversation shifts to a sustained new subject."
-        " Same name for follow-ups on the same subject."
-    )
-    return "\n".join(lines)
-
-
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -555,78 +488,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Dynamic skill discovery is an agent operating protocol, distinct from the
-    # graph backend. Keep it in the session-stable identity tier so it neither
-    # expands the initial prompt into a flat catalog nor changes across turns.
-    # Only advertise the protocol when its search tool is actually available.
-    if (
-        getattr(agent, "_skill_graph_mode", False)
-        and "skill_graph_search" in getattr(agent, "valid_tool_names", [])
-    ):
-        stable_parts.append(SKILL_GRAPH_IDENTITY)
-        logger.info("skill-graph: injected SKILL_GRAPH_IDENTITY into system prompt")
-        # Build a minimal skill index containing only the skill-graph
-        # companion, so the agent can discover and load it without graph
-        # search. The description comes from the on-disk SKILL.md.
-        _sg_desc = ""
-        try:
-            import os as _os, yaml as _yaml
-            _paths = [
-                _os.path.join(_os.path.expanduser("~/.hermes/hermes-agent/skills/hermes/skill-graph/SKILL.md")),
-                _os.path.join(_os.path.expanduser("~/.hermes/skills/hermes/skill-graph/SKILL.md")),
-            ]
-            for _p in _paths:
-                if _os.path.isfile(_p):
-                    _fm = next(_yaml.safe_load_all(open(_p, encoding="utf-8")))
-                    _sg_desc = (_fm or {}).get("description", "")
-                    break
-        except Exception:
-            pass
-        if not _sg_desc:
-            _sg_desc = "Skill knowledge graph — discover and load skills by intent"
-        # Read gateway skill extensions from routing-extensions.md.
-        # The extensions_file path is configured under
-        #   skills.config.skill-graph.extensions_file
-        # Parse the "Pre-installed Gateways (Extensions)" markdown table.
-        _gateway_extras: list[tuple[str, str]] = []
-        try:
-            import os as _os2  # noqa: F811
-            from hermes_cli.config import load_config_readonly as _load_cfg
-            _cfg = _load_cfg()
-            _ext_file = (
-                (((_cfg.get("skills") or {}).get("config") or {})
-                 .get("skill-graph") or {}).get("extensions_file") or ""
-            )
-            if _ext_file:
-                _ext_path = _os2.path.expanduser(_ext_file)
-                if _os2.path.isfile(_ext_path):
-                    _in_gw = False
-                    for _line in open(_ext_path, encoding="utf-8").readlines():
-                        _line = _line.rstrip()
-                        if _line.startswith("## Pre-installed Gateways"):
-                            _in_gw = True
-                            continue
-                        if _in_gw:
-                            if _line.startswith("## "):
-                                break
-                            if _line.startswith("| `") and "|" in _line[3:]:
-                                _cells = _line.split("|")
-                                if len(_cells) >= 3:
-                                    _gn = _cells[1].strip().strip("`")
-                                    _gp = _cells[2].strip()
-                                    if _gn and not _gn.startswith("-"):
-                                        _gateway_extras.append((_gn, _gp))
-        except Exception:
-            pass
-        _avail = [f"  skill-graph — {_sg_desc[:100]}"]
-        for _gn, _gp in _gateway_extras:
-            _avail.append(f"  {_gn} — {_gp[:100]}")
-        stable_parts.append("Available Skills\n" + "\n".join(_avail) + "\n")
-        logger.info(
-            "skill-graph: injected available skills into system prompt: %s",
-            ", ".join(line.split(" — ")[0].strip() for line in _avail),
-        )
-
+    # ── Skill index hook ─────────────────────────────────────────────
+    # ``build_skills_index`` lets plugins replace the flat skill index,
+    # inject identity protocol, and/or inject tool guidance — all before
+    # the system prompt is cached.
+    _skills_identity_parts: list[str] = []
+    _skills_guidance_parts: list[str] = []
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a
@@ -680,11 +547,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Skill-graph mode guidance: when the flat index is skipped, tell the
-    # agent to discover skills via the graph.
-    if getattr(agent, "_skill_graph_mode", False):
-        tool_guidance.append(SKILL_GRAPH_GUIDANCE)
-        logger.info("skill-graph: injected SKILL_GRAPH_GUIDANCE into tool guidance")
+    # Skill-graph guidance is injected by the build_skills_index hook below.
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
@@ -763,16 +626,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.prompt_builder import execution_guidance_text
             stable_parts.append(execution_guidance_text(agent.valid_tool_names))
 
-    # skill-graph mode: when the skill-graph plugin is loaded AND the
-    # agent._skill_graph_mode flag is set, skip the flat skill index.
-    # SKILL_GRAPH_GUIDANCE (in tool_guidance) tells the agent to discover
-    # skills dynamically via the graph instead.
+    # Build the default flat skill index. Plugins may replace it below.
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
 
-    if getattr(agent, "_skill_graph_mode", False) and "skill_graph_search" in getattr(agent, "valid_tool_names", []):
-        skills_prompt = ""  # graph handles discovery; no flat index needed
-        logger.info("skill-graph: flat skill index skipped (skill_graph_mode active)")
-    elif has_skills_tools:
+    if has_skills_tools:
         avail_toolsets = {
             toolset
             for toolset in (
@@ -809,6 +666,33 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
     else:
         skills_prompt = ""
+
+    # Let skill-discovery plugins replace the index and inject cache-safe
+    # identity or guidance after the default index has been built.
+    try:
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _index_results = _invoke_hook(
+            "build_skills_index",
+            agent=agent,
+            skills_prompt=skills_prompt,
+            valid_tool_names=set(agent.valid_tool_names),
+        )
+        for _r_hook in (_index_results or []):
+            if not isinstance(_r_hook, dict):
+                continue
+            if "skills_prompt" in _r_hook:
+                skills_prompt = _r_hook["skills_prompt"]
+            _identity = _r_hook.get("identity")
+            if _identity:
+                _skills_identity_parts.append(_identity)
+            _guidance = _r_hook.get("guidance")
+            if _guidance:
+                _skills_guidance_parts.append(_guidance)
+    except Exception as exc:
+        logger.warning("build_skills_index hook failed: %s", exc)
+
+    stable_parts.extend(_skills_identity_parts)
+    stable_parts.extend(_skills_guidance_parts)
 
     # Resolve the help-guidance variant now that the skills index exists:
     # the skill-pointer variant requires BOTH skill_view in the toolset AND
@@ -1088,7 +972,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         volatile_parts.append(skills_prompt)
 
-    if agent._memory_store and getattr(agent, "_memory_mode", "full") != "on_demand":
+    if agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
@@ -1099,13 +983,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # The provider prompt must only appear when its tools are exposed, and never
-    # for on_demand or off sub-agents: on_demand may call provider tools but must
-    # not receive the provider's full context in its initial prompt.
-    if agent._memory_manager and getattr(agent, "_memory_mode", "full") not in (
-        "on_demand",
-        "off",
-    ):
+    # External memory provider system prompt block (additive to built-in).
+    # Gated on the same check ``inject_memory_provider_tools`` uses so we
+    # never advertise provider tools that the agent's toolset configuration
+    # has already gated off (#81014).
+    if agent._memory_manager:
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
@@ -1190,11 +1072,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
-
-    # ── Session Topic Index (auto-detection enabled) ───────────────
-    _topic_detection = _build_topic_detection_block(agent)
-    if _topic_detection:
-        volatile_parts.append(_topic_detection)
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
