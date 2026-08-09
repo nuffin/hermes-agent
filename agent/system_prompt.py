@@ -735,6 +735,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
     stable_parts.extend(_guidance_parts(agent))
     skills_prompt = _skills_prompt(agent)
+    # Discovery plugins may replace the index and append stable protocol/guidance.
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        for hook_result in invoke_hook(
+            "build_skills_index", agent=agent, skills_prompt=skills_prompt,
+            valid_tool_names=set(agent.valid_tool_names),
+        ) or []:
+            if not isinstance(hook_result, dict):
+                continue
+            if "skills_prompt" in hook_result:
+                skills_prompt = hook_result["skills_prompt"]
+            if hook_result.get("identity"):
+                stable_parts.append(hook_result["identity"])
+            if hook_result.get("guidance"):
+                stable_parts.append(hook_result["guidance"])
+    except Exception as exc:
+        logger.warning("build_skills_index hook failed: %s", exc)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
     if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
