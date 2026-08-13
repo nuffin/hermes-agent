@@ -2969,10 +2969,18 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
-        child = _build_child_agent(
+        # T1-24: schema'd tasks get the contract appended to their context
+        # so the child knows the expected output shape before it starts.
+        _task_schema = task_schemas[i] if i < len(task_schemas) else None
+        _child_context = t.get("context")
+        if _task_schema is not None:
+            from tools.delegation_output_schema import append_output_contract
+
+            _child_context = append_output_contract(_child_context, _task_schema)
+        child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
-            context=t.get("context"),
+            context=_child_context,
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
@@ -2991,6 +2999,13 @@ def delegate_task(
             role=effective_role,
             memory_mode=effective_memory_mode,
         )
+        # Attach the validated schema for the completion-side validation
+        # hook in _run_single_child. Absent (None) on schema-less tasks.
+        if _task_schema is not None:
+            try:
+                child._delegate_output_schema = _task_schema
+            except Exception:
+                logger.debug("Could not attach output schema to child %d", i)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3001,7 +3016,7 @@ def delegate_task(
             child.tool_progress_callback = wrap_progress_callback(
                 getattr(child, "tool_progress_callback", None), _writer
             )
-        child._live_transcript_path = str(_writer.path)
+            child._live_transcript_path = str(_writer.path)
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
