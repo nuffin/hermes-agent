@@ -407,6 +407,12 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
+        if not interrupted and not failed:
+            try:
+                agent._refresh_active_topic_summary()
+            except Exception as _topic_summary_err:
+                logger.info("Topic summary refresh failed: %s", _topic_summary_err)
+
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")

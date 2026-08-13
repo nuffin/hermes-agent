@@ -5423,7 +5423,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         first = topics[0]["title"]
         total = len(topics)
         title = first if total == 1 else f"{first} (+{total - 1} topics)"
-        self.set_session_title(session_id, title)
+        self.set_auto_title(
+            session_id, title, source=self.TITLE_SOURCE_DERIVED
+        )
         return title
 
     def get_session_title(self, session_id: str) -> Optional[str]:
@@ -6904,9 +6906,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"UPDATE messages SET active = 0, compacted = 1 WHERE {where}",
                 params,
             )
+            rows_to_insert = compacted_messages
+            if topic_id is not None:
+                rows_to_insert = [
+                    {**message, "topic_id": message.get("topic_id", topic_id)}
+                    for message in compacted_messages
+                ]
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, rows_to_insert
             )
+            if topic_id is not None:
+                summary = self._topic_summary_from_compacted_messages(
+                    compacted_messages
+                )
+                if summary:
+                    conn.execute(
+                        "UPDATE session_topics SET summary = ? WHERE id = ? "
+                        "AND session_id = ?",
+                        (summary, topic_id, session_id),
+                    )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
             conn.execute(
@@ -7914,16 +7932,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Topic Management ───────────────────────────────────────────────
 
+    @staticmethod
+    def _topic_summary_from_compacted_messages(
+        messages: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Extract the compactor's already-paid summary for topic persistence."""
+        try:
+            from agent.context_compressor import (
+                COMPRESSED_SUMMARY_METADATA_KEY,
+                ContextCompressor,
+            )
+        except Exception:
+            return None
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if (
+                message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                or ContextCompressor.classify_summary_content(content) is not None
+            ):
+                summary = ContextCompressor._strip_summary_prefix(content).strip()
+                return summary or content.strip()
+        return None
+
     def create_topic(
         self,
         session_id: str,
         title: str,
         summary: Optional[str] = None,
     ) -> int:
-        """Create a new topic in a session. Returns the topic row ID."""
+        """Atomically archive the active topic and create its active successor."""
         now = time.time()
 
         def _do(conn):
+            conn.execute(
+                "UPDATE session_topics SET state = 'warm', last_active_at = ? "
+                "WHERE session_id = ? AND state = 'active'",
+                (now, session_id),
+            )
+            conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ? "
+                "AND active = 1 AND topic_id IN ("
+                "SELECT id FROM session_topics WHERE session_id = ?"
+                ")",
+                (session_id, session_id),
+            )
             cursor = conn.execute(
                 """INSERT INTO session_topics
                    (session_id, title, summary, state, created_at, last_active_at)
@@ -7935,30 +7991,74 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(_do)
 
     def get_topics(self, session_id: str) -> List[Dict[str, Any]]:
-        """Return all topics for a session, most recently active first."""
+        """Return all topics for a session in stable creation order."""
         with self._lock:
             rows = self._conn.execute(
                 """SELECT id, title, summary, message_count, state,
                           created_at, last_active_at
                    FROM session_topics
                    WHERE session_id = ?
-                   ORDER BY last_active_at DESC""",
+                   ORDER BY created_at ASC, id ASC""",
                 (session_id,),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def get_active_topic(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Return the currently active topic, or None."""
+        """Return the active topic after deterministic legacy-state repair."""
+        self.reconcile_topic_states(session_id)
         with self._lock:
             row = self._conn.execute(
                 """SELECT id, title, summary, message_count, state,
                           created_at, last_active_at
                    FROM session_topics
                    WHERE session_id = ? AND state = 'active'
-                   ORDER BY last_active_at DESC LIMIT 1""",
+                   ORDER BY last_active_at DESC, id DESC LIMIT 1""",
                 (session_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def reconcile_topic_states(self, session_id: str) -> Optional[int]:
+        """Repair legacy multi-active rows, keeping the newest deterministic row."""
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id FROM session_topics WHERE session_id = ? "
+                "AND state = 'active' ORDER BY last_active_at DESC, id DESC",
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                return None
+            keep_id = rows[0]["id"]
+            conn.execute(
+                "UPDATE session_topics SET state = 'warm' WHERE session_id = ? "
+                "AND state = 'active' AND id <> ?",
+                (session_id, keep_id),
+            )
+            conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ? "
+                "AND topic_id <> ? AND active = 1",
+                (session_id, keep_id),
+            )
+            return keep_id
+        return self._execute_write(_do)
+
+    def update_topic_summary(self, topic_id: int, summary: str) -> bool:
+        """Persist a non-empty reusable summary for one topic."""
+        normalized = (summary or "").strip()
+        if not normalized:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE session_topics SET summary = ? WHERE id = ?",
+                (normalized, topic_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
+
+    def get_topic_title_context(self, session_id: str) -> List[Dict[str, Any]]:
+        """Stable DB interface for chronological topic-aware title consumers."""
+        return self.get_topics(session_id)
 
     def set_active_topic(self, session_id: str, topic_id: int) -> bool:
         """Set the active topic for a session. Archives the previous active."""
@@ -7972,19 +8072,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if not row:
                 return False
-            # Archive current active topic
+            # Archive current active topic and hide its live rows from context.
             conn.execute(
                 """UPDATE session_topics
                    SET state = 'warm', last_active_at = ?
                    WHERE session_id = ? AND state = 'active'""",
                 (now, session_id),
             )
-            # Activate the target topic
+            conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ? "
+                "AND topic_id <> ? AND active = 1",
+                (session_id, topic_id),
+            )
+            # Activate the target topic and restore its non-compacted history.
             conn.execute(
                 """UPDATE session_topics
                    SET state = 'active', last_active_at = ?
                    WHERE id = ? AND session_id = ?""",
                 (now, topic_id, session_id),
+            )
+            conn.execute(
+                "UPDATE messages SET active = 1 WHERE session_id = ? "
+                "AND topic_id = ? AND compacted = 0",
+                (session_id, topic_id),
             )
             return True
 

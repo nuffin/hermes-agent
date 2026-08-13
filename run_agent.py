@@ -1869,10 +1869,10 @@ class AIAgent:
         if not db or not sid:
             return
         try:
-            if self._active_topic_id is not None:
-                db.set_active_topic(sid, 0)
+            self._refresh_active_topic_summary()
             topic_id = db.create_topic(sid, name)
             self._active_topic_id = topic_id
+            self._invalidate_system_prompt()
         except Exception:
             pass
 
@@ -1883,11 +1883,50 @@ class AIAgent:
         if not db or not sid or topic_id is None:
             return
         try:
+            self._refresh_active_topic_summary()
             if db.set_active_topic(sid, topic_id):
                 self._active_topic_id = topic_id
                 self._invalidate_system_prompt()
         except Exception:
             pass
+
+    def _refresh_active_topic_summary(self) -> bool:
+        """Persist a best available summary without making a duplicate LLM call."""
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        topic_id = getattr(self, "_active_topic_id", None)
+        if not db or not sid or topic_id is None:
+            return False
+        messages = list(getattr(self, "_session_messages", None) or [])
+        try:
+            from agent.context_compressor import ContextCompressor
+        except Exception:
+            ContextCompressor = None
+        summary = None
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if ContextCompressor is not None and (
+                ContextCompressor.classify_summary_content(content) is not None
+                or message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+            ):
+                summary = ContextCompressor._strip_summary_prefix(content).strip()
+                break
+        if not summary:
+            topic_messages = db.get_topic_messages(
+                sid, topic_id, include_inactive=True
+            )
+            parts = [
+                str(message.get("content", "")).strip()
+                for message in topic_messages[-8:]
+                if message.get("role") in {"user", "assistant"}
+                and str(message.get("content", "")).strip()
+            ]
+            summary = "\n".join(parts)[-4000:].strip()
+        return bool(summary and db.update_topic_summary(topic_id, summary))
 
     def _auto_create_first_topic(self, first_message: str) -> Optional[int]:
         """Create initial topic on first user message if none exists."""
@@ -1898,7 +1937,11 @@ class AIAgent:
         try:
             existing = db.get_topics(sid)
             if existing:
-                return existing[0]["id"] if existing[0]["state"] == "active" else None
+                active = db.get_active_topic(sid)
+                if active:
+                    self._active_topic_id = active["id"]
+                    return active["id"]
+                return None
             name = first_message[:40].strip() if first_message else "new session"
             if not name:
                 name = "new session"
@@ -1921,6 +1964,10 @@ class AIAgent:
             if not existing:
                 topic_id = db.create_topic(sid, "new session")
                 self._active_topic_id = topic_id
+            else:
+                active = db.get_active_topic(sid)
+                if active:
+                    self._active_topic_id = active["id"]
         except Exception:
             pass
 

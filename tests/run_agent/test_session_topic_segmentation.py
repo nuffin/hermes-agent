@@ -134,9 +134,60 @@ class TestTopicManager:
 
         topics = db.get_topics(sid)
         assert len(topics) == 2
-        # Most recently active first
-        assert topics[0]["title"] == "docker"
-        assert topics[1]["title"] == "python"
+        assert [topic["title"] for topic in topics] == ["python", "docker"]
+        assert [topic["state"] for topic in topics] == ["warm", "active"]
+
+    def test_create_topic_atomically_archives_previous_active(self, db):
+        sid = "test-db"
+        first = db.create_topic(sid, "python")
+        second = db.create_topic(sid, "docker")
+
+        active = [topic for topic in db.get_topics(sid) if topic["state"] == "active"]
+        assert [topic["id"] for topic in active] == [second]
+        assert db.get_active_topic(sid)["id"] == second
+        assert first != second
+
+    def test_reconcile_legacy_multiple_active_topics(self, db):
+        sid = "test-db"
+        first = db.create_topic(sid, "python")
+        second = db.create_topic(sid, "docker")
+        db._conn.execute(
+            "UPDATE session_topics SET state = 'active' WHERE id IN (?, ?)",
+            (first, second),
+        )
+        db._conn.commit()
+
+        kept = db.reconcile_topic_states(sid)
+
+        assert kept == second
+        states = {topic["id"]: topic["state"] for topic in db.get_topics(sid)}
+        assert states == {first: "warm", second: "active"}
+
+    def test_update_topic_summary_and_chronological_context(self, db):
+        sid = "test-db"
+        first = db.create_topic(sid, "python")
+        second = db.create_topic(sid, "docker")
+
+        assert db.update_topic_summary(first, "Goal: repair topic state") is True
+        context = db.get_topic_title_context(sid)
+
+        assert [topic["id"] for topic in context] == [first, second]
+        assert context[0]["summary"] == "Goal: repair topic state"
+        assert set(context[0]) >= {
+            "id", "title", "summary", "state", "message_count",
+            "created_at", "last_active_at",
+        }
+
+    def test_topic_switch_preserves_archived_history(self, db):
+        sid = "test-db"
+        first = db.create_topic(sid, "python")
+        db.append_message(sid, "user", "old durable message", topic_id=first)
+        second = db.create_topic(sid, "docker")
+
+        assert db.get_topic_messages(sid, first) == []
+        archived = db.get_topic_messages(sid, first, include_inactive=True)
+        assert [message["content"] for message in archived] == ["old durable message"]
+        assert db.get_active_topic(sid)["id"] == second
 
     def test_set_active_topic(self, db):
         sid = "test-db"
@@ -183,6 +234,38 @@ class TestTopicManager:
             "SELECT title FROM sessions WHERE id = ?", (sid,)
         ).fetchone()
         assert row["title"] == "kubernetes"
+        assert db.get_session_title_source(sid) == db.TITLE_SOURCE_DERIVED
+
+    def test_set_topic_session_title_uses_first_created_and_protects_human_title(self, db):
+        sid = "test-db"
+        db.create_topic(sid, "first-topic")
+        db.create_topic(sid, "newest-topic")
+
+        assert db.set_topic_session_title(sid) == "first-topic (+1 topics)"
+        db.set_session_title(sid, "Human title")
+
+        assert db.set_topic_session_title(sid) == "first-topic (+1 topics)"
+        assert db.get_session_title(sid) == "Human title"
+        assert db.get_session_title_source(sid) == db.TITLE_SOURCE_USER
+
+    def test_topic_scoped_compaction_reuses_summary_and_preserves_history(self, db):
+        from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+
+        sid = "test-db"
+        topic_id = db.create_topic(sid, "python")
+        db.append_message(sid, "user", "old message", topic_id=topic_id)
+        compacted = [{
+            "role": "assistant",
+            "content": "Goal: repair topic persistence\nFiles: hermes_state.py",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }]
+
+        db.archive_and_compact(sid, compacted, topic_id=topic_id)
+
+        topic = db.get_topic_title_context(sid)[0]
+        assert "repair topic persistence" in topic["summary"]
+        durable = db.get_topic_messages(sid, topic_id, include_inactive=True)
+        assert any(message["content"] == "old message" for message in durable)
 
     def test_get_topic_messages(self, db):
         sid = "test-db"
@@ -338,6 +421,39 @@ class TestProcessTopicSignals:
 
         cleaned = agent._process_topic_signals("just a response")
         assert cleaned == "just a response"
+
+
+class TestTopicSummaryLifecycle:
+    def test_switch_refreshes_archived_topic_summary(self):
+        from run_agent import AIAgent
+
+        db = MagicMock()
+        db.set_active_topic.return_value = True
+        db.get_topic_messages.return_value = [
+            {"role": "user", "content": "Repair hermes_state.py topic state"},
+            {"role": "assistant", "content": "Implemented atomic transition"},
+        ]
+        agent = MagicMock()
+        agent._session_db = db
+        agent.session_id = "session"
+        agent._active_topic_id = 3
+        agent._session_messages = []
+        agent._refresh_active_topic_summary = (
+            AIAgent._refresh_active_topic_summary.__get__(agent)
+        )
+        agent._switch_to_topic = AIAgent._switch_to_topic.__get__(agent)
+
+        agent._switch_to_topic(4)
+
+        db.update_topic_summary.assert_called_once()
+        assert "hermes_state.py" in db.update_topic_summary.call_args.args[1]
+        db.set_active_topic.assert_called_once_with("session", 4)
+
+    def test_finalize_refreshes_active_topic_summary(self):
+        source = Path("agent/turn_finalizer.py").read_text(encoding="utf-8")
+        refresh = source.index("agent._refresh_active_topic_summary()")
+        persist = source.index("agent._persist_session(messages, conversation_history)")
+        assert refresh < persist
 
 
 # ---------------------------------------------------------------------------
