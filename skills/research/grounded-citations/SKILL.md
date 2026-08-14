@@ -1,15 +1,31 @@
 ---
-name: grounded-citations
-description: "Ground answers and documents in cited, verifiable sources."
-version: 1.1.0
 author: Hermes Agent + Teknium
+description: Ground answers and documents in cited, verifiable sources.
 license: MIT
-platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [Research, Citations, Grounding, Sources, Web, Reports]
     category: research
-    related_skills: [research-paper-writing, arxiv, ocr-and-documents]
+    related_skills:
+    - research-paper-writing
+    - arxiv
+    - ocr-and-documents
+    scenes:
+    - research
+    - writing
+    tags:
+    - citations
+    - research
+    - writing
+    - fact-checking
+    - sources
+    - python
+    - cli
+name: grounded-citations
+platforms:
+- linux
+- macos
+- windows
+version: 1.1.0
 ---
 
 # Grounded Citations
