@@ -34,13 +34,13 @@ def test_cli_streaming_override_and_interim_setting_are_both_closed():
     assert expected in source
 
 
-def test_delegate_child_build_combines_schema_context_and_memory_mode():
+def test_delegate_child_build_uses_ordinary_context_without_unimplemented_schema_state():
     source = (REPOSITORY_ROOT / "tools/delegate_tool.py").read_text(encoding="utf-8")
 
     expected = '''        child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
-            context=_child_context,'''
+            context=t.get("context"),'''
     assert expected in source
-    assert "            memory_mode=effective_memory_mode,\n        )" in source
-    assert source.count("        children.append((i, t, child))") == 1
+    assert "task_schemas" not in source
+    assert "tools.delegation_output_schema" not in source

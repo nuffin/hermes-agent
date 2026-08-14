@@ -287,6 +287,26 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_schema_free_single_goal_delegation_does_not_reference_schema_state(self):
+        """Regression for an incomplete schema-feature cherry-pick on integration."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Run an ordinary schema-free task", parent_agent=parent)
+            )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(result["results"][0]["status"], "completed")
+
     def test_nous_child_rederives_api_mode_from_model(self):
         """Portal is dual-wire — same provider + different model prefix must
         not inherit the parent's Messages/chat_completions mode verbatim."""
