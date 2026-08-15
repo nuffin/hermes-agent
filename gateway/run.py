@@ -28753,7 +28753,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # True preserves the skip-db behaviour for the standard runtime.
                 "agent_persisted": (result_holder[0].get("agent_persisted", True) if result_holder[0] else True),
             }
->>>>>>> d7b57dfbe (feat: add on_session_resume plugin hook for resumed session lifecycle)
         
         # Start progress message sender if enabled. Gate on needs_progress_queue
         # (tool_progress OR thinking_progress), not tool_progress alone: the

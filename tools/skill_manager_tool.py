@@ -34,6 +34,7 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import contextvars as _ctxvars
@@ -1131,7 +1132,6 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
     _add_description_prompt_preview(result, content)
-    return result
 
     # ── post_skill_edit hook (observer only) ──
     try:

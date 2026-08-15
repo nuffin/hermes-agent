@@ -254,21 +254,23 @@ def test_process_command_fires_pre_command_for_help():
     cli.session_id = "test-session"
     cli._pending_resume_sessions = None
 
-    mock_invoke = MagicMock()
+    mock_fire = MagicMock()
     with (
         patch("hermes_cli.plugins.has_hook", return_value=True),
-        patch("hermes_cli.plugins.invoke_hook", mock_invoke),
+        patch("hermes_cli.plugins.fire_pre_command_hook", mock_fire),
+        patch("hermes_cli.plugins.invoke_hook"),
         patch.object(cli, "show_help"),
     ):
         result = cli.process_command("/help")
 
     assert result is True, "process_command should return True (continue)"
-    mock_invoke.assert_any_call(
-        "pre_command",
+    mock_fire.assert_called_once_with(
+        surface="cli",
         command="help",
-        raw="/help",
-        session_id="test-session",
-        cli=cli,
+        alias_used="help",
+        args_raw="",
+        session_key="test-session",
+        platform="cli",
     )
 
 
