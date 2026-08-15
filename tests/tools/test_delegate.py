@@ -142,7 +142,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
+        self.assertEqual(sorted(result), ["code_execution", "file", "memory", "terminal"])
 
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
@@ -189,12 +189,7 @@ class TestStripBlockedTools(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         disabled = kwargs["disabled_toolsets"]
         self.assertIn("browser", disabled)
-        for toolset_name in (
-            "clarify",
-            "cronjob",
-            "delegation",
-            "memory",
-        ):
+        for toolset_name in ("clarify", "cronjob", "delegation"):
             self.assertIn(toolset_name, disabled)
         # code_execution is deliberately NOT denied — children keep
         # execute_code for programmatic tool calling (Teknium, Jul 2026).
@@ -1033,7 +1028,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertEqual(
             MockAgent.call_args[1]["enabled_toolsets"],
-            ["web", "browser"],
+            ["web", "browser", "memory"],
         )
 
 
