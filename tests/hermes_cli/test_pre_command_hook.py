@@ -111,6 +111,7 @@ def test_cli_fires_for_recognized_command(monkeypatch):
     from hermes_cli import plugins as plugins_mod
 
     captured = {}
+    monkeypatch.setattr(plugins_mod, "has_hook", lambda name: name == "pre_command")
 
     def _capture(**kwargs):
         captured.update(kwargs)
@@ -133,6 +134,7 @@ def test_cli_reports_canonical_name_for_alias(monkeypatch):
     from hermes_cli import plugins as plugins_mod
 
     captured = {}
+    monkeypatch.setattr(plugins_mod, "has_hook", lambda name: name == "pre_command")
     monkeypatch.setattr(
         plugins_mod, "fire_pre_command_hook",
         lambda **kwargs: captured.update(kwargs),
@@ -152,6 +154,7 @@ def test_cli_passes_raw_args(monkeypatch):
     from hermes_cli import plugins as plugins_mod
 
     captured = {}
+    monkeypatch.setattr(plugins_mod, "has_hook", lambda name: name == "pre_command")
     monkeypatch.setattr(
         plugins_mod, "fire_pre_command_hook",
         lambda **kwargs: captured.update(kwargs),
@@ -169,6 +172,7 @@ def test_cli_hook_before_handler(monkeypatch):
     from hermes_cli import plugins as plugins_mod
 
     order = []
+    monkeypatch.setattr(plugins_mod, "has_hook", lambda name: name == "pre_command")
     monkeypatch.setattr(
         plugins_mod, "fire_pre_command_hook",
         lambda **kwargs: order.append("hook"),

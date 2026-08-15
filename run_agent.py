@@ -569,7 +569,6 @@ class AIAgent:
             )
         # Backward compatibility for deprecated skip_memory parameter
         if skip_memory:
-            import warnings
             warnings.warn(
                 "skip_memory is deprecated, use memory_mode='off' instead",
                 DeprecationWarning,
