@@ -12850,6 +12850,7 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
         "commands",
         "approve",
         "deny",
+        "topic",
     }
 )
 

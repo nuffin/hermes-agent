@@ -568,13 +568,16 @@ class AIAgent:
                 stacklevel=2,
             )
         # Backward compatibility for deprecated skip_memory parameter
-        if skip_memory:
+        if skip_memory and memory_mode != "off":
             warnings.warn(
                 "skip_memory is deprecated, use memory_mode='off' instead",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            memory_mode = "off"
+            if "memory" in (enabled_toolsets or []):
+                memory_mode = "full"
+            else:
+                memory_mode = "off"
 
         from agent.agent_init import init_agent
         init_agent(

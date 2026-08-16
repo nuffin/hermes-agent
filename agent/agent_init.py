@@ -1745,7 +1745,8 @@ def init_agent(
             DeprecationWarning,
             stacklevel=2,
         )
-        memory_mode = "off"
+        if "memory" not in (enabled_toolsets or []):
+            memory_mode = "off"
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_mode = memory_mode if memory_mode in {"full", "on_demand", "off"} else "full"
@@ -1761,14 +1762,16 @@ def init_agent(
     # the memory tool dispatches with store=None and every call fails (#65429).
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
-    _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    _memory_toolset_requested = "memory" in (
+        enabled_toolsets or getattr(agent, "enabled_toolsets", None) or []
+    )
     if agent._memory_mode != "off" and (not skip_memory or _memory_toolset_requested):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
+            if agent._memory_enabled or agent._user_profile_enabled or _memory_toolset_requested:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
