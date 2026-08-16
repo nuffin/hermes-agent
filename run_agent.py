@@ -643,6 +643,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            memory_mode=memory_mode,
             skip_background_review=skip_background_review,
             session_db=session_db,
             parent_session_id=parent_session_id,

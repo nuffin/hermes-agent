@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -555,6 +556,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_mode: str = "full",
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -1737,7 +1739,16 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
+    if skip_memory and memory_mode != "off":
+        warnings.warn(
+            "skip_memory is deprecated, use memory_mode='off' instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        memory_mode = "off"
+
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    agent._memory_mode = memory_mode if memory_mode in {"full", "on_demand", "off"} else "full"
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
@@ -1751,7 +1762,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    if agent._memory_mode != "off" and (not skip_memory or _memory_toolset_requested):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
