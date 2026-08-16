@@ -391,6 +391,7 @@ class TestSlackDownloadSlackFile:
     def test_success_on_first_attempt(self, tmp_path, monkeypatch):
         """Successful download on first try returns a cached file path."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
         adapter = _make_slack_adapter()
 
         fake_response = MagicMock()
@@ -416,6 +417,7 @@ class TestSlackDownloadSlackFile:
     def test_rejects_html_response(self, tmp_path, monkeypatch):
         """An HTML sign-in page from Slack is rejected, not cached as image."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
         adapter = _make_slack_adapter()
 
         fake_response = MagicMock()
@@ -450,9 +452,10 @@ class TestSlackDownloadSlackFile:
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
 
-    def test_success_returns_bytes(self):
+    def test_success_returns_bytes(self, monkeypatch):
         """Successful download returns raw bytes."""
         adapter = _make_slack_adapter()
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
 
         fake_response = MagicMock()
         fake_response.content = b"raw bytes here"

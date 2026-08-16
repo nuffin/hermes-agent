@@ -380,6 +380,7 @@ class TestVisionDispatchLoopSafety:
                 "tools.vision_tools._image_to_base64_data_url",
                 return_value="data:image/jpeg;base64,abc",
             ),
+            patch("tools.url_safety.is_safe_url", return_value=True),
         ):
             result_json = registry.dispatch(
                 "vision_analyze",
@@ -425,6 +426,7 @@ class TestVisionDispatchLoopSafety:
                 "tools.vision_tools._image_to_base64_data_url",
                 return_value="data:image/jpeg;base64,abc",
             ),
+            patch("tools.url_safety.is_safe_url", return_value=True),
         ):
             args = {"image_url": "https://example.com/cat.png", "question": "Describe"}
 
