@@ -572,8 +572,18 @@ class TestTodoSnapshotMergedNotDuplicated:
             lambda: "## Current Tasks\n- [ ] inspect image"
         )
 
+        # Input transcript must be large enough that the fake compressor's
+        # output is a genuine shrink — the no-growth commit guard refuses
+        # to persist a compression that grows the transcript.
+        input_msgs = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"m{i} " + "x" * 400,
+            }
+            for i in range(20)
+        ]
         compressed, _ = agent._compress_context(
-            _msgs(), "sys", approx_tokens=120_000
+            input_msgs, "sys", approx_tokens=120_000
         )
 
         assert len(compressed) == 3
@@ -678,8 +688,51 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        assert compressed == expected
+        assert [{k: v for k, v in m.items() if k != "_row_id"} for m in compressed] == expected
         assert not any(
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed
+        )
+
+
+class TestArchivedParentActivityLabelsCleared:
+    def test_parent_labels_cleared_after_rotation_child_lineage_intact(
+        self, tmp_path: Path
+    ):
+        """Round-2 #4: the terminal heartbeat stamp must not stay on the parent.
+
+        The compression activity heartbeat force-persists "context compression
+        completed" against the PARENT id (agent.session_id at stamp time).
+        After the out-of-place rotation the parent is archived; its activity
+        labels must be cleared so it doesn't advertise a fresh
+        last_activity_at + terminal label forever, while the child keeps its
+        lineage.
+        """
+        from agent.session_activity import ActivityProvenance
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ACTIVITY_LABELS"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = agent.session_id
+        assert child != parent  # rotation happened
+
+        # Child lineage intact.
+        child_row = db.get_session(child)
+        assert child_row is not None
+        assert child_row.get("parent_session_id") == parent
+
+        # Parent archived with cleared activity labels.
+        parent_row = db.get_session(parent)
+        assert parent_row is not None
+        assert parent_row.get("ended_at") is not None
+        assert not parent_row.get("last_activity_description"), (
+            "archived compression parent kept a stale activity description "
+            f"({parent_row.get('last_activity_description')!r})"
+        )
+        prov = parent_row.get("last_activity_provenance")
+        assert not prov or prov == ActivityProvenance.UNKNOWN.value, (
+            f"archived parent kept terminal provenance {prov!r}"
         )
