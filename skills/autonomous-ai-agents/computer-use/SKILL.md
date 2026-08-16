@@ -22,7 +22,6 @@ metadata:
     - tool
     category: desktop
     related_skills:
-    - browser
     scenes:
     - common
 ---

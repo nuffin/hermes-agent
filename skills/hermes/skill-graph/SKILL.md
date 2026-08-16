@@ -1,10 +1,14 @@
 ---
 name: skill-graph
-description: "Skill knowledge graph — intent classification, routing, and discovery. Load this skill first to classify user intent and find the right skill via skill_graph_search()."
+description: "Route user intent to the right skill."
 version: 2.0.0
 author: Hauzer S. Lee
 license: MIT
 category: hermes
+platforms:
+  - linux
+  - macos
+  - windows
 metadata:
   hermes:
     tags:
@@ -20,6 +24,7 @@ metadata:
         properties:
           reason: Routing + validation complete the pipeline
           strength: strong
+---
 
 # Skill Graph — Intent Routing + Discovery
 

@@ -1,16 +1,12 @@
 ---
 author: kshitijk4poor
-description: Control a running TouchDesigner instance via twozero MCP — create operators,
-  set parameters, wire connections, execute Python, build real-time visuals. 36 native
-  tools.
+description: Control TouchDesigner through twozero MCP.
 license: MIT
 metadata:
   hermes:
     related_skills:
-    - native-mcp
     - ascii-video
     - manim-video
-    - hermes-video
     scenes:
     - coding
     tags:

@@ -22,7 +22,6 @@ metadata:
     related_skills:
     - audiocraft-audio-generation
     - songwriting-and-ai-music
-    - audiocraft
     scenes:
     - media
 ---

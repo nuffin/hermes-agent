@@ -29,9 +29,9 @@ version: 1.1.1
 
 # xurl — X (Twitter) API via the Official CLI
 
-`xurl` is the X developer platform's official CLI for the X API. It supports shortcut commands for common actions AND raw curl-style access to any v2 endpoint. All commands return JSON to stdout.
+`xurl` is the X developer platform's official CLI for the X API. It supports shortcut commands for common actions, raw post operations; this skill returns source posts, not a summarized answer or summary of a topic.
 
-Use this skill for:
+Use this skill for authenticated X API access and:
 - posting, replying, quoting, deleting posts
 - searching posts and reading timelines/mentions
 - liking, reposting, bookmarking

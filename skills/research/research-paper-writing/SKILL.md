@@ -16,7 +16,6 @@ metadata:
     category: research
     related_skills:
     - arxiv
-    - ml-paper-writing
     - subagent-driven-development
     - plan
     requires_toolsets:

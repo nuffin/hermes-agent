@@ -7,7 +7,6 @@ metadata:
     related_skills:
     - systematic-debugging
     - python-debugpy
-    - debugging-hermes-tui-commands
     scenes:
     - coding
     tags:

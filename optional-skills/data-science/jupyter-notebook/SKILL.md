@@ -15,7 +15,7 @@ metadata:
     - exploration
     - iterative
     - stateful
-name: jupyter-live-kernel
+name: jupyter-notebook
 platforms:
 - linux
 - macos

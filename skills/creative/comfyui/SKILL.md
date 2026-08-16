@@ -35,8 +35,6 @@ metadata:
     - workflow
     related_skills:
     - stable-diffusion
-    - stable-diffusion-image-generation
-    - image_gen
     category: creative
     scenes:
     - media

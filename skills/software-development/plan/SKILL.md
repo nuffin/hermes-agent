@@ -1,7 +1,6 @@
 ---
 author: Hermes Agent (writing-craft adapted from obra/superpowers)
-description: 'Plan mode: write an actionable markdown plan to .hermes/plans/, no execution.
-  Bite-sized tasks, exact paths, complete code.'
+description: 'Write an actionable markdown implementation plan.'
 license: MIT
 metadata:
   hermes:

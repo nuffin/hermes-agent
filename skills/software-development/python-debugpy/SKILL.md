@@ -7,7 +7,6 @@ metadata:
     related_skills:
     - systematic-debugging
     - node-inspect-debugger
-    - debugging-hermes-tui-commands
     scenes:
     - coding
     tags:
