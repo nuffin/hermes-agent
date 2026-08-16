@@ -7618,6 +7618,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
+                    f"DELETE FROM session_topics WHERE session_id IN ({placeholders})",
+                    ids,
+                )
+                conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
                 self._delete_unreferenced_system_prompts(conn)
@@ -11309,6 +11313,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
+                existing,
+            )
+            conn.execute(
+                f"DELETE FROM session_topics WHERE session_id IN ({existing_placeholders})",
                 existing,
             )
             conn.execute(
