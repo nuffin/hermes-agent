@@ -585,6 +585,12 @@ def _flush_agent(db, session_id):
         _last_persistence_error_cause=None,
     )
     agent._ensure_db_session = lambda: None
+    agent._auto_create_first_topic = (
+        AIAgent._auto_create_first_topic.__get__(agent, AIAgent)
+    )
+    agent._process_topic_signals = (
+        AIAgent._process_topic_signals.__get__(agent, AIAgent)
+    )
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )

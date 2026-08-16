@@ -46,6 +46,9 @@ def _flush_agent(db, session_id):
         _compression_adoption_failed=False,
     )
     agent._ensure_db_session = lambda: None
+    agent._auto_create_first_topic = (
+        AIAgent._auto_create_first_topic.__get__(agent, AIAgent)
+    )
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )

@@ -2697,8 +2697,6 @@ class ContextCompressor(ContextEngine):
         self._last_compression_made_progress: bool = False
         self._summary_failure_cooldown_until: float = 0.0
 
-    def compression_made_progress(self) -> bool:
-        return self._last_compression_made_progress
         # True while the live local cooldown failed to persist to the DB;
         # a refresh must then treat an empty durable row as unknown, not
         # cleared (see get_active_compression_failure_cooldown).
@@ -2741,6 +2739,9 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry: Optional[Dict[str, Any]] = None
         self._active_compression_telemetry: Optional[Dict[str, Any]] = None
         self._compression_telemetry_seed: Optional[Dict[str, Any]] = None
+
+    def compression_made_progress(self) -> bool:
+        return self._last_compression_made_progress
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
