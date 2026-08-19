@@ -44,14 +44,11 @@ def register(ctx):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _load_rules() -> tuple[list[dict], str]:
-    """Load write-guard rules from $HERMES_HOME/config.yaml."""
+    """Load write-guard rules through the profile-aware config loader."""
     try:
-        import yaml
-        cfg_path = _HERMES_HOME / "config.yaml"
-        if not cfg_path.exists():
-            return [], "block"
-        with open(cfg_path) as f:
-            cfg = yaml.safe_load(f) or {}
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
         wg = cfg.get("write-guard", {})
         rules = wg.get("rules", [])
         default = wg.get("default", "block")
