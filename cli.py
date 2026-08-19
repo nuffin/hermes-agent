@@ -9711,24 +9711,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     try:
                         self._session_db.set_session_title(self.session_id, sanitized)
                         self._pending_title = None
+                        self._status_bar_title_checked_at = 0.0
                         title = sanitized
                     except ValueError as e:
                         _cprint(f"  {e} — session started untitled.")
                         title = None
-                    if sanitized:
-                        try:
-                            self._session_db.set_session_title(self.session_id, sanitized)
-                            self._pending_title = None
-                            self._status_bar_title_checked_at = 0.0
-                            title = sanitized
-                        except ValueError as e:
-                            _cprint(f"  {e} — session started untitled.")
-                            title = None
-                        except Exception:
-                            title = None
-                    elif title is not None:
-                        # sanitize_title returned empty (whitespace-only / unprintable)
-                        _cprint("  Title is empty after cleanup — session started untitled.")
+                    except Exception:
                         title = None
                 elif title is not None:
                     # sanitize_title returned empty (whitespace-only / unprintable)
