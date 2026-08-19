@@ -125,6 +125,23 @@ class TestValidateToolset:
     def test_invalid(self):
         assert validate_toolset("nonexistent") is False
 
+    def test_cli_accepts_plugin_toolset_key_during_discovery(self, monkeypatch):
+        import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "CLI_CONFIG", {"mcp_servers": {}})
+        monkeypatch.setattr(
+            cli_mod,
+            "validate_toolset",
+            lambda name: name in {"web", "terminal"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_toolset_keys_nowait",
+            lambda: {"ticket"},
+        )
+
+        assert cli_mod._get_invalid_toolsets(["ticket"]) == []
+        assert cli_mod._get_invalid_toolsets(["unknown"]) == ["unknown"]
+
     def test_mcp_alias_uses_live_registry(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(
