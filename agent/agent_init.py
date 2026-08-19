@@ -1686,7 +1686,9 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
 
-    # Backward compatibility for deprecated skip_memory parameter
+    # Backward compatibility for deprecated skip_memory parameter. Preserve the
+    # built-in store when the caller explicitly exposes the memory toolset, but
+    # keep the legacy opt-out for automatic memory/provider initialization.
     if skip_memory:
         import warnings
         warnings.warn(
@@ -1694,7 +1696,8 @@ def init_agent(
             DeprecationWarning,
             stacklevel=2,
         )
-        memory_mode = "off"
+        if "memory" not in (agent.enabled_toolsets or []):
+            memory_mode = "off"
 
     # Load config once for memory, skills, and compression sections
     try:
@@ -1764,7 +1767,11 @@ def init_agent(
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
+            if (
+                agent._memory_enabled
+                or agent._user_profile_enabled
+                or _memory_toolset_requested
+            ):
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
@@ -1779,7 +1786,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if memory_mode != "off":
+    if memory_mode != "off" and not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
