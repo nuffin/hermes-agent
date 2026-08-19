@@ -35,8 +35,11 @@ def _make_flush_agent(db: SessionDB, session_id: str):
         _persist_user_message_override=None,
         _persist_user_message_timestamp=None,
         _pending_cli_user_message=None,
+        _active_topic_id=None,
     )
     agent._ensure_db_session = lambda: None
+    agent._auto_create_first_topic = lambda _message: None
+    agent._process_topic_signals = lambda *args, **kwargs: None
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )
