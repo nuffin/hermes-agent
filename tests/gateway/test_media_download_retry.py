@@ -404,7 +404,13 @@ class TestSlackDownloadSlackFile:
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with (
+                patch("tools.url_safety.is_safe_url", return_value=True),
+                patch(
+                    "tools.url_safety.create_ssrf_safe_async_client",
+                    return_value=mock_client,
+                ),
+            ):
                 return await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
@@ -429,7 +435,13 @@ class TestSlackDownloadSlackFile:
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with (
+                patch("tools.url_safety.is_safe_url", return_value=True),
+                patch(
+                    "tools.url_safety.create_ssrf_safe_async_client",
+                    return_value=mock_client,
+                ),
+            ):
                 await adapter._download_slack_file(
                     "https://files.slack.com/img.jpg", ext=".jpg"
                 )
@@ -465,7 +477,13 @@ class TestSlackDownloadSlackFileBytes:
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
         async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
+            with (
+                patch("tools.url_safety.is_safe_url", return_value=True),
+                patch(
+                    "tools.url_safety.create_ssrf_safe_async_client",
+                    return_value=mock_client,
+                ),
+            ):
                 return await adapter._download_slack_file_bytes(
                     "https://files.slack.com/file.bin"
                 )

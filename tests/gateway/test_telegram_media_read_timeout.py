@@ -64,7 +64,8 @@ def _stub_download(monkeypatch, size: int):
 
 
 @pytest.mark.asyncio
-async def test_send_image_url_path_uses_media_read_timeout(adapter):
+async def test_send_image_url_path_uses_media_read_timeout(adapter, monkeypatch):
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
     calls = []
 
     async def _photo(**kwargs):
@@ -85,6 +86,7 @@ async def test_send_image_url_path_uses_media_read_timeout(adapter):
 async def test_send_image_upload_fallback_uses_media_read_timeout(adapter, monkeypatch):
     """The >5MB fallback is the slowest send in the file — it needs it most."""
     _stub_download(monkeypatch, 8 * 1024 * 1024)
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
     calls = []
 
     async def _photo(**kwargs):
