@@ -986,6 +986,31 @@ def validate_toolset(*args, **kwargs):
     return _validate_toolset(*args, **kwargs)
 
 
+def _get_invalid_toolsets(toolsets):
+    """Return explicitly selected toolsets unknown to the current runtime.
+
+    Plugin discovery may still be running when the CLI constructor validates
+    its resolved platform toolset list. Consult the same persisted/live plugin
+    key registry used by platform resolution so dynamically registered
+    toolsets are not reported as unknown during that startup window.
+    """
+    mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
+    plugin_toolset_names = set()
+    try:
+        from hermes_cli.plugins import get_plugin_toolset_keys_nowait
+
+        plugin_toolset_names = get_plugin_toolset_keys_nowait()
+    except Exception:
+        pass
+    return [
+        toolset
+        for toolset in toolsets
+        if not validate_toolset(toolset)
+        and toolset not in plugin_toolset_names
+        and toolset not in mcp_names
+    ]
+
+
 def _sync_process_session_id(session_id: str) -> None:
     """Keep process-local session-id consumers aligned after CLI switches."""
     from gateway.session_context import set_current_session_id
@@ -5549,11 +5574,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
 
         if toolsets and "all" not in toolsets and "*" not in toolsets:
-            # Validate each toolset — MCP server names are resolved via
-            # live registry aliases (registered during discover_mcp_tools),
-            # but discovery hasn't run yet at this point, so exclude them.
-            mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            # Validate static toolsets plus plugin toolset keys available from
+            # the live or persisted discovery registry. MCP server names are
+            # resolved through the separate configured-name allowlist.
+            invalid = _get_invalid_toolsets(toolsets)
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
