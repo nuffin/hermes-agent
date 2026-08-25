@@ -394,7 +394,7 @@ def _parse_skill_md(path: Path) -> dict[str, Any]:
                 tags = meta.get("metadata", {}).get("hermes", {}).get("tags", [])
                 if isinstance(tags, str):
                     tags = [t.strip() for t in tags.split(",") if t.strip()]
-                result["tags"] = list(tags) if isinstance(tags, list) else []
+                result["tags"] = [str(tag) for tag in tags] if isinstance(tags, list) else []
 
                 scenes = meta.get("metadata", {}).get("hermes", {}).get("scenes", [])
                 if isinstance(scenes, str):
