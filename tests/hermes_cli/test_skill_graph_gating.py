@@ -98,6 +98,24 @@ class TestSkillGraphGating:
         result = hook("skill_graph_search", turn_id="t1")
         assert result is None
 
+    def test_normalizes_non_string_yaml_tag_metadata(self, tmp_path):
+        """Unquoted YAML scalars must not break FTS tag indexing."""
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(
+            "---\n"
+            "name: scalar-metadata\n"
+            "metadata:\n"
+            "  hermes:\n"
+            "    tags: [hardware, 0402]\n"
+            "---\n"
+            "# Scalar metadata\n",
+            encoding="utf-8",
+        )
+
+        info = TestSkillGraphProfileIsolation._import_skill_graph()._parse_skill_md(skill_md)
+
+        assert info["tags"] == ["hardware", "258"]
+
     def test_turn_boundary_resets_flag(self):
         """New turn_id resets the searched flag."""
         mock_cfg = {"agent": {"skill_graph_mode": True}}
