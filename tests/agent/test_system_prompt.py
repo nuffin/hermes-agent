@@ -260,7 +260,7 @@ class TestTelegramRichMessagesHint:
                 "gateway": {"platforms": {"telegram": {"extra": {"rich_messages": False}}}}
             }
             stable = _stable_prompt(agent)
-        assert "Standard Markdown is automatically converted" in stable
+        assert "Standard Markdown auto-converts" in stable
         assert "lean into it" not in stable
         assert "task lists" not in stable
 
@@ -319,7 +319,7 @@ class TestTelegramRichMessagesHint:
         with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {}
             stable = _stable_prompt(agent)
-        assert "Standard Markdown is automatically converted" in stable
+        assert "Standard Markdown auto-converts" in stable
         assert "lean into it" not in stable
 
 
@@ -361,7 +361,7 @@ class TestTelegramRichMessagesHint:
                 "gateway": {"platforms": {"telegram": {"extra": "not-a-map"}}}
             }
             stable = _stable_prompt(agent)
-        assert "Standard Markdown is automatically converted" in stable
+        assert "Standard Markdown auto-converts" in stable
         assert "lean into it" not in stable
 
 
@@ -659,7 +659,6 @@ def test_build_skills_index_hook_suppresses_flat_index():
     agent = _make_agent(valid_tool_names=["skills_list", "skill_graph_search"])
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
         patch("run_agent.build_skills_system_prompt", return_value="SHOULD_NOT_APPEAR"),
@@ -675,7 +674,6 @@ def test_build_skills_index_hook_injects_identity():
     agent = _make_agent(valid_tool_names=["skill_graph_search"])
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
         patch("hermes_cli.lifecycle.invoke_hook", return_value=_mock_skill_graph_hook()),
@@ -690,7 +688,6 @@ def test_build_skills_index_no_hook_preserves_flat_index():
     agent = _make_agent(valid_tool_names=["skills_list"])
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
         patch("run_agent.build_skills_system_prompt", return_value="FLAT_INDEX_SENTINEL"),
