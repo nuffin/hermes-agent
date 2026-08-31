@@ -19158,6 +19158,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "approvals":
             return await self._handle_approvals_command(event)
 
+        if canonical == "project-scope":
+            return await self._handle_project_scope_command(event)
+
         if canonical == "model":
             return await self._handle_model_command(event)
 
