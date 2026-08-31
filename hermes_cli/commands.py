@@ -1479,9 +1479,13 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #   - platform: informational platform/environment lookup; reached via
 #     /hermes platform on Slack. Demoted when /save became gateway-available
 #     (session export is an interactive surface; platform is a rare
-#     informational lookup) — without this entry /save tips the registry
-#     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#     informational lookup) — without this entry /save tips the registry past
+#     the 50-cap and silently clamps /platform, breaking parity.
+#   - project-scope: security-sensitive session capability control; reached
+#     via /hermes project-scope on Slack. It remains native on eligible
+#     surfaces, but consuming a 51st Slack slot would silently drop another
+#     command and violate Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "project-scope"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

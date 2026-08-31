@@ -15,6 +15,7 @@ import pytest
 
 from tools import approval as approval_module
 import tools.terminal_tool as terminal_tool
+from hermes_cli import project_scope_command
 
 
 _ALLOWED_OPERATIONS = {
@@ -356,6 +357,32 @@ class TestHighSecurityRevalidation:
         payload = api.build_project_scope_audit_payload(decision)
         assert {"policy_digest", "session_id", "timestamp", "decision_reason", "matched_root_label"} <= set(payload)
         assert "raw_command" not in payload
+
+    def test_confirm_binds_the_snapshot_reviewed_at_activate_time(self, scope_config):
+        """Replacing a same-ID template between display and confirm cannot broaden it."""
+        api = _api()
+        repo, temporary, state = scope_config
+        session = "confirm-snapshot"
+        project_scope_command._pending.pop(session, None)
+        api.revoke_project_scope(session)
+
+        rendered = project_scope_command.run_project_scope_command(
+            "activate release-scope", session_key=session,
+        )
+        token = rendered.rsplit(" ", 1)[1]
+        state["project_scope_templates"] = [_template(
+            repo, temporary, docker_registry_prefixes=["registry.example.test/"],
+        )]
+
+        confirmed = project_scope_command.run_project_scope_command(
+            f"confirm {token}", session_key=session,
+        )
+
+        assert "activated" in confirmed
+        decision = api.evaluate_project_scope(_context(
+            api, "docker push registry.example.test/other/image:latest", session, repo,
+        ))
+        assert _decision_status(decision) == "denied"
 
     def test_terminal_revalidates_after_guard_before_execution(self, monkeypatch):
         api = _api()

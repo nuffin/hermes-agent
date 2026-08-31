@@ -347,6 +347,23 @@ def _is_gateway_approval_context() -> bool:
     return bool(_get_session_platform())
 
 
+def is_trusted_interactive_approval_context() -> bool:
+    """Whether this turn has a human-capable, non-delegated approval surface.
+
+    This is the shared authority predicate for control paths that create or
+    revoke session approval capabilities. It intentionally derives from the
+    same session/approval context as terminal approvals and fails closed when
+    no gateway context is bound.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+        if is_delegated_child_context():
+            return False
+    except Exception:
+        return False
+    return _is_gateway_approval_context()
+
+
 def _resolve_cli_approval_callback(approval_callback=None):
     """Return an interactive CLI approval callback when one is available.
 
@@ -4125,27 +4142,28 @@ def check_dangerous_command(command: str, env_type: str,
     Returns:
         {"approved": True/False, "message": str or None, ...}
     """
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
-
-    # Hardline floor: commands with no recovery path (rm -rf /, mkfs, dd
-    # to raw device, shutdown/reboot, fork bomb, kill -1) are blocked
-    # unconditionally, BEFORE the yolo bypass.  Opting into yolo is
-    # trusting the agent with your files and services, not trusting it
-    # to wipe the disk or power the box off.
+    # Hardline floors apply to every terminal backend, including isolated
+    # containers. Container isolation only suppresses ordinary prompts below.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc, command)
 
-    # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
-    # user saying "never, even under yolo".
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning("Sudo stdin guard block: %s (command: %s)",
+                       sudo_guess_desc, command[:200])
+        return _sudo_stdin_block_result(sudo_guess_desc)
+
+    # User-defined deny rules are also unconditional floors.
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
@@ -4764,15 +4782,9 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
-
-    # Hardline floor: unconditional block for catastrophic commands
-    # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
-    # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
-    # no session-level setting can bypass it.
+    # Hardline floors always precede the isolated-container ordinary-prompt
+    # shortcut. A sandbox is never authority to override hardline, sudo, or a
+    # user-authored deny rule.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
@@ -4797,6 +4809,11 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # Isolated containers may skip only ordinary approval and scoped policy.
+    # Docker loses this shortcut when host paths are bind-mounted.
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
 
     # A project scope can only be consumed through the immutable context made
     # at the terminal boundary.  It is deliberately after unconditional floors
