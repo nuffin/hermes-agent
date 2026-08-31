@@ -4824,20 +4824,17 @@ def check_all_command_guards(command: str, env_type: str,
             if scope_decision.status == "approved":
                 _fire_approval_hook(
                     "post_approval_response",
-                    project_scope={
-                        "event": "project_scope_auto_approved",
-                        "template_id": scope_decision.template_id,
-                        "activation_id": scope_decision.activation_id,
-                        "backend_type": terminal_context.backend_type,
-                        "operation": scope_decision.operation,
-                        "decision": "approved",
-                    },
+                    project_scope=build_project_scope_audit_payload(scope_decision),
                 )
                 return {
                     "approved": True,
                     "message": None,
                     "project_scope_approved": True,
                     "project_scope_operation": scope_decision.operation,
+                    # Internal-only handoff for immediate execution-boundary
+                    # revalidation; this is never rendered to a user/audit log.
+                    "project_scope_context": terminal_context,
+                    "project_scope_decision": scope_decision,
                 }
             if scope_decision.status == "denied":
                 logger.info("Active project scope did not grant command: %s", scope_decision.reason)
