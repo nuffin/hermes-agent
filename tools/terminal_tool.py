@@ -383,12 +383,14 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 def _check_all_guards(command: str, env_type: str,
                       has_host_access: bool = False,
-                      terminal_context=None) -> dict:
+                      terminal_context=None,
+                      bypass_ordinary_approval: bool = False) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
                                   has_host_access=has_host_access,
-                                  terminal_context=terminal_context)
+                                  terminal_context=terminal_context,
+                                  bypass_ordinary_approval=bypass_ordinary_approval)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -3238,8 +3240,8 @@ def terminal_tool(
                     "status": "blocked",
                 }, ensure_ascii=False)
 
-        # Pre-exec security checks (tirith + dangerous command detection)
-        # Skip check if force=True (user has confirmed they want to run it)
+        # Pre-exec security checks. ``force`` only bypasses the ordinary
+        # approval prompt; unconditional hardline/user-deny floors still run.
         approval_note = None
         # True when the user explicitly approved this run (or pre-confirmed via
         # force).  Drives the clean-interrupt-slate clear before env.execute so
@@ -3248,22 +3250,17 @@ def terminal_tool(
         _approved_run = bool(force)
         scope_context = None
         scope_decision = None
-        if not force:
-            from tools.project_scope_approval import TerminalApprovalContext
-            terminal_context = TerminalApprovalContext(
-                raw_command=command,
-                backend_type=env_type,
-                session_key=session_key,
-                supplied_workdir=workdir,
-                effective_cwd=effective_cwd,
-                background=background,
-                has_host_access=_docker_has_host_access(config),
-            )
-            approval = _check_all_guards(
-                command, env_type,
-                has_host_access=_docker_has_host_access(config),
-                terminal_context=terminal_context,
-            )
+        from tools.project_scope_approval import TerminalApprovalContext
+        terminal_context = TerminalApprovalContext(
+            raw_command=command, backend_type=env_type, session_key=session_key,
+            supplied_workdir=workdir, effective_cwd=effective_cwd,
+            background=background, has_host_access=_docker_has_host_access(config),
+        )
+        approval = _check_all_guards(
+            command, env_type, has_host_access=_docker_has_host_access(config),
+            terminal_context=terminal_context, bypass_ordinary_approval=bool(force),
+        )
+        if approval is not None:
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
@@ -3302,6 +3299,15 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
+        execution_command = command
+        if scope_decision is not None:
+            from tools.project_scope_approval import scoped_execution_command
+            execution_command = scoped_execution_command(command, scope_decision)
+            if execution_command is None:
+                return json.dumps({"output": "", "exit_code": -1,
+                                   "error": "Command denied: scoped Git execution could not suppress hooks",
+                                   "status": "blocked"}, ensure_ascii=False)
+
         def _scope_execution_still_valid() -> str | None:
             """Recheck a scoped approval at the last user-space boundary."""
             if scope_context is None or scope_decision is None:
@@ -3339,7 +3345,7 @@ def terminal_tool(
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
-                        command=command,
+                        command=execution_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         owner_task_id=task_id or effective_task_id,
@@ -3350,7 +3356,7 @@ def terminal_tool(
                 else:
                     proc_session = process_registry.spawn_via_env(
                         env=env,
-                        command=command,
+                        command=execution_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         owner_task_id=task_id or effective_task_id,
@@ -3621,7 +3627,7 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = env.execute(execution_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

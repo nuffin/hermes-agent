@@ -13019,6 +13019,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._toggle_yolo()
         elif canonical == "approvals":
             self._handle_approvals_command(cmd_original)
+        elif canonical == "project-scope":
+            self._handle_project_scope_command(cmd_original)
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
