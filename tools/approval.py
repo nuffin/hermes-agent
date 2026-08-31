@@ -1219,6 +1219,10 @@ def check_all_command_guards(command: str, env_type: str,
                     "message": None,
                     "project_scope_approved": True,
                     "project_scope_operation": scope_decision.operation,
+                    # Internal-only handoff for immediate execution-boundary
+                    # revalidation; this is never rendered to a user/audit log.
+                    "project_scope_context": terminal_context,
+                    "project_scope_decision": scope_decision,
                 }
             if scope_decision.status == "denied":
                 logger.info("Active project scope did not grant command: %s", scope_decision.reason)

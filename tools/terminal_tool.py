@@ -908,6 +908,8 @@ class _ApprovalVerdict:
     """
     note: Optional[str] = None
     approved_run: bool = False
+    project_scope_context: Any = None
+    project_scope_decision: Any = None
 
 
 def _run_approval_guards(
@@ -946,9 +948,16 @@ def _run_approval_guards(
             note=f"Command required approval ({desc}) and was approved by the user.",
             approved_run=True,
         )
+    scope_context = approval.get("project_scope_context")
+    scope_decision = approval.get("project_scope_decision")
     if approval.get("smart_approved"):
-        return _ApprovalVerdict(note=f"Command was flagged ({desc}) and auto-approved by smart approval.")
-    return _ApprovalVerdict()
+        return _ApprovalVerdict(
+            note=f"Command was flagged ({desc}) and auto-approved by smart approval.",
+            project_scope_context=scope_context, project_scope_decision=scope_decision,
+        )
+    return _ApprovalVerdict(
+        project_scope_context=scope_context, project_scope_decision=scope_decision,
+    )
 
 
 @dataclass
@@ -1140,6 +1149,7 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], command_cwd: str, approval_note: Optional[str], clear_interrupt: bool,
+    project_scope_context: Any = None, project_scope_decision: Any = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1156,6 +1166,14 @@ def _run_foreground(
 
     for retry_count in range(max_retries + 1):
         try:
+            if project_scope_context is not None and project_scope_decision is not None:
+                from tools.project_scope_approval import revalidate_project_scope
+                refreshed = revalidate_project_scope(project_scope_context, project_scope_decision)
+                if refreshed.status != "approved":
+                    return _error_json(
+                        f"Command denied: {refreshed.reason or 'project scope is no longer valid'}",
+                        status="blocked",
+                    )
             # The approval context and execution share this resolved value; do
             # not re-resolve it after authorization.
             # bounded_capture: model-facing output keeps a head/tail window
@@ -1358,6 +1376,16 @@ def terminal_tool(
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
+        if verdict.project_scope_context is not None and verdict.project_scope_decision is not None:
+            from tools.project_scope_approval import revalidate_project_scope
+            refreshed = revalidate_project_scope(
+                verdict.project_scope_context, verdict.project_scope_decision,
+            )
+            if refreshed.status != "approved":
+                raise _Rejected(_error_json(
+                    f"Command denied: {refreshed.reason or 'project scope is no longer valid'}",
+                    status="blocked",
+                ))
         if background:
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
@@ -1377,6 +1405,8 @@ def terminal_tool(
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, command_cwd=effective_cwd, approval_note=verdict.note,
             clear_interrupt=verdict.approved_run,
+            project_scope_context=verdict.project_scope_context,
+            project_scope_decision=verdict.project_scope_decision,
         )
     except _Rejected as r:
         return r.result_json
