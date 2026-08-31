@@ -1801,15 +1801,23 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
 
-    # Backward compatibility for deprecated skip_memory parameter
+    # Backward compatibility for deprecated skip_memory parameter.  The legacy
+    # contract normally maps to off, but an explicitly requested built-in
+    # memory toolset must remain tool-only so it is not wired to no store
+    # (#65429).  A denylisted memory toolset is not a request.
     if skip_memory:
         import warnings
         warnings.warn(
-            "skip_memory is deprecated, use memory_mode='off' instead",
+            "skip_memory is deprecated; use memory_mode='on_demand' for tool-only memory or 'off' to disable it",
             DeprecationWarning,
             stacklevel=2,
         )
-        memory_mode = "off"
+        if memory_mode == "full":
+            _legacy_memory_toolset_requested = (
+                "memory" in (agent.enabled_toolsets or [])
+                and "memory" not in (agent.disabled_toolsets or [])
+            )
+            memory_mode = "on_demand" if _legacy_memory_toolset_requested else "off"
 
     # Load config once for memory, skills, and compression sections
     try:
