@@ -4194,8 +4194,15 @@ class GatewaySlashCommandsMixin:
     async def _handle_project_scope_command(self, event: MessageEvent) -> str:
         """Gateway adapter for a session-bound, correlated confirmation flow."""
         from hermes_cli.project_scope_command import run_project_scope_command
+        from tools.approval import is_trusted_interactive_approval_context
+
+        # Project-scope activation changes a session capability. Reuse the
+        # approval subsystem's context-bound authority predicate rather than
+        # maintaining a separate platform allowlist here.
+        delegated = not is_trusted_interactive_approval_context()
         return run_project_scope_command(
             event.get_command_args(), session_key=self._session_key_for_source(event.source),
+            delegated=delegated,
         )
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:

@@ -278,6 +278,11 @@ class TestSlackNativeSlashes:
             f"commands on Telegram but missing from Slack native slashes: {sorted(missing)}"
         )
 
+    def test_project_scope_is_intentionally_routed_via_hermes_on_slack(self):
+        """It stays native on eligible surfaces without displacing Slack's cap."""
+        assert "project-scope" in _SLACK_VIA_HERMES_ONLY
+        assert "project-scope" not in {name for name, _desc, _hint in slack_native_slashes()}
+
 
 class TestSlackAppManifest:
     """Generated Slack app manifest (used by `hermes slack manifest`)."""
