@@ -382,11 +382,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      terminal_context=None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  terminal_context=terminal_context)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -3198,6 +3200,16 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        # Resolve the command cwd exactly once before authorization.  The same
+        # value is passed to scoped evaluation and every execution path below;
+        # command text (including a `cd` fragment) cannot replace it.
+        effective_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+            env_type=env_type,
+        )
+
         # Windows-only: NTFS locks loaded module files, so rewriting the local
         # checkout backing this interpreter can corrupt the running process.
         # POSIX keeps old inodes alive for open handles, so the guard is off
@@ -3208,11 +3220,7 @@ def terminal_tool(
                 guard_active,
             )
 
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-            )
+            guard_cwd = effective_cwd
             _self_repo_hit, _self_repo_msg = (
                 detect_self_repo_git_mutation(command, guard_cwd)
                 if guard_active()
@@ -3239,9 +3247,20 @@ def terminal_tool(
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
         if not force:
+            from tools.project_scope_approval import TerminalApprovalContext
+            terminal_context = TerminalApprovalContext(
+                raw_command=command,
+                backend_type=env_type,
+                session_key=session_key,
+                supplied_workdir=workdir,
+                effective_cwd=effective_cwd,
+                background=background,
+                has_host_access=_docker_has_host_access(config),
+            )
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                terminal_context=terminal_context,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -3298,12 +3317,6 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-                env_type=env_type,
-            )
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -3573,12 +3586,7 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                        env_type=env_type,
-                    )
+                    command_cwd = effective_cwd
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,

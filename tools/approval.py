@@ -3016,6 +3016,13 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        # Scoped project activation is intentionally separate from session and
+        # permanent command allowlists, but shares this exact teardown boundary.
+        try:
+            from tools.project_scope_approval import clear_project_scope_session
+            clear_project_scope_session(session_key)
+        except Exception:
+            pass
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -3040,6 +3047,20 @@ def clear_session(session_key: str) -> None:
         shutdown_remote_kernels_for_owner(session_key)
     except Exception:
         pass
+
+
+# Public project-scope API. Keep the capability implementation separate from
+# the legacy dangerous-command engine while exposing the confirmed approval
+# boundary from this module, where callers already obtain approval APIs.
+from tools.project_scope_approval import (  # noqa: E402
+    TerminalApprovalContext,
+    activate_project_scope,
+    build_project_scope_audit_payload,
+    evaluate_project_scope,
+    get_active_project_scope,
+    load_project_scope_templates,
+    revoke_project_scope,
+)
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -4745,7 +4766,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             terminal_context=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -4790,6 +4812,39 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # A project scope can only be consumed through the immutable context made
+    # at the terminal boundary.  It is deliberately after unconditional floors
+    # and before ordinary prompt/bypass flow; absent/invalid/ineligible scopes
+    # fall through without changing existing approval semantics.
+    if terminal_context is not None:
+        try:
+            from tools.project_scope_approval import evaluate_project_scope
+            scope_decision = evaluate_project_scope(terminal_context)
+            if scope_decision.status == "approved":
+                _fire_approval_hook(
+                    "post_approval_response",
+                    project_scope={
+                        "event": "project_scope_auto_approved",
+                        "template_id": scope_decision.template_id,
+                        "activation_id": scope_decision.activation_id,
+                        "backend_type": terminal_context.backend_type,
+                        "operation": scope_decision.operation,
+                        "decision": "approved",
+                    },
+                )
+                return {
+                    "approved": True,
+                    "message": None,
+                    "project_scope_approved": True,
+                    "project_scope_operation": scope_decision.operation,
+                }
+            if scope_decision.status == "denied":
+                logger.info("Active project scope did not grant command: %s", scope_decision.reason)
+        except Exception as exc:
+            # Config/evaluator failures must leave the established approval path
+            # intact rather than accidentally broadening it.
+            logger.warning("Project scope evaluation failed closed: %s", exc)
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
