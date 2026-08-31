@@ -146,11 +146,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      terminal_context=None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  terminal_context=terminal_context)
 
 
 from tools.environments.base import EnvironmentConnectionError
@@ -908,13 +910,18 @@ class _ApprovalVerdict:
     approved_run: bool = False
 
 
-def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+def _run_approval_guards(
+    command: str, env_type: str, config: Dict[str, Any], *, force: bool, terminal_context=None,
+) -> _ApprovalVerdict:
     """Run tirith + dangerous-command guards; ``force`` skips them entirely.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
     if force:
         return _ApprovalVerdict(approved_run=True)
-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+    approval = _check_all_guards(
+        command, env_type, has_host_access=_docker_has_host_access(config),
+        terminal_context=terminal_context,
+    )
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
@@ -1132,7 +1139,7 @@ def _yield_kwargs(command: str, **ctx) -> dict:
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
-    workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    workdir: Optional[str], command_cwd: str, approval_note: Optional[str], clear_interrupt: bool,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1149,9 +1156,8 @@ def _run_foreground(
 
     for retry_count in range(max_retries + 1):
         try:
-            command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
-            )
+            # The approval context and execution share this resolved value; do
+            # not re-resolve it after authorization.
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
@@ -1331,9 +1337,21 @@ def terminal_tool(
                 "(process-identity probe wedged); the command was not run. Retry the call.",
                 status="error",
             ))
+        # Resolve cwd once before authorization. Command text cannot replace it.
+        effective_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+        )
         # Pre-exec security checks (tirith + dangerous command detection);
         # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        from tools.project_scope_approval import TerminalApprovalContext
+        terminal_context = TerminalApprovalContext(
+            raw_command=command, backend_type=env_type, session_key=session_key,
+            supplied_workdir=workdir, effective_cwd=effective_cwd, background=background,
+            has_host_access=_docker_has_host_access(plan.config),
+        )
+        verdict = _run_approval_guards(
+            command, env_type, plan.config, force=force, terminal_context=terminal_context,
+        )
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
@@ -1343,7 +1361,7 @@ def terminal_tool(
         if background:
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
-                task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
+                task_id=task_id, session_key=session_key, workdir=workdir, cwd=effective_cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
@@ -1357,7 +1375,8 @@ def terminal_tool(
         return _run_foreground(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
-            workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            workdir=workdir, command_cwd=effective_cwd, approval_note=verdict.note,
+            clear_interrupt=verdict.approved_run,
         )
     except _Rejected as r:
         return r.result_json
