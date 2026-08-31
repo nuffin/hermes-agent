@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools import approval as approval_module
+import tools.project_scope_approval as project_scope_approval
 import tools.terminal_tool as terminal_tool
 from hermes_cli import project_scope_command
 
@@ -59,6 +60,16 @@ def _template(repo: Path, temporary: Path, **overrides):
     }
     value.update(overrides)
     return value
+
+
+@pytest.fixture(autouse=True)
+def isolate_project_scope_registry():
+    """Keep process-global session activations from crossing test boundaries."""
+    with project_scope_approval._lock:
+        project_scope_approval._active.clear()
+    yield
+    with project_scope_approval._lock:
+        project_scope_approval._active.clear()
 
 
 @pytest.fixture
@@ -143,6 +154,8 @@ class TestProjectScopeTemplateValidation:
         repo, _, _ = scope_config
         context = _context(api, "git -C . worktree prune", "session-a", repo)
 
+        # Regression: the preceding lifecycle test uses this same session key.
+        assert api.get_active_project_scope("session-a") is None
         assert _decision_status(api.evaluate_project_scope(context)) == "not_applicable"
         api.activate_project_scope("session-a", "release-scope")
         assert _decision_status(api.evaluate_project_scope(context)) == "approved"
