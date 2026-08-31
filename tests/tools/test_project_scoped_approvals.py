@@ -299,8 +299,11 @@ class TestAuditAndDelegation:
 class TestHighSecurityRevalidation:
     def _write_remote(self, repo: Path, *, url: str, pushurls=()):
         git = repo / ".git"
+        if not git.exists():
+            import subprocess
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
         git.mkdir(exist_ok=True)
-        lines = ['[remote "origin"]', f"\turl = {url}"]
+        lines = ['[core]', '\trepositoryformatversion = 0', '\tbare = false', '[remote "origin"]', f"\turl = {url}"]
         lines.extend(f"\tpushurl = {pushurl}" for pushurl in pushurls)
         (git / "config").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

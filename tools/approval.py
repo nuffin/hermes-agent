@@ -4767,7 +4767,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False,
-                             terminal_context=None) -> dict:
+                             terminal_context=None,
+                             bypass_ordinary_approval: bool = False) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -4842,6 +4843,12 @@ def check_all_command_guards(command: str, env_type: str,
             # Config/evaluator failures must leave the established approval path
             # intact rather than accidentally broadening it.
             logger.warning("Project scope evaluation failed closed: %s", exc)
+
+    # ``terminal_tool(force=True)`` is an explicit pre-confirmation only for
+    # the ordinary prompt.  It never skips hardline, sudo-stdin, or user-deny
+    # floors above (and it never creates a project scope capability).
+    if bypass_ordinary_approval:
+        return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
