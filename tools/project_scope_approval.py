@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import configparser
 import fnmatch
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -59,6 +60,8 @@ class ActivatedProjectScope:
     session_key: str
     activation_id: str
     issued_at: float
+    template: ProjectScopeTemplate
+    policy_digest: str
 
 
 @dataclass(frozen=True)
@@ -68,10 +71,28 @@ class ScopeDecision:
     reason: str | None = None
     template_id: str | None = None
     activation_id: str | None = None
+    policy_digest: str | None = None
+    session_key: str | None = None
+    timestamp: float | None = None
+    matched_root_label: str | None = None
 
 
 _lock = threading.RLock()
 _active: dict[str, ActivatedProjectScope] = {}
+
+
+def _policy_digest(template: ProjectScopeTemplate) -> str:
+    """Hash a canonical, non-secret representation of an activated policy."""
+    payload = {
+        "id": template.template_id,
+        "repository_roots": [str(path) for path in template.repository_roots],
+        "temporary_roots": [str(path) for path in template.temporary_roots],
+        "git_remotes": [[name, list(prefixes)] for name, prefixes in template.git_remotes],
+        "git_ref_rules": list(template.git_ref_rules),
+        "docker_registry_prefixes": list(template.docker_registry_prefixes),
+        "allowed_operations": sorted(template.allowed_operations),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _observe(event: str, activation: ActivatedProjectScope, *, operation: str | None = None) -> None:
@@ -82,8 +103,13 @@ def _observe(event: str, activation: ActivatedProjectScope, *, operation: str | 
             "event": event,
             "template_id": activation.template_id,
             "activation_id": activation.activation_id,
+            "session_id": activation.session_key,
+            "policy_digest": activation.policy_digest,
+            "timestamp": time.time(),
             "operation": operation,
             "decision": "approved" if event != "project_scope_revoked" else "revoked",
+            "decision_reason": "explicit activation" if event == "project_scope_activated" else "explicit/session revocation",
+            "matched_root_label": None,
         })
     except Exception:
         pass
@@ -211,9 +237,15 @@ def activate_project_scope(session_key: str, template_id: str, *, delegated: boo
         raise PermissionError("delegated callers cannot activate a project scope")
     if not isinstance(session_key, str) or not session_key:
         return None
-    if template_id not in load_project_scope_templates():
+    template = load_project_scope_templates().get(template_id)
+    if template is None:
         return None
-    activation = ActivatedProjectScope(template_id, session_key, uuid.uuid4().hex, time.time())
+    # Retain this validated value, not merely its ID: later configuration edits
+    # cannot broaden an already user-confirmed session capability.
+    activation = ActivatedProjectScope(
+        template_id, session_key, uuid.uuid4().hex, time.time(), template,
+        _policy_digest(template),
+    )
     with _lock:
         _active[session_key] = activation
     _observe("project_scope_activated", activation)
@@ -296,7 +328,14 @@ def _ref_allowed(ref: str, rules: tuple[str, ...]) -> bool:
     return bool(_FULL_REF_RE.fullmatch(ref)) and any(fnmatch.fnmatchcase(ref, rule) for rule in rules)
 
 
-def _remote_url(repo: Path, remote_name: str) -> str | None:
+def _remote_destinations(repo: Path, remote_name: str) -> tuple[str, ...] | None:
+    """Read only local Git metadata and return Git's effective push targets.
+
+    Git permits repeated ``pushurl`` entries.  ``ConfigParser`` collapses those
+    duplicate keys, so scan the selected local config section directly.  A
+    configured pushurl replaces ``url`` for pushing; every effective target
+    must be inside the policy prefix, not just the fetch URL.
+    """
     git = repo / ".git"
     try:
         if git.is_file():
@@ -304,12 +343,27 @@ def _remote_url(repo: Path, remote_name: str) -> str | None:
             if not marker.startswith("gitdir: "):
                 return None
             git = (repo / marker[8:].strip()).resolve(strict=True)
-        parser = configparser.ConfigParser(interpolation=None)
-        parser.read(git / "config", encoding="utf-8")
-        section = f'remote "{remote_name}"'
-        return parser.get(section, "url", fallback=None)
-    except (OSError, configparser.Error):
+        lines = (git / "config").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
         return None
+    section = f'[remote "{remote_name}"]'
+    in_section = False
+    urls: list[str] = []
+    pushurls: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == section
+            continue
+        if not in_section or "=" not in stripped:
+            continue
+        key, value = (part.strip() for part in stripped.split("=", 1))
+        if key == "url" and value:
+            urls.append(value)
+        elif key == "pushurl" and value:
+            pushurls.append(value)
+    destinations = pushurls or urls
+    return tuple(destinations) if destinations else None
 
 
 def _repo_from_c(argv: list[str], template: ProjectScopeTemplate, cwd: Path) -> tuple[Path, list[str]] | None:
@@ -346,8 +400,11 @@ def _evaluate_git(argv: list[str], template: ProjectScopeTemplate, cwd: Path) ->
             return ScopeDecision("denied", reason="invalid remote/refspec")
         source, destination = refspec.split(":", 1)
         configured = dict(template.git_remotes).get(remote)
-        url = _remote_url(repo, remote)
-        if configured and url and any(url.startswith(prefix) for prefix in configured) and _ref_allowed(source, template.git_ref_rules) and _ref_allowed(destination, template.git_ref_rules):
+        destinations = _remote_destinations(repo, remote)
+        if (configured and destinations
+                and all(any(url.startswith(prefix) for prefix in configured) for url in destinations)
+                and _ref_allowed(source, template.git_ref_rules)
+                and _ref_allowed(destination, template.git_ref_rules)):
             return ScopeDecision("approved", "git.push.configured_remote")
         return ScopeDecision("denied", reason="remote URL or refspec outside scope")
     if args[:1] == ["push"]:
@@ -360,8 +417,32 @@ def _image_allowed(image: str, prefixes: tuple[str, ...]) -> bool:
     return all(ch not in image for ch in " @") and any(image.startswith(prefix) for prefix in prefixes)
 
 
-def _evaluate_docker(argv: list[str], template: ProjectScopeTemplate, cwd: Path) -> ScopeDecision:
+def _persisted_docker_context_is_local() -> bool:
+    """Fail closed from Docker's local config only; never contact a daemon."""
     if any(os.environ.get(key) for key in ("DOCKER_HOST", "DOCKER_CONTEXT")):
+        return False
+    config_dir = Path(os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker")))
+    try:
+        config = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    current = config.get("currentContext", "default")
+    if current in (None, "", "default"):
+        return True
+    if not isinstance(current, str):
+        return False
+    try:
+        meta = json.loads((config_dir / "contexts" / "meta" / current / "meta.json").read_text(encoding="utf-8"))
+        host = meta["Endpoints"]["docker"]["Host"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return isinstance(host, str) and (host.startswith("unix://") or host.startswith("npipe://"))
+
+
+def _evaluate_docker(argv: list[str], template: ProjectScopeTemplate, cwd: Path) -> ScopeDecision:
+    if not _persisted_docker_context_is_local():
         return ScopeDecision("denied", reason="remote Docker daemon/context is not eligible")
     args = argv[1:]
     if args[:1] == ["push"] and len(args) == 2 and _image_allowed(args[1], template.docker_registry_prefixes):
@@ -392,24 +473,60 @@ def _evaluate_docker(argv: list[str], template: ProjectScopeTemplate, cwd: Path)
     return ScopeDecision("approved", "docker.build")
 
 
+def _decorate_decision(decision: ScopeDecision, activation: ActivatedProjectScope) -> ScopeDecision:
+    labels = {
+        "git.worktree.create": "temporary_root",
+        "git.worktree.remove": "temporary_root",
+        "git.worktree.prune": "repository_root",
+        "git.commit.signed": "repository_root",
+        "git.push.configured_remote": "repository_root",
+        "docker.build": "repository_root",
+        "docker.push.configured_registry": "docker_registry_prefix",
+    }
+    return ScopeDecision(
+        decision.status, decision.operation, decision.reason, activation.template_id,
+        activation.activation_id, activation.policy_digest, activation.session_key,
+        time.time(), labels.get(decision.operation or ""),
+    )
+
+
 def evaluate_project_scope(context: TerminalApprovalContext) -> ScopeDecision:
-    """Evaluate an active template only; no active template is always inert."""
+    """Evaluate the immutable activation snapshot; no active scope is inert."""
     activation = get_active_project_scope(context.session_key)
     if activation is None:
         return ScopeDecision("not_applicable")
-    template = load_project_scope_templates().get(activation.template_id)
-    if template is None:
-        return ScopeDecision("denied", reason="active template is no longer valid", template_id=activation.template_id, activation_id=activation.activation_id)
     argv = _parse_argv(context.raw_command)
     if argv is None:
-        return ScopeDecision("not_applicable", template_id=template.template_id, activation_id=activation.activation_id)
+        return _decorate_decision(ScopeDecision("not_applicable"), activation)
     cwd = _canonical_path(context.effective_cwd, Path("/"))
     if cwd is None:
-        return ScopeDecision("denied", reason="effective cwd cannot be resolved", template_id=template.template_id, activation_id=activation.activation_id)
-    decision = _evaluate_git(argv, template, cwd) if argv[0] == "git" else _evaluate_docker(argv, template, cwd)
-    if decision.status == "approved" and decision.operation not in template.allowed_operations:
-        decision = ScopeDecision("denied", reason="operation not declared by template")
-    return ScopeDecision(decision.status, decision.operation, decision.reason, template.template_id, activation.activation_id)
+        return _decorate_decision(ScopeDecision("denied", reason="effective cwd cannot be resolved"), activation)
+    decision = _evaluate_git(argv, activation.template, cwd) if argv[0] == "git" else _evaluate_docker(argv, activation.template, cwd)
+    if decision.status == "approved" and decision.operation not in activation.template.allowed_operations:
+        decision = ScopeDecision("denied", reason="operation not declared by activation snapshot")
+    return _decorate_decision(decision, activation)
+
+
+def revalidate_project_scope(context: TerminalApprovalContext, decision: ScopeDecision) -> ScopeDecision:
+    """Repeat local path/config checks at the execution boundary.
+
+    This closes the guard-to-exec stale-decision window for mutable paths and
+    Git metadata.  It cannot make independent user-space file reads and exec
+    atomic; an attacker who races both checks remains a documented residual
+    risk and requires OS-level descriptor/transaction support to eliminate.
+    """
+    current = evaluate_project_scope(context)
+    if (current.status != "approved" or decision.status != "approved"
+            or current.activation_id != decision.activation_id
+            or current.policy_digest != decision.policy_digest
+            or current.operation != decision.operation):
+        return ScopeDecision(
+            "denied", reason="project scope changed before execution",
+            template_id=decision.template_id, activation_id=decision.activation_id,
+            policy_digest=decision.policy_digest, session_key=context.session_key,
+            timestamp=time.time(), matched_root_label=decision.matched_root_label,
+        )
+    return current
 
 
 def build_project_scope_audit_payload(decision: ScopeDecision) -> dict[str, object]:
@@ -418,6 +535,11 @@ def build_project_scope_audit_payload(decision: ScopeDecision) -> dict[str, obje
         "event": "project_scope_auto_approved" if decision.status == "approved" else "project_scope_denied",
         "template_id": decision.template_id,
         "activation_id": decision.activation_id,
+        "session_id": decision.session_key,
+        "policy_digest": decision.policy_digest,
+        "timestamp": decision.timestamp,
         "operation": decision.operation,
         "decision": decision.status,
+        "decision_reason": decision.reason or ("matched immutable policy" if decision.status == "approved" else "scope not granted"),
+        "matched_root_label": decision.matched_root_label,
     }

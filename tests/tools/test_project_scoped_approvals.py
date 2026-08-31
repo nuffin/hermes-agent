@@ -294,3 +294,86 @@ class TestAuditAndDelegation:
         assert _decision_status(api.evaluate_project_scope(_context(api, command, "child", repo))) == "not_applicable"
         with pytest.raises((PermissionError, ValueError, RuntimeError)):
             api.activate_project_scope("child", "release-scope", delegated=True)
+
+
+class TestHighSecurityRevalidation:
+    def _write_remote(self, repo: Path, *, url: str, pushurls=()):
+        git = repo / ".git"
+        git.mkdir(exist_ok=True)
+        lines = ['[remote "origin"]', f"\turl = {url}"]
+        lines.extend(f"\tpushurl = {pushurl}" for pushurl in pushurls)
+        (git / "config").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_git_push_uses_all_effective_pushurls_and_url_fallback(self, scope_config):
+        api = _api()
+        repo, _, _ = scope_config
+        api.activate_project_scope("session-a", "release-scope")
+        command = "git -C . push origin refs/heads/release/x:refs/heads/release/x"
+
+        self._write_remote(repo, url="https://git.example.test/team/repo")
+        assert _decision_status(api.evaluate_project_scope(_context(api, command, "session-a", repo))) == "approved"
+        self._write_remote(repo, url="https://evil.example/fetch", pushurls=("https://git.example.test/team/one", "https://git.example.test/team/two"))
+        assert _decision_status(api.evaluate_project_scope(_context(api, command, "session-a", repo))) == "approved"
+        self._write_remote(repo, url="https://git.example.test/team/repo", pushurls=("https://git.example.test/team/one", "https://evil.example/push"))
+        assert _decision_status(api.evaluate_project_scope(_context(api, command, "session-a", repo))) == "denied"
+
+    def test_persisted_docker_context_is_checked_without_daemon_contact(self, scope_config, monkeypatch, tmp_path):
+        api = _api()
+        repo, _, _ = scope_config
+        docker_config = tmp_path / "docker"
+        docker_config.mkdir()
+        monkeypatch.setenv("DOCKER_CONFIG", str(docker_config))
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+        monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+        api.activate_project_scope("session-a", "release-scope")
+        context = _context(api, "docker build .", "session-a", repo)
+
+        (docker_config / "config.json").write_text('{"currentContext": "default"}')
+        assert _decision_status(api.evaluate_project_scope(context)) == "approved"
+        (docker_config / "config.json").write_text('{"currentContext": "remote"}')
+        assert _decision_status(api.evaluate_project_scope(context)) == "denied"
+        meta = docker_config / "contexts" / "meta" / "remote"
+        meta.mkdir(parents=True)
+        (meta / "meta.json").write_text('{"Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}')
+        assert _decision_status(api.evaluate_project_scope(context)) == "approved"
+        monkeypatch.setenv("DOCKER_CONTEXT", "remote")
+        assert _decision_status(api.evaluate_project_scope(context)) == "denied"
+
+    def test_activation_snapshot_cannot_expand_after_same_id_config_edit(self, scope_config):
+        api = _api()
+        repo, temporary, state = scope_config
+        api.activate_project_scope("session-a", "release-scope")
+        state["project_scope_templates"] = [_template(
+            repo, temporary, docker_registry_prefixes=["registry.example.test/"],
+        )]
+        decision = api.evaluate_project_scope(_context(
+            api, "docker push registry.example.test/other/image:latest", "session-a", repo,
+        ))
+        assert _decision_status(decision) == "denied"
+        payload = api.build_project_scope_audit_payload(decision)
+        assert {"policy_digest", "session_id", "timestamp", "decision_reason", "matched_root_label"} <= set(payload)
+        assert "raw_command" not in payload
+
+    def test_terminal_revalidates_after_guard_before_execution(self, monkeypatch):
+        api = _api()
+        executed = []
+        context = _context(api, "git -C . worktree prune", "task", Path("/tmp"))
+        decision = SimpleNamespace(status="approved", activation_id="activation", policy_digest="digest", operation="git.worktree.prune")
+
+        class FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                executed.append(command)
+                return {"output": "unexpected", "returncode": 0}
+
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"task": FakeEnv()})
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_task_env_overrides", {"task": {"cwd": "/tmp"}})
+        monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *a, **k: {"approved": True, "project_scope_context": context, "project_scope_decision": decision})
+        import tools.project_scope_approval as scope_module
+        monkeypatch.setattr(scope_module, "revalidate_project_scope", lambda *a: SimpleNamespace(status="denied", reason="project scope changed before execution"))
+
+        result = json.loads(terminal_tool.terminal_tool(command="git -C . worktree prune", task_id="task"))
+        assert result["status"] == "blocked"
+        assert not executed
