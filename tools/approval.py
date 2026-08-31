@@ -45,6 +45,17 @@ logger = logging.getLogger(__name__)
 _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 
 
+def is_trusted_interactive_approval_context() -> bool:
+    """Whether this turn has a human-capable, non-delegated approval surface."""
+    try:
+        from agent.delegation_context import is_delegated_child_context
+        if is_delegated_child_context():
+            return False
+    except Exception:
+        return False
+    return approval_context._is_gateway_approval_context()
+
+
 # --- Per-session approval state (thread-safe) -----------------------------------------------------------------------
 
 _lock = threading.Lock()
@@ -1100,11 +1111,11 @@ def check_dangerous_command(command: str, env_type: str,
     """Detect a dangerous command and handle approval (pattern layer only). ``has_host_access``:
     a Docker sandbox that bind-mounts host paths must not skip approval.
     Returns ``{"approved": True/False, "message": str or None, ...}``."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return _user_deny_block(command) or _approved()
-    blocked = _floor_block(command)
+    blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return _approved()
     if _yolo_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
@@ -1193,12 +1204,13 @@ def check_all_command_guards(command: str, env_type: str,
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return _user_deny_block(command) or _approved()
-
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+    # Isolated containers may skip ordinary approval and scoped-policy
+    # evaluation, never hardline, sudo-stdin, or user-deny floors.
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return _approved()
 
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
