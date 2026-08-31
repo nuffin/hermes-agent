@@ -1187,7 +1187,8 @@ def _tirith_scan(command: str) -> dict:
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False,
-                             terminal_context=None) -> dict:
+                             terminal_context=None,
+                             bypass_ordinary_approval: bool = False) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
@@ -1228,6 +1229,12 @@ def check_all_command_guards(command: str, env_type: str,
                 logger.info("Active project scope did not grant command: %s", scope_decision.reason)
         except Exception as exc:
             logger.warning("Project scope evaluation failed closed: %s", exc)
+
+    # ``terminal_tool(force=True)`` is an explicit pre-confirmation only for
+    # the ordinary prompt. It never skips hardline, sudo-stdin, or user-deny
+    # floors above, and it never creates a project-scope capability.
+    if bypass_ordinary_approval:
+        return _approved()
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":

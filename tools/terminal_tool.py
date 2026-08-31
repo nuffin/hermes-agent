@@ -147,12 +147,14 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 def _check_all_guards(command: str, env_type: str,
                       has_host_access: bool = False,
-                      terminal_context=None) -> dict:
+                      terminal_context=None,
+                      bypass_ordinary_approval: bool = False) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
                                   has_host_access=has_host_access,
-                                  terminal_context=terminal_context)
+                                  terminal_context=terminal_context,
+                                  bypass_ordinary_approval=bypass_ordinary_approval)
 
 
 from tools.environments.base import EnvironmentConnectionError
@@ -915,14 +917,13 @@ class _ApprovalVerdict:
 def _run_approval_guards(
     command: str, env_type: str, config: Dict[str, Any], *, force: bool, terminal_context=None,
 ) -> _ApprovalVerdict:
-    """Run tirith + dangerous-command guards; ``force`` skips them entirely.
+    """Run pre-execution guards; ``force`` skips only the ordinary prompt.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
-    if force:
-        return _ApprovalVerdict(approved_run=True)
     approval = _check_all_guards(
         command, env_type, has_host_access=_docker_has_host_access(config),
         terminal_context=terminal_context,
+        bypass_ordinary_approval=force,
     )
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
@@ -1386,9 +1387,18 @@ def terminal_tool(
                     f"Command denied: {refreshed.reason or 'project scope is no longer valid'}",
                     status="blocked",
                 ))
+        execution_command = command
+        if verdict.project_scope_decision is not None:
+            from tools.project_scope_approval import scoped_execution_command
+            execution_command = scoped_execution_command(command, verdict.project_scope_decision)
+            if execution_command is None:
+                raise _Rejected(_error_json(
+                    "Command denied: scoped Git execution could not suppress hooks",
+                    status="blocked",
+                ))
         if background:
             result = spawn_background_process(
-                command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=effective_cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
@@ -1401,7 +1411,7 @@ def terminal_tool(
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return result
         return _run_foreground(
-            command, env, plan,
+            execution_command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, command_cwd=effective_cwd, approval_note=verdict.note,
             clear_interrupt=verdict.approved_run,

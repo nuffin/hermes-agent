@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import threading
 import time
 import uuid
@@ -223,7 +224,7 @@ def project_scope_summary(template_id: str) -> dict[str, object] | None:
     template = load_project_scope_templates().get(template_id)
     if template is None:
         return None
-    return {"id": template.template_id, "repository_roots": [str(p) for p in template.repository_roots], "temporary_roots": [str(p) for p in template.temporary_roots], "allowed_operations": sorted(template.allowed_operations), "git_remotes": [name for name, _ in template.git_remotes], "git_ref_rules": list(template.git_ref_rules), "docker_registry_prefixes": list(template.docker_registry_prefixes), "expires": "session"}
+    return {"id": template.template_id, "repository_roots": [str(p) for p in template.repository_roots], "temporary_roots": [str(p) for p in template.temporary_roots], "allowed_operations": sorted(template.allowed_operations), "git_remotes": [{"name": name, "url_prefixes": list(prefixes)} for name, prefixes in template.git_remotes], "git_ref_rules": list(template.git_ref_rules), "docker_registry_prefixes": list(template.docker_registry_prefixes), "expires": "session"}
 
 
 def activate_project_scope(session_key: str, template_id: str, *, delegated: bool = False) -> ActivatedProjectScope | None:
@@ -329,41 +330,36 @@ def _ref_allowed(ref: str, rules: tuple[str, ...]) -> bool:
 
 
 def _remote_destinations(repo: Path, remote_name: str) -> tuple[str, ...] | None:
-    """Read only local Git metadata and return Git's effective push targets.
+    """Ask Git for every effective push target without contacting a remote.
 
-    Git permits repeated ``pushurl`` entries.  ``ConfigParser`` collapses those
-    duplicate keys, so scan the selected local config section directly.  A
-    configured pushurl replaces ``url`` for pushing; every effective target
-    must be inside the policy prefix, not just the fetch URL.
+    ``git remote get-url --push --all`` is the only supported resolver here:
+    it applies Git's own include/includeIf, repeated pushurl, and
+    ``url.<base>.pushInsteadOf`` rules.  Parsing config ourselves is unsafe
+    because a later Git config feature could silently create an approval gap.
+    The subcommand is metadata-only (no transport or hooks); a non-zero,
+    malformed, overlong, or timed-out response is deliberately ineligible.
     """
-    git = repo / ".git"
-    try:
-        if git.is_file():
-            marker = git.read_text(encoding="utf-8", errors="replace").strip()
-            if not marker.startswith("gitdir: "):
-                return None
-            git = (repo / marker[8:].strip()).resolve(strict=True)
-        lines = (git / "config").read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", remote_name):
         return None
-    section = f'[remote "{remote_name}"]'
-    in_section = False
-    urls: list[str] = []
-    pushurls: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_section = stripped == section
-            continue
-        if not in_section or "=" not in stripped:
-            continue
-        key, value = (part.strip() for part in stripped.split("=", 1))
-        if key == "url" and value:
-            urls.append(value)
-        elif key == "pushurl" and value:
-            pushurls.append(value)
-    destinations = pushurls or urls
-    return tuple(destinations) if destinations else None
+    # Config injection through inherited GIT_CONFIG_* variables would make
+    # evaluation differ from the scope-approved execution.  Normal on-disk
+    # system/global/local config and their Git-managed includes remain active.
+    if any(key == "GIT_CONFIG_COUNT" or key.startswith("GIT_CONFIG_KEY_")
+           or key.startswith("GIT_CONFIG_VALUE_") for key in os.environ):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", os.fspath(repo), "remote", "get-url", "--push", "--all", remote_name],
+            cwd=os.fspath(repo), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=2, check=False,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode or len(result.stdout) > 16_384:
+        return None
+    destinations = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+    return destinations or None
 
 
 def _repo_from_c(argv: list[str], template: ProjectScopeTemplate, cwd: Path) -> tuple[Path, list[str]] | None:
@@ -427,6 +423,14 @@ def _persisted_docker_context_is_local() -> bool:
     except FileNotFoundError:
         return True
     except (OSError, ValueError, TypeError):
+        return False
+    # Docker invokes docker-credential-<name> for either setting.  A scoped
+    # auto-approval cannot safely prove that helper benign, so do not reach the
+    # Docker CLI at all when local config asks it to execute one.
+    if (isinstance(config.get("credsStore"), str) and config["credsStore"].strip()) or (
+        isinstance(config.get("credHelpers"), dict)
+        and any(isinstance(value, str) and value.strip() for value in config["credHelpers"].values())
+    ):
         return False
     current = config.get("currentContext", "default")
     if current in (None, "", "default"):
@@ -527,6 +531,22 @@ def revalidate_project_scope(context: TerminalApprovalContext, decision: ScopeDe
             timestamp=time.time(), matched_root_label=decision.matched_root_label,
         )
     return current
+
+
+def scoped_execution_command(raw_command: str, decision: ScopeDecision) -> str | None:
+    """Return a hook-suppressed argv for an approved Git operation only.
+
+    Git command-line config has highest precedence, disabling both configured
+    ``core.hooksPath`` and executable default hooks without changing ordinary
+    terminal commands. Unexpected parsing refuses execution rather than
+    weakening the scope boundary.
+    """
+    if decision.operation not in {"git.commit.signed", "git.push.configured_remote"}:
+        return raw_command
+    argv = _parse_argv(raw_command)
+    if not argv or argv[0] != "git":
+        return None
+    return shlex.join(["git", "-c", "core.hooksPath=/dev/null", *argv[1:]])
 
 
 def build_project_scope_audit_payload(decision: ScopeDecision) -> dict[str, object]:

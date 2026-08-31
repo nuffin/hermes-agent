@@ -2555,6 +2555,13 @@ class CLICommandsMixin:
             _cp(f"  Failed to save {failed} setting to config.yaml")
         return new_state
 
+    def _handle_project_scope_command(self, cmd_original: str) -> None:
+        from cli import _cprint
+        from tools.approval import get_current_session_key
+        from hermes_cli.project_scope_command import run_project_scope_command
+        args = " ".join((cmd_original or "").strip().split()[1:])
+        _cprint(run_project_scope_command(args, session_key=get_current_session_key(default="")))
+
     def _handle_footer_command(self, cmd_original: str) -> None:
         """Toggle or inspect ``display.runtime_footer.enabled`` (``/footer [on|off|status]``)."""
         from hermes_cli.config import load_config

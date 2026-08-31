@@ -948,6 +948,13 @@ class GatewaySlashCommandsMixin(
         # system prompt/tool schema (prompt-cache prefix is sacred).
         return run_approval_mode_command(requested).message
 
+    async def _handle_project_scope_command(self, event: MessageEvent) -> str:
+        """Gateway adapter for a session-bound, correlated confirmation flow."""
+        from hermes_cli.project_scope_command import run_project_scope_command
+        return run_project_scope_command(
+            event.get_command_args(), session_key=self._session_key_for_source(event.source),
+        )
+
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
         from tools.approval import disable_session_yolo, enable_session_yolo, is_session_yolo_enabled
