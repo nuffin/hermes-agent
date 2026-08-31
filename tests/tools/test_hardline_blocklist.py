@@ -706,16 +706,22 @@ def test_cron_approve_mode_cannot_bypass_hardline(clean_session, monkeypatch):
     assert result.get("hardline") is True
 
 
-def test_container_backends_still_bypass(clean_session):
-    """Containerized backends remain bypass-approved — they can't touch the host.
-
-    Hardline only protects environments with real host impact (local, ssh).
-    """
+def test_container_backends_cannot_bypass_hardline_floors(clean_session):
+    """Unconditional hardline floors apply even to isolated containers."""
     for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
         r1 = check_dangerous_command("rm -rf /", env)
-        assert r1["approved"] is True, f"container {env} should still bypass"
+        assert r1["approved"] is False, f"container {env} must not bypass hardline"
+        assert r1.get("hardline") is True
         r2 = check_all_command_guards("rm -rf /", env)
-        assert r2["approved"] is True, f"container {env} should still bypass"
+        assert r2["approved"] is False, f"container {env} must not bypass hardline"
+        assert r2.get("hardline") is True
+
+
+def test_isolated_container_retains_ordinary_approval_bypass(clean_session):
+    """Only ordinary dangerous-command prompting remains skipped in containers."""
+    for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
+        result = check_all_command_guards("rm -rf /tmp/recoverable", env)
+        assert result["approved"] is True, f"container {env} should skip ordinary approval"
 
 
 def test_hardline_runs_before_dangerous_detection(clean_session):
@@ -801,9 +807,10 @@ def test_sudo_stdin_guard_detects_without_password():
         assert "sudo" in desc.lower()
 
 
-def test_sudo_stdin_guard_container_bypass(clean_session):
-    """Containerized backends still bypass — they can't touch the host."""
+def test_sudo_stdin_guard_runs_in_containers(clean_session):
+    """The unconditional sudo-stdin floor applies to every backend."""
     for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
-            assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+            assert result["approved"] is False, f"container {env} must block sudo guard on {cmd!r}"
+            assert "sudo" in result["message"].lower()
