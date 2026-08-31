@@ -3246,6 +3246,8 @@ def terminal_tool(
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
+        scope_context = None
+        scope_decision = None
         if not force:
             from tools.project_scope_approval import TerminalApprovalContext
             terminal_context = TerminalApprovalContext(
@@ -3289,6 +3291,8 @@ def terminal_tool(
                     "error": approval.get("message", fallback_msg),
                     "status": "blocked"
                 }, ensure_ascii=False)
+            scope_context = approval.get("project_scope_context")
+            scope_decision = approval.get("project_scope_decision")
             # Track whether approval was explicitly granted by the user
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
@@ -3297,6 +3301,16 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+
+        def _scope_execution_still_valid() -> str | None:
+            """Recheck a scoped approval at the last user-space boundary."""
+            if scope_context is None or scope_decision is None:
+                return None
+            from tools.project_scope_approval import revalidate_project_scope
+            refreshed = revalidate_project_scope(scope_context, scope_decision)
+            if refreshed.status == "approved":
+                return None
+            return refreshed.reason or "project scope is no longer valid"
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -3317,6 +3331,11 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
+            scope_error = _scope_execution_still_valid()
+            if scope_error:
+                return json.dumps({"output": "", "exit_code": -1,
+                                   "error": f"Command denied: {scope_error}",
+                                   "status": "blocked"}, ensure_ascii=False)
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -3586,6 +3605,11 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
+                    scope_error = _scope_execution_still_valid()
+                    if scope_error:
+                        return json.dumps({"output": "", "exit_code": -1,
+                                           "error": f"Command denied: {scope_error}",
+                                           "status": "blocked"}, ensure_ascii=False)
                     command_cwd = effective_cwd
                     execute_kwargs = {
                         "timeout": effective_timeout,
