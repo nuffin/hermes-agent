@@ -1,9 +1,9 @@
 # RFC: Project-Scoped Approvals
 
-**Status:** Partially implemented; end-user activation transport and full audit schema remain incomplete.
+**Status:** Partially implemented; end-user activation transport remains incomplete.
 **Decision:** Introduce opt-in, session-only, typed project-scope approvals as inert configuration templates. A matching template may approve only a narrowly parsed operation after explicit activation and all existing unconditional safeguards.
 
-> **Verified implementation note (2026-09-01):** The branch contains the internal evaluator, session registry, terminal context forwarding, and focused contract coverage. It does **not** yet expose a user-facing activation/confirmation transport, and its emitted scope observer payload omits the RFC's root-match labels, policy hash, timestamp, and reason fields. Therefore the branch must not be represented as a complete end-user implementation of this RFC.
+> **Verified implementation note (2026-09-01):** The branch contains the internal evaluator, immutable session snapshot/digest, session registry, terminal context forwarding, execution-boundary revalidation, and focused contract coverage. It emits allowlisted audit metadata including root-match label, policy digest, timestamp, session/activation identifiers, and decision reason. It does **not** expose a user-facing activation/confirmation transport; therefore it must not be represented as a complete end-user implementation of this RFC.
 
 ## Motivation
 
@@ -53,7 +53,7 @@ In v1, `activation` must be `explicit-session-approval` and `expires` must be `s
 
 Before use, the user requests a configured template by exact ID. Hermes presents its redacted, normalized summary—canonical roots, operations, remote/ref restrictions, registry prefixes, session expiry, and unchanged hardline, user-deny, and file protections—and requests one explicit confirmation binding that ID to the current session key.
 
-An affirmative response creates an in-memory `ActivatedProjectScope(template_id, session_key, activation_id, issued_at)`. At most one template is active per session. Activating another template requires a new confirmation and atomically replaces the prior activation. The user may revoke the active template at any time; revocation applies before the next command and is audited. `clear_session(session_key)` revokes the entry automatically. Activations are neither persisted nor reusable in another session.
+An affirmative response creates an in-memory activation containing `template_id`, `session_key`, `activation_id`, `issued_at`, and a validated immutable template snapshot with its SHA-256 policy digest. At most one template is active per session. Activating another template requires a new confirmation and atomically replaces the prior activation. Editing configuration under the same template ID cannot expand an existing session; a user must explicitly activate the edited template to obtain its new digest. The user may revoke the active template at any time; revocation applies before the next command and is audited. `clear_session(session_key)` revokes the entry automatically. Activations are neither persisted nor reusable in another session.
 
 Scopes cannot be enabled by force modes, smart approval, permanent allowlists, tool parameters, or child agents. Each delegated call is independently evaluated. A child sharing its parent's session key may consume the parent-session activation, but cannot activate, revoke, extend, or transfer it; a child with another key is inactive.
 
@@ -83,14 +83,14 @@ V1 admits exactly one shell-free command name and argv vector. Before `shlex.spl
 
 This gate controls only scope eligibility. Rejected input remains subject to the ordinary safety path and is not thereby safe.
 
-For every path-bearing operand and `effective_cwd`, paths are resolved relative to `effective_cwd`, never process CWD. Existing paths use strict realpath resolution. For a planned non-existing target, the resolver finds and resolves the nearest existing ancestor, rejects `.` and `..` traversal in the remaining suffix, then appends and normalizes it. Containment is equality or component-wise descent, never string-prefix matching. Relevant operands are re-stat/re-resolved immediately before execution; ambiguous or mutable operations are refused rather than treated as sandboxed.
+For every path-bearing operand and `effective_cwd`, paths are resolved relative to `effective_cwd`, never process CWD. Existing paths use strict realpath resolution. For a planned non-existing target, the resolver finds and resolves the nearest existing ancestor, rejects `.` and `..` traversal in the remaining suffix, then appends and normalizes it. Containment is equality or component-wise descent, never string-prefix matching. Relevant operands and local Git effective push metadata are re-resolved immediately before foreground execution or background spawn; a changed/revoked activation, scope-relevant path, or remote configuration blocks execution. This is a fail-closed user-space recheck, not a claim of atomicity: a hostile actor able to race the final metadata/path read and process launch remains a residual OS-level TOCTOU risk until descriptor- or transaction-based execution is available.
 
 The closed v1 operation enum is:
 
 - `git.worktree.create`, `git.worktree.prune`, and `git.worktree.remove`: exact `git -C <repo> worktree ...` forms; effective CWD and `-C` must be the configured repository root; destinations/removal targets must be under a temporary root, with symlink escape and sensitive/root/home/system targets refused.
 - `git.commit.signed`: a narrow `git -C <repo> commit -S ...` grammar with reviewed message syntax; no hooks/config overrides, pathspec-from-file, amend, no-verify, or arbitrary Git `-c`.
-- `git.push.configured_remote`: exact configured remote name and full refspec; normalized configured remote URL and both source/destination refs must match template rules. Force behavior, deletion, mirror/all, tags, URL remotes, and config overrides are excluded.
-- `docker.build`: a closed benign flag set with explicit repository-contained context (and allowed Dockerfile path); no host networking, daemon/context controls, secrets/SSH injection, arbitrary build arguments, or lifecycle behavior. A supported tag must match an allowed registry prefix.
+- `git.push.configured_remote`: exact configured remote name and full refspec; Git's effective push destination set is read from local metadata (`pushurl` entries when present, otherwise `url`) and every destination plus both source/destination refs must match template rules. Force behavior, deletion, mirror/all, tags, URL remotes, and config overrides are excluded.
+- `docker.build`: a closed benign flag set with explicit repository-contained context (and allowed Dockerfile path); no host networking, daemon/context controls, secrets/SSH injection, arbitrary build arguments, or lifecycle behavior. A supported tag must match an allowed registry prefix. Environment overrides and the persisted Docker `currentContext` are checked from local configuration only; default or explicitly local Unix/npipe metadata is eligible, while unknown or remote metadata fails closed without contacting a daemon.
 - `docker.push.configured_registry`: exact image-reference grammar with normalized registry/namespace prefix matching; no daemon/context controls or tag/digest rewrites outside the prefix.
 
 There is no generic filesystem or cleanup capability in v1. Any future cleanup operation requires its own explicit single-argv grammar, temporary-root containment, sensitive target exclusions, and revalidation.
