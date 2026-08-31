@@ -1,9 +1,9 @@
 # RFC: Project-Scoped Approvals
 
-**Status:** Partially implemented; end-user activation transport remains incomplete.
+**Status:** Implemented with session-bound activation transport.
 **Decision:** Introduce opt-in, session-only, typed project-scope approvals as inert configuration templates. A matching template may approve only a narrowly parsed operation after explicit activation and all existing unconditional safeguards.
 
-> **Verified implementation note (2026-09-01):** The branch contains the internal evaluator, immutable session snapshot/digest, session registry, terminal context forwarding, execution-boundary revalidation, and focused contract coverage. It emits allowlisted audit metadata including root-match label, policy digest, timestamp, session/activation identifiers, and decision reason. It does **not** expose a user-facing activation/confirmation transport; therefore it must not be represented as a complete end-user implementation of this RFC.
+> **Verified implementation note (2026-09-01):** The branch contains the internal evaluator, immutable session snapshot/digest, session registry, terminal context forwarding, execution-boundary revalidation, and focused contract coverage. `/project-scope activate` renders and stores a reviewed immutable policy snapshot; `confirm` binds that exact snapshot rather than reloading mutable configuration. Gateway control uses the shared approval/session trust predicate and denies delegated or unattended sources. It emits allowlisted audit metadata including root-match label, policy digest, timestamp, session/activation identifiers, and decision reason.
 
 ## Motivation
 
@@ -51,9 +51,9 @@ In v1, `activation` must be `explicit-session-approval` and `expires` must be `s
 
 ## Session activation and revocation
 
-Before use, the user requests a configured template by exact ID. Hermes presents its redacted, normalized summary—canonical roots, operations, remote/ref restrictions, registry prefixes, session expiry, and unchanged hardline, user-deny, and file protections—and requests one explicit confirmation binding that ID to the current session key.
+Before use, the user requests a configured template by exact ID. Hermes presents its redacted, normalized summary—canonical roots, operations, remote/ref restrictions, registry prefixes, session expiry, and unchanged hardline, user-deny, and file protections—and stores that validated immutable snapshot plus its canonical digest with the short-lived confirmation token. Confirming consumes the token and binds the stored snapshot, never a template reloaded from configuration; replacement of an ID between display and confirm cannot broaden authorization.
 
-An affirmative response creates an in-memory activation containing `template_id`, `session_key`, `activation_id`, `issued_at`, and a validated immutable template snapshot with its SHA-256 policy digest. At most one template is active per session. Activating another template requires a new confirmation and atomically replaces the prior activation. Editing configuration under the same template ID cannot expand an existing session; a user must explicitly activate the edited template to obtain its new digest. The user may revoke the active template at any time; revocation applies before the next command and is audited. `clear_session(session_key)` revokes the entry automatically. Activations are neither persisted nor reusable in another session.
+An affirmative response creates an in-memory activation containing `template_id`, `session_key`, `activation_id`, `issued_at`, and a validated immutable template snapshot with its SHA-256 policy digest. At most one template is active per session. Activating another template requires a new confirmation and atomically replaces the prior activation. Editing configuration under the same template ID cannot expand an existing session; a user must explicitly activate the edited template to obtain its new digest. The user may revoke the active template at any time; revocation applies before the next command and is audited. `clear_session(session_key)` revokes the entry automatically. Activations are neither persisted nor reusable in another session. The gateway invokes this control surface only when the shared approval/session context identifies a trusted interactive, non-delegated source; webhook, API, and delegated paths are explicitly denied for list, activation, confirmation, and revocation.
 
 Scopes cannot be enabled by force modes, smart approval, permanent allowlists, tool parameters, or child agents. Each delegated call is independently evaluated. A child sharing its parent's session key may consume the parent-session activation, but cannot activate, revoke, extend, or transfer it; a child with another key is inactive.
 
@@ -75,7 +75,7 @@ class TerminalApprovalContext:
 
 `raw_command` remains the exact tool input for existing hardline, deny, and dangerous-pattern checks. `effective_cwd` is calculated once through the existing CWD resolver—preserving its explicit-workdir, session-CWD, then configured-default precedence—and is passed unchanged to both evaluation and execution. Evaluators must not recalculate CWD from command text, inspect a `cd` operand, or use task paths.
 
-Terminal-local unconditional guards, hardline detection, `sudo -S` protection, and `approvals.deny` run first. Scoped evaluation occurs only after those checks and only for a user-active template. A `not_applicable` or `denied` scope result preserves ordinary dangerous-command and prompt behavior; it is never a bypass. A scoped approval is positive only for an eligible typed operation and does not alter yolo behavior, `approvals.mode`, permanent allowlists, or file-tool behavior.
+Terminal-local unconditional guards—hardline detection, `sudo -S` protection, and `approvals.deny`—run before every backend-specific shortcut, including isolated Docker, Daytona, and Vercel container paths. Only ordinary approval prompting and scoped-policy evaluation may be skipped for an isolated container. Scoped evaluation occurs only after those floors and only for a user-active template. A `not_applicable` or `denied` scope result preserves ordinary dangerous-command and prompt behavior; it is never a bypass. A scoped approval is positive only for an eligible typed operation and does not alter yolo behavior, `approvals.mode`, permanent allowlists, or file-tool behavior.
 
 ## V1 admission, operations, and canonicalization
 
@@ -121,7 +121,10 @@ Implementation must add focused tests using a temporary Hermes home and preserve
 4. foreground and background terminal integration with the raw command, backend, session, supplied workdir, and resolved effective CWD;
 5. strict canonicalization, including symlink and nearest-existing-ancestor escapes, traversal, wrong CWD, and protected targets;
 6. rejection of compound syntax, expansion, redirects, globbing, interpreter carriers, and multi-stage commands while ordinary approval behavior remains available;
-7. Git and Docker repository, remote, ref, registry, force, lifecycle, daemon/context, and redacted-observer cases.
+7. Git and Docker repository, remote, ref, registry, force, lifecycle, daemon/context, and redacted-observer cases;
+8. activation-display/confirm configuration replacement, proving the confirmation activates the reviewed snapshot and digest rather than a broadened same-ID template;
+9. gateway interactive versus webhook/API/delegated control authorization for activation, confirmation, and revocation; and
+10. command-registration parity, documenting that `/project-scope` stays available as `/hermes project-scope` on Slack's 50-command cap while remaining native on eligible surfaces.
 
 ## Non-goals
 

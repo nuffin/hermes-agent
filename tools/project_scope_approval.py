@@ -96,6 +96,11 @@ def _policy_digest(template: ProjectScopeTemplate) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def project_scope_policy_digest(template: ProjectScopeTemplate) -> str:
+    """Return the canonical digest used to bind a reviewed template snapshot."""
+    return _policy_digest(template)
+
+
 def _observe(event: str, activation: ActivatedProjectScope, *, operation: str | None = None) -> None:
     """Emit allowlisted scope metadata only; never raw command/config values."""
     try:
@@ -227,6 +232,24 @@ def project_scope_summary(template_id: str) -> dict[str, object] | None:
     return {"id": template.template_id, "repository_roots": [str(p) for p in template.repository_roots], "temporary_roots": [str(p) for p in template.temporary_roots], "allowed_operations": sorted(template.allowed_operations), "git_remotes": [{"name": name, "url_prefixes": list(prefixes)} for name, prefixes in template.git_remotes], "git_ref_rules": list(template.git_ref_rules), "docker_registry_prefixes": list(template.docker_registry_prefixes), "expires": "session"}
 
 
+def activate_project_scope_template(
+    session_key: str, template: ProjectScopeTemplate, *, delegated: bool = False,
+) -> ActivatedProjectScope | None:
+    """Activate one already-validated immutable template for a trusted session."""
+    if delegated:
+        raise PermissionError("delegated callers cannot activate a project scope")
+    if not isinstance(session_key, str) or not session_key:
+        return None
+    activation = ActivatedProjectScope(
+        template.template_id, session_key, uuid.uuid4().hex, time.time(), template,
+        _policy_digest(template),
+    )
+    with _lock:
+        _active[session_key] = activation
+    _observe("project_scope_activated", activation)
+    return activation
+
+
 def activate_project_scope(session_key: str, template_id: str, *, delegated: bool = False) -> ActivatedProjectScope | None:
     """Bind one prevalidated template to a session after explicit user consent.
 
@@ -241,16 +264,7 @@ def activate_project_scope(session_key: str, template_id: str, *, delegated: boo
     template = load_project_scope_templates().get(template_id)
     if template is None:
         return None
-    # Retain this validated value, not merely its ID: later configuration edits
-    # cannot broaden an already user-confirmed session capability.
-    activation = ActivatedProjectScope(
-        template_id, session_key, uuid.uuid4().hex, time.time(), template,
-        _policy_digest(template),
-    )
-    with _lock:
-        _active[session_key] = activation
-    _observe("project_scope_activated", activation)
-    return activation
+    return activate_project_scope_template(session_key, template, delegated=delegated)
 
 
 def revoke_project_scope(session_key: str) -> bool:
