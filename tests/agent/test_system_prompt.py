@@ -763,3 +763,20 @@ class TestConversationStartedTwoLine:
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
 
+
+
+def test_build_skills_index_hook_identity_replay():
+    """Replay coverage: the hook injects identity and suppresses flat index."""
+    agent = _make_agent(valid_tool_names=["skill_graph_search"])
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("hermes_cli.lifecycle.invoke_hook", return_value=[{
+            "skills_prompt": "", "identity": "Skill Discovery Protocol", "guidance": "Graph guidance"
+        }]),
+    ):
+        parts = build_system_prompt_parts(agent)
+    assert "Skill Discovery Protocol" in parts.get("stable", "")
+    assert "Graph guidance" in parts.get("stable", "")
+    assert "SHOULD_NOT_APPEAR" not in parts.get("volatile", "")
