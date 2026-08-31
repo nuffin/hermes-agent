@@ -295,6 +295,12 @@ def clear_session(session_key: str) -> None:
             # the prompt was withdrawn, nobody denied it.
             entry.cancelled = "the session ended before the prompt was answered"
             entry.event.set()
+    # Project scopes share the session teardown boundary with approval state.
+    try:
+        from tools.project_scope_approval import clear_project_scope_session
+        clear_project_scope_session(session_key)
+    except Exception:
+        pass
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
@@ -304,6 +310,19 @@ def clear_session(session_key: str) -> None:
             getattr(importlib.import_module(module), shutdown)(session_key)
         except Exception:
             pass
+
+
+# Public project-scope API. The capability implementation remains separate from
+# the legacy dangerous-command engine; this is the established approval boundary.
+from tools.project_scope_approval import (  # noqa: E402
+    TerminalApprovalContext,
+    activate_project_scope,
+    build_project_scope_audit_payload,
+    evaluate_project_scope,
+    get_active_project_scope,
+    load_project_scope_templates,
+    revoke_project_scope,
+)
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -1167,7 +1186,8 @@ def _tirith_scan(command: str) -> dict:
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             terminal_context=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
@@ -1183,6 +1203,27 @@ def check_all_command_guards(command: str, env_type: str,
     prepared = consume_prepared_guard(command, env_type, has_host_access)
     if prepared is not None:
         return prepared
+
+    # A scope is evaluated only from the immutable terminal-bound context,
+    # after unconditional floors and before ordinary bypass/prompt flow.
+    if terminal_context is not None:
+        try:
+            scope_decision = evaluate_project_scope(terminal_context)
+            if scope_decision.status == "approved":
+                _fire_approval_hook(
+                    "post_approval_response",
+                    project_scope=build_project_scope_audit_payload(scope_decision),
+                )
+                return {
+                    "approved": True,
+                    "message": None,
+                    "project_scope_approved": True,
+                    "project_scope_operation": scope_decision.operation,
+                }
+            if scope_decision.status == "denied":
+                logger.info("Active project scope did not grant command: %s", scope_decision.reason)
+        except Exception as exc:
+            logger.warning("Project scope evaluation failed closed: %s", exc)
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
