@@ -1,4 +1,5 @@
 """Tests for skill-graph pre_tool_call gating hook."""
+import sqlite3
 import pytest
 import sys
 from unittest.mock import patch, MagicMock
@@ -213,6 +214,33 @@ class TestSkillGraphProfileIsolation:
         db = mod._db_path()
         assert str(tmp_path) in str(db)
         assert "personal" not in str(db)
+
+    def test_init_db_migrates_legacy_skill_nodes_schema(self, tmp_path):
+        """Legacy graph DBs gain lifecycle columns before graph queries run."""
+        db_path = tmp_path / "legacy-skill-graph.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE skill_nodes (
+                name TEXT PRIMARY KEY,
+                category TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                tags TEXT DEFAULT '[]',
+                file_path TEXT DEFAULT '',
+                content_hash TEXT DEFAULT '',
+                last_parsed REAL DEFAULT 0
+            )
+        """)
+        conn.commit()
+
+        mod = self._import_skill_graph()
+        mod._init_db(conn)
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(skill_nodes)")}
+        assert {"is_deleted", "deleted_at", "needs_organizing"} <= columns
+        assert conn.execute(
+            "SELECT COUNT(*) FROM skill_nodes WHERE is_deleted = 0"
+        ).fetchone()[0] == 0
+        conn.close()
 
     def test_find_skills_dirs_includes_hermes_home(self, tmp_path, monkeypatch):
         """_find_all_skills_dirs() includes the profile's own skills/ dir."""

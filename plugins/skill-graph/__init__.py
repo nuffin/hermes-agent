@@ -60,6 +60,9 @@ CREATE TABLE IF NOT EXISTS skill_nodes (
     scenes      TEXT DEFAULT '[]',      -- JSON array, from metadata.hermes.scenes
     auto_tagged INTEGER DEFAULT 0,      -- 1 if tags/scenes were LLM-generated
     auto_tagged_at TEXT DEFAULT NULL,    -- timestamp of last successful auto-tag
+    is_deleted  INTEGER DEFAULT 0,       -- 1 after a skill is removed locally
+    deleted_at  TEXT DEFAULT NULL,       -- soft-delete timestamp
+    needs_organizing INTEGER DEFAULT 0,  -- created skill has not been organized yet
     file_path   TEXT DEFAULT '',
     content_hash TEXT DEFAULT '',
     last_parsed REAL DEFAULT 0
@@ -150,8 +153,11 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _init_db(conn: sqlite3.Connection) -> None:
-    """Ensure schema exists."""
+    """Create the current schema and upgrade pre-existing graph databases."""
     conn.executescript(SCHEMA_SQL)
+    # CREATE TABLE IF NOT EXISTS never adds newly declared columns to an
+    # existing database, so run migrations before any caller can query it.
+    _migrate_db(conn)
     conn.commit()
 
 
@@ -1423,7 +1429,6 @@ def _ensure_graph() -> sqlite3.Connection:
     if _global_conn is None:
         conn = _get_conn()
         _init_db(conn)
-        _migrate_db(conn)
         _global_conn = conn
     if not _global_synced:
         with _graph_lock:
