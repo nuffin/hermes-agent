@@ -4554,6 +4554,7 @@ _PLUGIN_COMPAT_LAZY = {
     'list_notify_subs': ('hermes_cli.kanban_db_notify', 'list_notify_subs'),
     'purge_stale_done_notify_subs': ('hermes_cli.kanban_db_notify', 'purge_stale_done_notify_subs'),
     '_cleanup_reaped_scope_brokers': ('hermes_cli.kanban_db_dispatch', '_cleanup_reaped_scope_brokers'),
+    '_default_spawn': ('hermes_cli.kanban_db_dispatch', '_default_spawn'),
     '_dispatcher_scope_brokers': ('hermes_cli.kanban_db_dispatch', '_dispatcher_scope_brokers'),
     '_register_dispatcher_scope_broker': ('hermes_cli.kanban_db_dispatch', '_register_dispatcher_scope_broker'),
     'reap_worker_zombies': ('hermes_cli.kanban_db_dispatch', 'reap_worker_zombies'),
