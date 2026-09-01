@@ -577,8 +577,6 @@ class AIAgent:
         skip_memory: bool = False,
         skip_background_review: bool = False,
         memory_mode: str = "full",
-        # Deprecated — use memory_mode instead (remove after 2026-08)
-        skip_memory: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
