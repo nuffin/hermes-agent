@@ -158,10 +158,51 @@ def bind_attempt(board_db: str | Path, board: str, task_id: str, run_id: int, cl
         conn.close()
 
 
+def _live_dispatch_claim(board_db: str | Path, task_id: str, run_id: int, claim_lock: str) -> sqlite3.Row | None:
+    """Read the dispatcher-owned task/run claim; every mismatch fails closed."""
+    try:
+        conn = sqlite3.connect(Path(board_db).expanduser().resolve())
+        conn.row_factory = sqlite3.Row
+        try:
+            task = conn.execute(
+                "SELECT id,assignee,status,current_run_id,claim_lock FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if task is None or task["status"] != "running":
+                return None
+            if int(task["current_run_id"] or 0) != run_id or task["claim_lock"] != claim_lock:
+                return None
+            run = conn.execute(
+                "SELECT id,status,claim_lock FROM task_runs WHERE id=? AND task_id=?",
+                (run_id, task_id),
+            ).fetchone()
+            if run is None or run["status"] != "running" or run["claim_lock"] != claim_lock:
+                return None
+            return task
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
+
+
 def bind_for_dispatch(board_db: str | Path, board: str, task_id: str, run_id: int, claim_lock: str) -> KanbanScopeAttempt | None:
-    """Resolve a direct, dispatcher-owned parent edge; ambiguity fails closed."""
+    """Bind only the live dispatcher claim; ambiguity and reassignment fail closed."""
+    task = _live_dispatch_claim(board_db, task_id, run_id, claim_lock)
+    if task is None:
+        return None
     direct = bind_attempt(board_db, board, task_id, run_id, claim_lock)
     if direct is not None:
+        # A root grant includes the concrete card's assignee.  A later reassignment
+        # is a new authority decision, never an implicit transfer.
+        conn = _connect(board_db)
+        try:
+            root = conn.execute("SELECT assignee FROM project_scope_roots WHERE root_ref=? AND active=1", (direct.root_ref,)).fetchone()
+            if root is None or root["assignee"] != task["assignee"]:
+                conn.execute("UPDATE project_scope_attempts SET active=0 WHERE attempt_ref=?", (direct.attempt_ref,))
+                conn.commit()
+                return None
+        finally:
+            conn.close()
         return direct
     try:
         board_conn = sqlite3.connect(board_db)
@@ -186,6 +227,10 @@ def bind_for_dispatch(board_db: str | Path, board: str, task_id: str, run_id: in
 
 def resolve_attempt(board_db: str | Path, board: str, task_id: str, run_id: int, claim_lock: str,
                     attempt_ref: str | None = None) -> KanbanScopeAttempt | None:
+    # This is the terminal/pre-execution guard: the persisted capability is
+    # insufficient until the board's current task/run claim says it is live.
+    if _live_dispatch_claim(board_db, task_id, run_id, claim_lock) is None:
+        return None
     conn = _connect(board_db)
     try:
         row = conn.execute("""SELECT a.* FROM project_scope_attempts a
