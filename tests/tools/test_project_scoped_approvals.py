@@ -299,11 +299,11 @@ class TestAuditAndDelegation:
         api = _api()
         repo, _, _ = scope_config
         root = api.activate_project_scope("parent", "release-scope")
-        first = project_scope_approval.grant_delegated_project_scope(
+        first = project_scope_approval._mint_dispatcher_child_scope(
             "parent", "child", "sa-child", parent_subagent_id="sa-parent",
         )
         assert first is not None
-        second = project_scope_approval.derive_delegated_project_scope(
+        second = project_scope_approval._mint_dispatcher_child_scope(
             "child", "grandchild", "sa-grandchild", parent_grant_id=first.grant_id,
         )
         assert second is not None
@@ -316,15 +316,25 @@ class TestAuditAndDelegation:
             api, "git -C . worktree prune", "grandchild", repo,
             execution_identity="sa-grandchild",
         ))) == "approved"
-        assert project_scope_approval.derive_delegated_project_scope(
+        assert project_scope_approval._mint_dispatcher_child_scope(
             "child", "other", "sa-other", parent_grant_id="wrong",
         ) is None
+
+    def test_descendant_cannot_cycle_back_to_root_or_an_ancestor(self, scope_config):
+        api = _api()
+        api.activate_project_scope("parent", "release-scope")
+        first = project_scope_approval._mint_dispatcher_child_scope("parent", "child", "sa-child")
+        assert first is not None
+        second = project_scope_approval._mint_dispatcher_child_scope("child", "grandchild", "sa-grandchild", parent_grant_id=first.grant_id)
+        assert second is not None
+        assert project_scope_approval._mint_dispatcher_child_scope("grandchild", "parent", "sa-forged-root", parent_grant_id=second.grant_id) is None
+        assert project_scope_approval._mint_dispatcher_child_scope("grandchild", "child", "sa-replay", parent_grant_id=second.grant_id) is None
 
     def test_parent_revoke_cascades_before_child_execution_and_audit_is_redacted(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
         api.activate_project_scope("parent", "release-scope")
-        grant = project_scope_approval.grant_delegated_project_scope("parent", "child", "sa-child")
+        grant = project_scope_approval._mint_dispatcher_child_scope("parent", "child", "sa-child")
         assert grant is not None
         assert api.revoke_project_scope("parent")
         decision = api.evaluate_project_scope(_context(api, "git -C . worktree prune", "child", repo))

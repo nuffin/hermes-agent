@@ -264,6 +264,23 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    # Only the dispatcher owns child session/subagent identities. Mint here,
+    # after construction, never from prompt/caller-provided delegation fields.
+    try:
+        from tools.project_scope_approval import _mint_dispatcher_child_scope, get_delegated_project_scope
+        parent_session = str(getattr(parent_agent, "session_id", "") or "")
+        child_session = str(getattr(child, "session_id", "") or "")
+        parent_grant = get_delegated_project_scope(parent_session)
+        child._project_scope_grant = (
+            _mint_dispatcher_child_scope(
+                parent_session, child_session, subagent_id,
+                parent_subagent_id=parent_subagent_id,
+                parent_grant_id=parent_grant.grant_id if parent_grant else None,
+            )
+            if parent_session and child_session else None
+        )
+    except Exception:
+        child._project_scope_grant = None
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
