@@ -72,16 +72,25 @@ def _connect(path: str | Path) -> sqlite3.Connection:
 
 
 def _snapshot(activation: Any) -> str:
-    t = activation.template
-    return json.dumps({
-        "template_id": t.template_id,
-        "repository_roots": [str(x) for x in t.repository_roots],
-        "temporary_roots": [str(x) for x in t.temporary_roots],
-        "git_remotes": [[name, list(prefixes)] for name, prefixes in t.git_remotes],
-        "git_ref_rules": list(t.git_ref_rules),
-        "docker_registry_prefixes": list(t.docker_registry_prefixes),
-        "allowed_operations": sorted(t.allowed_operations),
-    }, sort_keys=True, separators=(",", ":"))
+    from tools.project_scope_approval import _kanban_activation_snapshot
+    return _kanban_activation_snapshot(activation)
+
+
+def _deactivate_root(conn: sqlite3.Connection, root_ref: str) -> None:
+    with conn:
+        conn.execute("UPDATE project_scope_roots SET active=0 WHERE root_ref=?", (root_ref,))
+        conn.execute("UPDATE project_scope_attempts SET active=0 WHERE root_ref=?", (root_ref,))
+
+
+def _root_has_live_activation(row: sqlite3.Row) -> bool:
+    """Durable records describe a capability; session memory remains authority."""
+    try:
+        from tools.project_scope_approval import validate_live_kanban_activation
+        return validate_live_kanban_activation(
+            row["root_session_key"], row["activation_id"], row["policy_digest"], row["template_json"],
+        ) is not None
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def grant_root(board_db: str | Path, board: str, task_id: str, assignee: str | None, *, receipt: object) -> KanbanScopeRoot:
@@ -202,10 +211,9 @@ def bind_for_dispatch(board_db: str | Path, board: str, task_id: str, run_id: in
         # is a new authority decision, never an implicit transfer.
         conn = _connect(board_db)
         try:
-            root = conn.execute("SELECT assignee FROM project_scope_roots WHERE root_ref=? AND active=1", (direct.root_ref,)).fetchone()
-            if root is None or root["assignee"] != task["assignee"]:
-                conn.execute("UPDATE project_scope_attempts SET active=0 WHERE attempt_ref=?", (direct.attempt_ref,))
-                conn.commit()
+            root = conn.execute("SELECT * FROM project_scope_roots WHERE root_ref=? AND active=1", (direct.root_ref,)).fetchone()
+            if root is None or root["assignee"] != task["assignee"] or not _root_has_live_activation(root):
+                _deactivate_root(conn, direct.root_ref)
                 return None
         finally:
             conn.close()
@@ -226,7 +234,14 @@ def bind_for_dispatch(board_db: str | Path, board: str, task_id: str, run_id: in
           [board, *parents]).fetchall() if parents else []
         if len(candidates) != 1:
             return None
-        return bind_attempt(board_db, board, task_id, run_id, claim_lock, parent_attempt=candidates[0]["attempt_ref"])
+        attempt = bind_attempt(board_db, board, task_id, run_id, claim_lock, parent_attempt=candidates[0]["attempt_ref"])
+        if attempt is None:
+            return None
+        root = registry.execute("SELECT * FROM project_scope_roots WHERE root_ref=? AND active=1", (attempt.root_ref,)).fetchone()
+        if root is None or not _root_has_live_activation(root):
+            _deactivate_root(registry, attempt.root_ref)
+            return None
+        return attempt
     finally:
         registry.close()
 
@@ -240,7 +255,8 @@ def resolve_attempt(board_db: str | Path, board: str, task_id: str, run_id: int,
         return None
     conn = _connect(board_db)
     try:
-        row = conn.execute("""SELECT a.*,r.assignee AS root_assignee FROM project_scope_attempts a
+        row = conn.execute("""SELECT a.*,r.assignee AS root_assignee,r.activation_id AS activation_id,
+          r.root_session_key,r.policy_digest,r.template_json FROM project_scope_attempts a
           JOIN project_scope_roots r ON r.root_ref=a.root_ref
           WHERE a.board=? AND a.task_id=? AND a.run_id=? AND a.claim_lock=?
             AND a.active=1 AND r.active=1""", (board, task_id, run_id, claim_lock)).fetchone()
@@ -249,10 +265,8 @@ def resolve_attempt(board_db: str | Path, board: str, task_id: str, run_id: int,
         # Assignment is an authority boundary, not merely a dispatch hint.
         # Re-read it at every terminal guard/pre-exec lookup and revoke the
         # complete root lineage on transfer so a stale attempt cannot execute.
-        if row["root_assignee"] != task["assignee"]:
-            with conn:
-                conn.execute("UPDATE project_scope_roots SET active=0 WHERE root_ref=?", (row["root_ref"],))
-                conn.execute("UPDATE project_scope_attempts SET active=0 WHERE root_ref=?", (row["root_ref"],))
+        if row["root_assignee"] != task["assignee"] or not _root_has_live_activation(row):
+            _deactivate_root(conn, row["root_ref"])
             return None
         return KanbanScopeAttempt(row["attempt_ref"], row["root_ref"], row["board"], row["task_id"],
                                   int(row["run_id"]), row["claim_lock"], int(row["depth"]))
@@ -265,8 +279,11 @@ def template_for_attempt(board_db: str | Path, attempt: KanbanScopeAttempt):
     from tools.project_scope_approval import ProjectScopeTemplate
     conn = _connect(board_db)
     try:
-        row = conn.execute("SELECT template_json,policy_digest FROM project_scope_roots WHERE root_ref=? AND active=1", (attempt.root_ref,)).fetchone()
+        row = conn.execute("SELECT * FROM project_scope_roots WHERE root_ref=? AND active=1", (attempt.root_ref,)).fetchone()
         if row is None:
+            return None
+        if not _root_has_live_activation(row):
+            _deactivate_root(conn, attempt.root_ref)
             return None
         data = json.loads(row["template_json"])
         template = ProjectScopeTemplate(data["template_id"], tuple(Path(x) for x in data["repository_roots"]),
@@ -274,9 +291,7 @@ def template_for_attempt(board_db: str | Path, attempt: KanbanScopeAttempt):
             tuple(data["git_ref_rules"]), tuple(data["docker_registry_prefixes"]), frozenset(data["allowed_operations"]))
         from tools.project_scope_approval import project_scope_policy_digest
         if project_scope_policy_digest(template) != row["policy_digest"]:
-            with conn:
-                conn.execute("UPDATE project_scope_roots SET active=0 WHERE root_ref=?", (attempt.root_ref,))
-                conn.execute("UPDATE project_scope_attempts SET active=0 WHERE root_ref=?", (attempt.root_ref,))
+            _deactivate_root(conn, attempt.root_ref)
             return None
         return template, row["policy_digest"]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):

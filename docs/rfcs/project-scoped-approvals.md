@@ -30,9 +30,15 @@ edge makes all descendants inert before execution.
 Kanban cards are noninteractive and inert without an explicit parent root
 grant. The trusted `/project-scope grant-kanban <board> <card>` surface first
 renders the redacted immutable policy summary plus exact board/card/assignee
-identity, then requires `confirm-kanban <token>`. Confirmation writes a durable
-registry record adjacent to the board DB; it stores a policy snapshot/digest and
-opaque IDs only, never card text or a model-facing policy token. The dispatcher
+identity, then requires `confirm-kanban <token>`. Confirmation writes durable
+capability-registry metadata adjacent to the board DB; it stores a policy
+snapshot/digest and opaque IDs only, never card text or a model-facing policy
+token. The durable row is not authority and can never restore an activation:
+every root/attempt lookup requires the current in-memory activation for the
+persisted root session key to have the exact immutable activation ID,
+snapshot, and digest. Consequently daemon/process restart invalidates all
+outstanding roots and attempts unless a supported explicit activation lifecycle
+reestablishes them; there is no implicit restore from a Kanban row. The dispatcher
 mints a fresh opaque attempt reference after each claim and binds it to exact
 board, card, run ID, and claim lock. Same-card retries mint a new reference;
 replay, moved-board, lock/run mismatch, reassignment, ambiguous parent lineage,
