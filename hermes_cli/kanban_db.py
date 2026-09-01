@@ -10802,6 +10802,18 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # Scope lineage is dispatcher-owned and carries only an opaque attempt ref.
+    # Ordinary cards have no row and therefore retain pre-feature behavior.
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    if task.current_run_id is not None and task.claim_lock:
+        try:
+            from hermes_cli.kanban_scope_lineage import bind_for_dispatch
+            scope_attempt = bind_for_dispatch(kanban_db_path(board=resolved_board), resolved_board,
+                                              task.id, int(task.current_run_id), task.claim_lock)
+            if scope_attempt is not None:
+                env["HERMES_KANBAN_SCOPE_ATTEMPT"] = scope_attempt.attempt_ref
+        except Exception:
+            _log.debug("kanban scope lineage unavailable for task %s", task.id, exc_info=True)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
