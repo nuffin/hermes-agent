@@ -38,10 +38,22 @@ every root/attempt lookup requires the current in-memory activation for the
 persisted root session key to have the exact immutable activation ID,
 snapshot, and digest. Consequently daemon/process restart invalidates all
 outstanding roots and attempts unless a supported explicit activation lifecycle
-reestablishes them; there is no implicit restore from a Kanban row. The dispatcher
-mints a fresh opaque attempt reference after each claim and binds it to exact
-board, card, run ID, and claim lock. Same-card retries mint a new reference;
-replay, moved-board, lock/run mismatch, reassignment, ambiguous parent lineage,
+reestablishes them; there is no implicit restore from a Kanban row. On Unix the
+parent dispatcher also owns a run-local private (0700 directory, 0600 socket)
+liveness broker. Workers receive only an opaque attempt reference and broker
+address; the broker verifies kernel peer PID credentials against the actual
+post-spawn direct child registration, then revalidates the exact root session,
+activation ID, immutable snapshot digest, board/card/run/claim/assignee and
+active state in the parent process on every terminal lookup. The socket accepts
+a bounded typed resolve request only; it is not a policy, mint, grant, revoke,
+list, or root-selection API. Requests before registration, from a grandchild or
+another same-user process, after worker exit, or after revocation/replacement
+are denied. The broker is neither durable nor restartable; Windows has no TCP
+fallback and fails closed until an equivalent authenticated local transport is
+implemented. This protects model/plugin/prompt paths, not arbitrary same-user
+native code already inside Hermes' trusted core. The dispatcher mints a fresh
+opaque attempt reference after each claim and binds it to exact board, card, run
+ID, and claim lock. Same-card retries mint a new reference; replay, moved-board, lock/run mismatch, reassignment, ambiguous parent lineage,
 cycle, and depth overflow fail closed. A direct, uniquely verified parent card
 may pass the identical snapshot/digest to a descendant automatically, but this
 does not grant child ownership or card mutation. Parent activation replacement,

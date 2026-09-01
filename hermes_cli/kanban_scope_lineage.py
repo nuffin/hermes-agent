@@ -7,7 +7,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import shutil
+import socket
+import struct
+import tempfile
+import threading
 import sqlite3
 import time
 import uuid
@@ -328,3 +334,79 @@ def template_for_attempt(board_db: str | Path, attempt: KanbanScopeAttempt):
         return None
     finally:
         conn.close()
+
+
+class DispatcherScopeBroker:
+    """Ephemeral Unix-peer-credential liveness oracle owned by dispatcher."""
+    def __init__(self, board_db: str | Path, board: str, attempt: KanbanScopeAttempt):
+        self.board_db, self.board, self.attempt = Path(board_db), board, attempt
+        self._directory = Path(tempfile.mkdtemp(prefix="hermes-scope-", dir=str(Path(board_db).parent)))
+        os.chmod(self._directory, 0o700)
+        self.endpoint = str(self._directory / "live.sock")
+        self._child_pid: int | None = None
+        self._closed = threading.Event(); self._server = None; self._thread = None
+
+    def start(self) -> None:
+        if os.name == "nt" or not hasattr(socket, "SO_PEERCRED"):
+            raise OSError("secure Kanban scope broker unavailable")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.endpoint); os.chmod(self.endpoint, 0o600)
+        server.listen(4); server.settimeout(.2); self._server = server
+        self._thread = threading.Thread(target=self._serve, daemon=True); self._thread.start()
+
+    def register_child(self, pid: int) -> bool:
+        if not isinstance(pid, int) or pid <= 0 or self._closed.is_set() or self._child_pid is not None:
+            return False
+        self._child_pid = pid
+        return True
+
+    def close(self) -> None:
+        self._closed.set()
+        if self._server is not None: self._server.close()
+        if self._thread is not None: self._thread.join(timeout=1)
+        shutil.rmtree(self._directory, ignore_errors=True)
+
+    def _serve(self) -> None:
+        while not self._closed.is_set():
+            try: conn, _ = self._server.accept()
+            except (OSError, TimeoutError): continue
+            with conn:
+                try:
+                    conn.settimeout(1)
+                    pid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+                    request = json.loads(conn.recv(1024).decode())
+                    if (not isinstance(request, dict) or set(request) != {"op", "attempt"}
+                            or request["op"] != "resolve" or request["attempt"] != self.attempt.attempt_ref
+                            or pid != self._child_pid): raise ValueError
+                    value = self._resolve_live()
+                    conn.sendall(json.dumps({"ok": value is not None, "scope": value}, separators=(",", ":")).encode())
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    try: conn.sendall(b'{"ok":false}')
+                    except OSError: pass
+
+    def _resolve_live(self) -> dict[str, object] | None:
+        attempt = resolve_attempt(self.board_db, self.board, self.attempt.task_id, self.attempt.run_id,
+                                  self.attempt.claim_lock, self.attempt.attempt_ref)
+        snapshot = template_for_attempt(self.board_db, attempt) if attempt else None
+        if snapshot is None: return None
+        template, digest = snapshot
+        return {"template": json.loads(_template_json(template)), "digest": digest, "root_ref": attempt.root_ref}
+
+
+def _template_json(template: Any) -> str:
+    return json.dumps({"template_id": template.template_id, "repository_roots": [str(x) for x in template.repository_roots],
+        "temporary_roots": [str(x) for x in template.temporary_roots], "git_remotes": [[n, list(p)] for n, p in template.git_remotes],
+        "git_ref_rules": list(template.git_ref_rules), "docker_registry_prefixes": list(template.docker_registry_prefixes),
+        "allowed_operations": sorted(template.allowed_operations)}, separators=(",", ":"))
+
+
+def request_broker_scope(endpoint: str, attempt_ref: str) -> dict[str, object] | None:
+    """Typed worker lookup; all missing/invalid/Windows paths fail closed."""
+    if os.name == "nt" or not endpoint or not attempt_ref or len(endpoint) > 512 or len(attempt_ref) > 128: return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1); client.connect(endpoint)
+            client.sendall(json.dumps({"op":"resolve", "attempt":attempt_ref}, separators=(",", ":")).encode())
+            reply = json.loads(client.recv(65536).decode())
+        return reply["scope"] if isinstance(reply, dict) and reply.get("ok") is True and isinstance(reply.get("scope"), dict) else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError): return None
