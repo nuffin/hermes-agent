@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 def _template(tmp_path: Path):
     from tools.project_scope_approval import ProjectScopeTemplate
@@ -414,3 +416,94 @@ def test_worker_retirement_keeps_root_only_while_a_sibling_attempt_is_live(tmp_p
         assert conn.execute("SELECT active FROM project_scope_roots WHERE root_ref=?", (parent.root_ref,)).fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_spawn_failure_retires_scoped_broker_attempt_and_root(tmp_path, monkeypatch):
+    """A Popen failure cannot leave a socket, map entry, or minted authority."""
+    import os
+    import sqlite3
+    import subprocess
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_scope_lineage as lineage
+
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id is not None and task.claim_lock is not None
+    _grant(db, "board-a", task.id, "worker", _activation(tmp_path))
+    brokers = []
+    original_broker = lineage.DispatcherScopeBroker
+
+    class RecordingBroker(original_broker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            brokers.append(self)
+
+    def missing_executable(*_args, **_kwargs):
+        raise FileNotFoundError("missing hermes")
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    monkeypatch.setattr(lineage, "DispatcherScopeBroker", RecordingBroker)
+    monkeypatch.setattr(subprocess, "Popen", missing_executable)
+    with pytest.raises(RuntimeError, match="executable not found"):
+        kb._default_spawn(task, str(tmp_path), board="board-a")
+
+    assert len(brokers) == 1
+    broker = brokers[0]
+    assert not os.path.exists(broker.endpoint)
+    assert all(broker not in bucket.values() for bucket in kb._dispatcher_scope_brokers.values())
+    conn = sqlite3.connect(lineage.registry_path(db))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM project_scope_attempts WHERE task_id=? AND active=1", (task.id,),
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT active FROM project_scope_roots").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_register_rejects_exit_before_registration_zombie_and_retires_attempt(tmp_path):
+    """A dead direct child is not live merely because it remains unreaped."""
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+    import time
+    from hermes_cli import kanban_scope_lineage as lineage
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux /proc state is required for zombie coverage")
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id is not None and task.claim_lock is not None
+    _grant(db, "board-a", task.id, "worker", _activation(tmp_path))
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    broker = lineage.DispatcherScopeBroker(db, "board-a", attempt)
+    broker.start()
+    endpoint = broker.endpoint
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 2
+        state = ""
+        while time.monotonic() < deadline:
+            try:
+                stat = open(f"/proc/{proc.pid}/stat", encoding="utf-8").read()
+                state = stat.rsplit(")", 1)[1].split()[0]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            time.sleep(.01)
+        assert state == "Z"
+        assert broker.register_child(proc.pid) is False
+        assert not os.path.exists(endpoint)
+        conn = sqlite3.connect(lineage.registry_path(db))
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM project_scope_attempts WHERE attempt_ref=? AND active=1", (attempt.attempt_ref,),
+            ).fetchone()[0] == 0
+        finally:
+            conn.close()
+    finally:
+        proc.wait()
+        broker.close()
