@@ -64,6 +64,29 @@ class ActivatedProjectScope:
     issued_at: float
     template: ProjectScopeTemplate
     policy_digest: str
+    confirmation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TrustedConfirmationReceipt:
+    """Trusted interactive confirmation, bound to one exact session/template."""
+    receipt_id: str
+    session_key: str
+    template: ProjectScopeTemplate
+    policy_digest: str
+    issued_at: float
+
+
+@dataclass(frozen=True)
+class TrustedKanbanGrantReceipt:
+    """One trusted `/project-scope` confirmation bound to one card grant."""
+    receipt_id: str
+    session_key: str
+    activation_id: str
+    board: str
+    task_id: str
+    assignee: str | None
+    issued_at: float
 
 
 @dataclass(frozen=True)
@@ -97,11 +120,11 @@ class ScopeDecision:
 
 _lock = threading.RLock()
 _active: dict[str, ActivatedProjectScope] = {}
+_confirmations: dict[str, TrustedConfirmationReceipt] = {}
+_kanban_confirmations: dict[str, TrustedKanbanGrantReceipt] = {}
 _delegated_grants: dict[str, DelegatedProjectScopeGrant] = {}
 _grant_by_recipient: dict[str, str] = {}
 _MAX_LINEAGE_DEPTH = 8
-_TRUSTED_UI_MINT = object()
-_DISPATCHER_MINT = object()
 
 
 def _policy_digest(template: ProjectScopeTemplate) -> str:
@@ -254,44 +277,76 @@ def project_scope_summary(template_id: str) -> dict[str, object] | None:
     return {"id": template.template_id, "repository_roots": [str(p) for p in template.repository_roots], "temporary_roots": [str(p) for p in template.temporary_roots], "allowed_operations": sorted(template.allowed_operations), "git_remotes": [{"name": name, "url_prefixes": list(prefixes)} for name, prefixes in template.git_remotes], "git_ref_rules": list(template.git_ref_rules), "docker_registry_prefixes": list(template.docker_registry_prefixes), "expires": "session"}
 
 
-def activate_project_scope_template(
-    session_key: str, template: ProjectScopeTemplate, *, delegated: bool = False,
-    _authority: object | None = None,
-) -> ActivatedProjectScope | None:
-    """Raw template activation is reserved for the confirmed trusted UI path."""
-    if delegated or _authority is not _TRUSTED_UI_MINT:
-        return None
-    if not isinstance(session_key, str) or not session_key:
-        return None
-    activation = ActivatedProjectScope(
-        template.template_id, session_key, uuid.uuid4().hex, time.time(), template,
-        _policy_digest(template),
+def activate_project_scope_template(*args: object, **kwargs: object) -> None:
+    """Removed raw activation surface; trusted confirmations mint receipts."""
+    return None
+
+
+def activate_project_scope(*args: object, **kwargs: object) -> None:
+    """Removed raw activation surface; callers cannot assert consent."""
+    return None
+
+
+def _issue_trusted_confirmation(session_key: str, template: ProjectScopeTemplate) -> TrustedConfirmationReceipt:
+    """Create a receipt only after the interactive command verified its token."""
+    receipt = TrustedConfirmationReceipt(
+        uuid.uuid4().hex, session_key, template, _policy_digest(template), time.time(),
     )
     with _lock:
-        _active[session_key] = activation
+        _confirmations[receipt.receipt_id] = receipt
+    return receipt
+
+
+def _activate_confirmed_project_scope(receipt: TrustedConfirmationReceipt) -> ActivatedProjectScope | None:
+    """Consume an immutable trusted receipt; no bool/token/object can substitute."""
+    if not isinstance(receipt, TrustedConfirmationReceipt):
+        return None
+    with _lock:
+        live = _confirmations.pop(receipt.receipt_id, None)
+        if live != receipt or live.policy_digest != _policy_digest(live.template):
+            return None
+        activation = ActivatedProjectScope(
+            live.template.template_id, live.session_key, uuid.uuid4().hex, time.time(),
+            live.template, live.policy_digest, live.receipt_id,
+        )
+        _active[live.session_key] = activation
     _observe("project_scope_activated", activation)
     return activation
 
 
-def activate_project_scope(session_key: str, template_id: str, *, delegated: bool = False) -> ActivatedProjectScope | None:
-    """Bind one prevalidated template to a session after explicit user consent.
-
-    This API does not infer consent from command text, task metadata, CWD, or
-    environment.  Callers must supply the current session and an exact ID from
-    a user-facing confirmation flow.
-    """
-    if delegated:
-        raise PermissionError("delegated callers cannot activate a project scope")
-    if not isinstance(session_key, str) or not session_key:
+def _issue_trusted_kanban_grant(
+    session_key: str, activation: ActivatedProjectScope, board: str, task_id: str,
+    assignee: str | None,
+) -> TrustedKanbanGrantReceipt | None:
+    """Bind a confirmed card grant to the still-live exact session activation."""
+    if not isinstance(activation, ActivatedProjectScope):
         return None
-    template = load_project_scope_templates().get(template_id)
-    if template is None:
+    with _lock:
+        live = _active.get(session_key)
+        if live != activation or live.activation_id != activation.activation_id:
+            return None
+        receipt = TrustedKanbanGrantReceipt(
+            uuid.uuid4().hex, session_key, activation.activation_id, board, task_id,
+            assignee, time.time(),
+        )
+        _kanban_confirmations[receipt.receipt_id] = receipt
+        return receipt
+
+
+def validate_trusted_kanban_grant(
+    receipt: object, *, board: str, task_id: str, assignee: str | None,
+) -> ActivatedProjectScope | None:
+    """Validate live activation and exact receipt binding at root mint time."""
+    if not isinstance(receipt, TrustedKanbanGrantReceipt):
         return None
-    return _activate_confirmed_project_scope(session_key, template)
-
-
-def _activate_confirmed_project_scope(session_key: str, template: ProjectScopeTemplate) -> ActivatedProjectScope | None:
-    return activate_project_scope_template(session_key, template, _authority=_TRUSTED_UI_MINT)
+    with _lock:
+        live_receipt = _kanban_confirmations.pop(receipt.receipt_id, None)
+        live = _active.get(receipt.session_key)
+        if (live_receipt != receipt or live is None
+                or live.activation_id != receipt.activation_id
+                or (receipt.board, receipt.task_id, receipt.assignee) != (board, task_id, assignee)):
+            return None
+        return live
 
 
 def revoke_project_scope(session_key: str) -> bool:
@@ -317,13 +372,10 @@ def get_active_project_scope(session_key: str) -> ActivatedProjectScope | None:
         return _active.get(session_key)
 
 
-def grant_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
+def _grant_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
                                   recipient_subagent_id: str, *,
-                                  parent_subagent_id: str | None = None,
-                                  _authority: object | None = None) -> DelegatedProjectScopeGrant | None:
-    """Create a root edge only for the dispatcher-owned child constructor."""
-    if _authority is not _DISPATCHER_MINT:
-        return None
+                                  parent_subagent_id: str | None = None) -> DelegatedProjectScopeGrant | None:
+    """Create a root edge only from the delegate dispatcher lifecycle."""
     if not all(isinstance(value, str) and value for value in
                (parent_session_key, recipient_session_key, recipient_subagent_id)):
         return None
@@ -344,12 +396,9 @@ def grant_delegated_project_scope(parent_session_key: str, recipient_session_key
     return grant
 
 
-def derive_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
-                                   recipient_subagent_id: str, *, parent_grant_id: str,
-                                   _authority: object | None = None) -> DelegatedProjectScopeGrant | None:
+def _derive_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
+                                   recipient_subagent_id: str, *, parent_grant_id: str) -> DelegatedProjectScopeGrant | None:
     """Derive an exact immutable descendant; never a new root or template."""
-    if _authority is not _DISPATCHER_MINT:
-        return None
     if not all(isinstance(value, str) and value for value in
                (parent_session_key, recipient_session_key, recipient_subagent_id, parent_grant_id)):
         return None
@@ -391,8 +440,18 @@ def _mint_dispatcher_child_scope(parent_session_key: str, recipient_session_key:
                                  parent_grant_id: str | None = None) -> DelegatedProjectScopeGrant | None:
     """Mint only from runtime-issued parent/child identities."""
     if parent_grant_id:
-        return derive_delegated_project_scope(parent_session_key, recipient_session_key, recipient_subagent_id, parent_grant_id=parent_grant_id, _authority=_DISPATCHER_MINT)
-    return grant_delegated_project_scope(parent_session_key, recipient_session_key, recipient_subagent_id, parent_subagent_id=parent_subagent_id, _authority=_DISPATCHER_MINT)
+        return _derive_delegated_project_scope(parent_session_key, recipient_session_key, recipient_subagent_id, parent_grant_id=parent_grant_id)
+    return _grant_delegated_project_scope(parent_session_key, recipient_session_key, recipient_subagent_id, parent_subagent_id=parent_subagent_id)
+
+
+def grant_delegated_project_scope(*args: object, **kwargs: object) -> None:
+    """Removed raw grant-minting API; dispatcher lifecycle owns this transition."""
+    return None
+
+
+def derive_delegated_project_scope(*args: object, **kwargs: object) -> None:
+    """Removed raw grant-minting API; dispatcher lifecycle owns this transition."""
+    return None
 
 
 def clear_delegated_project_scope(session_key: str, recipient_subagent_id: str) -> None:

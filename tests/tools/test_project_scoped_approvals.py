@@ -87,6 +87,18 @@ def scope_config(tmp_path, monkeypatch):
     return repo, temporary, state
 
 
+def _activate(api, session_key: str, template_id: str):
+    rendered = project_scope_command.run_project_scope_command(
+        f"activate {template_id}", session_key=session_key,
+    )
+    token = rendered.rsplit(" ", 1)[1]
+    result = project_scope_command.run_project_scope_command(
+        f"confirm {token}", session_key=session_key,
+    )
+    assert "activated" in result
+    return api.get_active_project_scope(session_key)
+
+
 def _context(api, command: str, session: str, cwd: Path, *, workdir=None, backend="local", execution_identity=None):
     return api.TerminalApprovalContext(
         raw_command=command,
@@ -162,7 +174,7 @@ class TestProjectScopeTemplateValidation:
         # Regression: the preceding lifecycle test uses this same session key.
         assert api.get_active_project_scope("session-a") is None
         assert _decision_status(api.evaluate_project_scope(context)) == "not_applicable"
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         assert _decision_status(api.evaluate_project_scope(context)) == "approved"
 
 
@@ -172,8 +184,8 @@ class TestProjectScopeLifecycle:
         repo, temporary, state = scope_config
         state["project_scope_templates"].append(_template(repo, temporary, id="other-scope"))
 
-        first = api.activate_project_scope("session-a", "release-scope")
-        second = api.activate_project_scope("session-a", "other-scope")
+        first = _activate(api, "session-a", "release-scope")
+        second = _activate(api, "session-a", "other-scope")
 
         active = api.get_active_project_scope("session-a")
         assert _field(active, "template_id") == "other-scope"
@@ -183,11 +195,11 @@ class TestProjectScopeLifecycle:
     def test_revoke_and_clear_session_remove_scope_before_next_command(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         assert api.revoke_project_scope("session-a") is True
         assert api.get_active_project_scope("session-a") is None
 
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         approval_module.clear_session("session-a")
         context = _context(api, "git -C . worktree prune", "session-a", repo)
         assert api.get_active_project_scope("session-a") is None
@@ -200,7 +212,7 @@ class TestProjectScopeLifecycle:
 
         # Matching CWD/command and arbitrary metadata are not authority sources.
         assert _decision_status(api.evaluate_project_scope(context)) == "not_applicable"
-        api.activate_project_scope("parent-session", "release-scope")
+        _activate(api, "parent-session", "release-scope")
         assert _decision_status(api.evaluate_project_scope(context)) == "not_applicable"
 
 
@@ -210,7 +222,7 @@ class TestScopeOrderingAndTerminalContext:
         api = _api()
         repo, _, state = scope_config
         state["deny"] = ["git push origin *"]
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         monkeypatch.setattr(approval_module, "_get_approval_config", lambda: state)
         result = approval_module.check_all_command_guards(
             command, "local", terminal_context=_context(api, command, "session-a", repo)
@@ -244,6 +256,44 @@ class TestScopeOrderingAndTerminalContext:
         assert context.effective_cwd == "/tool/cwd"
         assert executed[0][1]["cwd"] == context.effective_cwd
 
+    def test_terminal_runtime_uses_dispatcher_child_identity_not_collapsed_task_id(self, scope_config, monkeypatch):
+        api = _api()
+        repo, _, _ = scope_config
+        _activate(api, "parent", "release-scope")
+        assert project_scope_approval._mint_dispatcher_child_scope("parent", "sa-child", "sa-child")
+        captured = []
+
+        class FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                return {"output": "ok", "returncode": 0}
+
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_task_env_overrides", {"default": {"cwd": str(repo)}})
+        monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local", "cwd": str(repo), "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda command, env_type, **kw: captured.append(kw["terminal_context"]) or {"approved": api.evaluate_project_scope(kw["terminal_context"]).status == "approved"})
+        from agent.delegation_context import SubagentExecutionIdentity, delegated_child_context
+        with delegated_child_context("child", SubagentExecutionIdentity("sa-child")):
+            result = json.loads(terminal_tool.terminal_tool(command="git -C . worktree prune", task_id="sa-child"))
+        assert result["exit_code"] == 0
+        assert captured[-1].execution_identity == "sa-child"
+        with delegated_child_context("child", SubagentExecutionIdentity("sa-other")):
+            denied = json.loads(terminal_tool.terminal_tool(command="git -C . worktree prune", task_id="sa-child"))
+        assert denied["status"] == "blocked"
+
+    def test_raw_mint_interfaces_and_activation_like_objects_fail_closed(self, scope_config, tmp_path):
+        api = _api()
+        repo, _, _ = scope_config
+        template = api.load_project_scope_templates()["release-scope"]
+        assert api.activate_project_scope("parent", "release-scope", delegated=False) is None
+        assert project_scope_approval.activate_project_scope_template("parent", template, _authority=object()) is None
+        assert project_scope_approval.grant_delegated_project_scope("parent", "child", "sa", delegated=True) is None
+        from hermes_cli import kanban_scope_lineage as lineage
+        with pytest.raises((PermissionError, TypeError)):
+            lineage.grant_root(tmp_path / "board.db", "board", "card", "worker", receipt=object())
+        assert _activate(api, "parent", "release-scope") is not None
+
 
 class TestScopedOperationEligibility:
     @pytest.mark.parametrize("command", [
@@ -256,7 +306,7 @@ class TestScopedOperationEligibility:
     def test_shell_compounds_interpreters_and_globs_are_never_scoped(self, scope_config, command):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         assert _decision_status(api.evaluate_project_scope(_context(api, command, "session-a", repo))) == "not_applicable"
 
     def test_existing_nonexisting_symlink_and_dotdot_escapes_are_denied(self, scope_config):
@@ -265,7 +315,7 @@ class TestScopedOperationEligibility:
         outside = repo.parent / "outside"
         outside.mkdir()
         (temporary / "escape").symlink_to(outside, target_is_directory=True)
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
 
         for destination in (temporary / "escape" / "existing", temporary / "escape" / "planned", temporary / ".." / "outside" / "planned"):
             command = f"git -C {repo} worktree add {destination} refs/heads/release/x"
@@ -274,7 +324,7 @@ class TestScopedOperationEligibility:
     def test_remote_ref_registry_and_force_constraints_fail_closed(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         denied = (
             f"git -C {repo} push origin refs/heads/release/x:refs/heads/main",
             f"git -C {repo} push --force origin refs/heads/release/x:refs/heads/release/x",
@@ -291,14 +341,14 @@ class TestAuditAndDelegation:
     def test_default_child_without_explicit_grant_remains_ordinary(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("parent", "release-scope")
+        _activate(api, "parent", "release-scope")
         context = _context(api, "git -C . worktree prune", "child", repo)
         assert _decision_status(api.evaluate_project_scope(context)) == "not_applicable"
 
     def test_explicit_delegation_grant_is_exact_and_transitive(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        root = api.activate_project_scope("parent", "release-scope")
+        root = _activate(api, "parent", "release-scope")
         first = project_scope_approval._mint_dispatcher_child_scope(
             "parent", "child", "sa-child", parent_subagent_id="sa-parent",
         )
@@ -322,7 +372,7 @@ class TestAuditAndDelegation:
 
     def test_descendant_cannot_cycle_back_to_root_or_an_ancestor(self, scope_config):
         api = _api()
-        api.activate_project_scope("parent", "release-scope")
+        _activate(api, "parent", "release-scope")
         first = project_scope_approval._mint_dispatcher_child_scope("parent", "child", "sa-child")
         assert first is not None
         second = project_scope_approval._mint_dispatcher_child_scope("child", "grandchild", "sa-grandchild", parent_grant_id=first.grant_id)
@@ -333,7 +383,7 @@ class TestAuditAndDelegation:
     def test_parent_revoke_cascades_before_child_execution_and_audit_is_redacted(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("parent", "release-scope")
+        _activate(api, "parent", "release-scope")
         grant = project_scope_approval._mint_dispatcher_child_scope("parent", "child", "sa-child")
         assert grant is not None
         assert api.revoke_project_scope("parent")
@@ -344,7 +394,7 @@ class TestAuditAndDelegation:
     def test_audit_payload_is_allowlisted_and_redacts_sensitive_command_content(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         command = f"git -C {repo} commit -S -m 'token=super-secret-message'"
         decision = api.evaluate_project_scope(_context(api, command, "session-a", repo))
 
@@ -359,13 +409,12 @@ class TestAuditAndDelegation:
     def test_delegated_child_may_consume_only_same_session_existing_activation(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("parent", "release-scope")
+        _activate(api, "parent", "release-scope")
         command = "git -C . worktree prune"
 
         assert _decision_status(api.evaluate_project_scope(_context(api, command, "parent", repo))) == "approved"
         assert _decision_status(api.evaluate_project_scope(_context(api, command, "child", repo))) == "not_applicable"
-        with pytest.raises((PermissionError, ValueError, RuntimeError)):
-            api.activate_project_scope("child", "release-scope", delegated=True)
+        assert api.activate_project_scope("child", "release-scope", delegated=True) is None
 
 
 class TestHighSecurityRevalidation:
@@ -382,7 +431,7 @@ class TestHighSecurityRevalidation:
     def test_git_push_uses_all_effective_pushurls_and_url_fallback(self, scope_config):
         api = _api()
         repo, _, _ = scope_config
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         command = "git -C . push origin refs/heads/release/x:refs/heads/release/x"
 
         self._write_remote(repo, url="https://git.example.test/team/repo")
@@ -400,7 +449,7 @@ class TestHighSecurityRevalidation:
         monkeypatch.setenv("DOCKER_CONFIG", str(docker_config))
         monkeypatch.delenv("DOCKER_HOST", raising=False)
         monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         context = _context(api, "docker build .", "session-a", repo)
 
         (docker_config / "config.json").write_text('{"currentContext": "default"}')
@@ -417,7 +466,7 @@ class TestHighSecurityRevalidation:
     def test_activation_snapshot_cannot_expand_after_same_id_config_edit(self, scope_config):
         api = _api()
         repo, temporary, state = scope_config
-        api.activate_project_scope("session-a", "release-scope")
+        _activate(api, "session-a", "release-scope")
         state["project_scope_templates"] = [_template(
             repo, temporary, docker_registry_prefixes=["registry.example.test/"],
         )]

@@ -8,7 +8,8 @@ from pathlib import Path
 
 from agent.redact import redact_sensitive_text
 from tools.project_scope_approval import (
-    ProjectScopeTemplate, _activate_confirmed_project_scope, get_active_project_scope,
+    ProjectScopeTemplate, _activate_confirmed_project_scope, _issue_trusted_confirmation,
+    _issue_trusted_kanban_grant, get_active_project_scope,
     load_project_scope_templates,
     project_scope_policy_digest, revoke_project_scope,
 )
@@ -109,7 +110,10 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
             return "Kanban scope confirmation is stale; board/card/assignee changed and no root grant was created."
         try:
             from hermes_cli.kanban_scope_lineage import grant_root
-            grant_root(board_db, board, card, assignee, activation)
+            receipt = _issue_trusted_kanban_grant(session_key, activation, board, card, assignee)
+            if receipt is None:
+                raise PermissionError("stale trusted confirmation")
+            grant_root(board_db, board, card, assignee, receipt=receipt)
         except Exception:
             return "Kanban scope root grant failed closed; no scope was granted."
         return f"Kanban root scope grant created for board `{redact_sensitive_text(board, force=True)}` card `{redact_sensitive_text(card, force=True)}`."
@@ -132,7 +136,9 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
         if (pending is None or pending[0] != parts[1] or pending[3] < time.monotonic()
                 or pending[2] != project_scope_policy_digest(pending[1])):
             return "Project scope confirmation is unavailable, expired, or mismatched; no scope was activated."
-        activation = _activate_confirmed_project_scope(session_key, pending[1])
+        activation = _activate_confirmed_project_scope(
+            _issue_trusted_confirmation(session_key, pending[1])
+        )
         return (f"Project scope `{pending[1].template_id}` activated for this session."
                 if activation is not None else "Project scope activation failed closed; no scope was activated.")
     return "Usage: /project-scope [list|activate <template-id>|confirm <token>|grant-kanban <board> <card>|confirm-kanban <token>|revoke]"
