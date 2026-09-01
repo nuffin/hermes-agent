@@ -67,9 +67,13 @@ def isolate_project_scope_registry():
     """Keep process-global session activations from crossing test boundaries."""
     with project_scope_approval._lock:
         project_scope_approval._active.clear()
+        project_scope_approval._delegated_grants.clear()
+        project_scope_approval._grant_by_recipient.clear()
     yield
     with project_scope_approval._lock:
         project_scope_approval._active.clear()
+        project_scope_approval._delegated_grants.clear()
+        project_scope_approval._grant_by_recipient.clear()
 
 
 @pytest.fixture
@@ -83,7 +87,7 @@ def scope_config(tmp_path, monkeypatch):
     return repo, temporary, state
 
 
-def _context(api, command: str, session: str, cwd: Path, *, workdir=None, backend="local"):
+def _context(api, command: str, session: str, cwd: Path, *, workdir=None, backend="local", execution_identity=None):
     return api.TerminalApprovalContext(
         raw_command=command,
         backend_type=backend,
@@ -92,6 +96,7 @@ def _context(api, command: str, session: str, cwd: Path, *, workdir=None, backen
         effective_cwd=str(cwd),
         background=False,
         has_host_access=False,
+        execution_identity=execution_identity,
     )
 
 
@@ -283,6 +288,49 @@ class TestScopedOperationEligibility:
 
 
 class TestAuditAndDelegation:
+    def test_default_child_without_explicit_grant_remains_ordinary(self, scope_config):
+        api = _api()
+        repo, _, _ = scope_config
+        api.activate_project_scope("parent", "release-scope")
+        context = _context(api, "git -C . worktree prune", "child", repo)
+        assert _decision_status(api.evaluate_project_scope(context)) == "not_applicable"
+
+    def test_explicit_delegation_grant_is_exact_and_transitive(self, scope_config):
+        api = _api()
+        repo, _, _ = scope_config
+        root = api.activate_project_scope("parent", "release-scope")
+        first = project_scope_approval.grant_delegated_project_scope(
+            "parent", "child", "sa-child", parent_subagent_id="sa-parent",
+        )
+        assert first is not None
+        second = project_scope_approval.derive_delegated_project_scope(
+            "child", "grandchild", "sa-grandchild", parent_grant_id=first.grant_id,
+        )
+        assert second is not None
+        assert second.policy_digest == root.policy_digest == first.policy_digest
+        assert _decision_status(api.evaluate_project_scope(_context(
+            api, "git -C . worktree prune", "grandchild", repo,
+            execution_identity="wrong-subagent",
+        ))) == "not_applicable"
+        assert _decision_status(api.evaluate_project_scope(_context(
+            api, "git -C . worktree prune", "grandchild", repo,
+            execution_identity="sa-grandchild",
+        ))) == "approved"
+        assert project_scope_approval.derive_delegated_project_scope(
+            "child", "other", "sa-other", parent_grant_id="wrong",
+        ) is None
+
+    def test_parent_revoke_cascades_before_child_execution_and_audit_is_redacted(self, scope_config):
+        api = _api()
+        repo, _, _ = scope_config
+        api.activate_project_scope("parent", "release-scope")
+        grant = project_scope_approval.grant_delegated_project_scope("parent", "child", "sa-child")
+        assert grant is not None
+        assert api.revoke_project_scope("parent")
+        decision = api.evaluate_project_scope(_context(api, "git -C . worktree prune", "child", repo))
+        assert _decision_status(decision) == "not_applicable"
+        payload = project_scope_approval.build_project_scope_audit_payload(decision)
+        assert "sa-child" not in json.dumps(payload)  # recipient IDs are not command data
     def test_audit_payload_is_allowlisted_and_redacts_sensitive_command_content(self, scope_config):
         api = _api()
         repo, _, _ = scope_config

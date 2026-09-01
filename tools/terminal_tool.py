@@ -3255,6 +3255,7 @@ def terminal_tool(
             raw_command=command, backend_type=env_type, session_key=session_key,
             supplied_workdir=workdir, effective_cwd=effective_cwd,
             background=background, has_host_access=_docker_has_host_access(config),
+            execution_identity=effective_task_id,
         )
         approval = _check_all_guards(
             command, env_type, has_host_access=_docker_has_host_access(config),

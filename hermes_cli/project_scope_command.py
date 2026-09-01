@@ -8,7 +8,8 @@ import time
 from agent.redact import redact_sensitive_text
 from tools.project_scope_approval import (
     ProjectScopeTemplate, activate_project_scope_template,
-    load_project_scope_templates, project_scope_policy_digest, revoke_project_scope,
+    grant_delegated_project_scope, load_project_scope_templates,
+    project_scope_policy_digest, revoke_project_scope,
 )
 
 _PENDING_TTL_SECONDS = 120.0
@@ -50,6 +51,16 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
     if action == "list":
         ids = sorted(templates)
         return "Configured project scopes: " + (", ".join(ids) if ids else "none")
+    if action == "grant-delegate" and len(parts) == 3:
+        # Exact runtime identifiers are issued by the trusted delegation
+        # runtime. This narrow interactive control cannot choose a template;
+        # it can only copy this session's already-confirmed immutable snapshot.
+        grant = grant_delegated_project_scope(session_key, parts[1], parts[2])
+        if grant is None:
+            return "Project scope delegate grant was rejected; no child scope was granted."
+        return ("Project scope delegate grant created for session "
+                f"`{redact_sensitive_text(parts[1], force=True)}` and subagent "
+                f"`{redact_sensitive_text(parts[2], force=True)}`.")
     if action == "revoke" and len(parts) == 1:
         return "Project scope revoked for this session." if revoke_project_scope(session_key) else "No active project scope for this session."
     if action == "activate" and len(parts) == 2 and parts[1] in templates:
@@ -72,4 +83,4 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
         activation = activate_project_scope_template(session_key, pending[1], delegated=False)
         return (f"Project scope `{pending[1].template_id}` activated for this session."
                 if activation is not None else "Project scope activation failed closed; no scope was activated.")
-    return "Usage: /project-scope [list|activate <template-id>|confirm <token>|revoke]"
+    return "Usage: /project-scope [list|activate <template-id>|confirm <token>|grant-delegate <child-session> <subagent-id>|revoke]"
