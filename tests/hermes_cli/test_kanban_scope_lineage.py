@@ -15,9 +15,11 @@ def _template(tmp_path: Path):
 
 
 def _activation(tmp_path: Path):
+    template = _template(tmp_path)
+    from tools.project_scope_approval import project_scope_policy_digest
     return type("Activation", (), {
-        "activation_id": "root-a", "session_key": "parent", "template": _template(tmp_path),
-        "policy_digest": "digest",
+        "activation_id": "root-a", "session_key": "parent", "template": template,
+        "policy_digest": project_scope_policy_digest(template),
     })()
 
 
@@ -90,6 +92,39 @@ def test_dispatcher_rejects_unknown_or_reassigned_root_card(tmp_path):
     finally:
         conn.close()
     assert lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock) is None
+
+
+def test_reassignment_after_bind_revokes_before_execution(tmp_path):
+    from hermes_cli import kanban_scope_lineage as lineage
+    db = tmp_path / "board.db"
+    task = _claimed_task(db, assignee="worker")
+    lineage.grant_root(db, "board-a", task.id, "worker", _activation(tmp_path))
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    conn = __import__("sqlite3").connect(db)
+    try:
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", ("replacement", task.id))
+        conn.commit()
+    finally:
+        conn.close()
+    assert lineage.resolve_attempt(db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref) is None
+    assert lineage.template_for_attempt(db, attempt) is None
+
+
+def test_tampered_snapshot_digest_fails_closed(tmp_path):
+    from hermes_cli import kanban_scope_lineage as lineage
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    lineage.grant_root(db, "board-a", task.id, "worker", _activation(tmp_path))
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    conn = __import__("sqlite3").connect(lineage.registry_path(db))
+    try:
+        conn.execute("UPDATE project_scope_roots SET template_json=? WHERE root_ref=?", ('{"template_id":"tampered"}', attempt.root_ref))
+        conn.commit()
+    finally:
+        conn.close()
+    assert lineage.template_for_attempt(db, attempt) is None
 
 
 def test_terminal_lookup_denies_archived_or_replayed_dispatch_attempt(tmp_path):
