@@ -3073,8 +3073,11 @@ from tools.project_scope_approval import (  # noqa: E402
     TerminalApprovalContext,
     activate_project_scope,
     build_project_scope_audit_payload,
+    derive_delegated_project_scope,
     evaluate_project_scope,
     get_active_project_scope,
+    get_delegated_project_scope,
+    grant_delegated_project_scope,
     load_project_scope_templates,
     revoke_project_scope,
 )
