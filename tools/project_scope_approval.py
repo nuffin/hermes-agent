@@ -746,15 +746,22 @@ def _kanban_scope_activation(context: TerminalApprovalContext) -> ActivatedProje
         raw_run = os.environ.get("HERMES_KANBAN_RUN_ID", "")
         board_db = os.environ.get("HERMES_KANBAN_DB", "")
         run_id = int(raw_run)
-        if not all((task_id, board, claim_lock, attempt_ref, board_db)) or run_id <= 0:
+        broker = os.environ.get("HERMES_KANBAN_SCOPE_BROKER", "")
+        if not all((task_id, board, claim_lock, attempt_ref, board_db, broker)) or run_id <= 0:
             return None
-        from hermes_cli.kanban_scope_lineage import resolve_attempt, template_for_attempt
-        attempt = resolve_attempt(board_db, board, task_id, run_id, claim_lock, attempt_ref)
-        snapshot = template_for_attempt(board_db, attempt) if attempt else None
-        if snapshot is None:
+        from hermes_cli.kanban_scope_lineage import request_broker_scope
+        scope = request_broker_scope(broker, attempt_ref)
+        if scope is None:
             return None
-        template, digest = snapshot
-        return ActivatedProjectScope(template.template_id, context.session_key, attempt.root_ref,
+        data = scope["template"]
+        from tools.project_scope_approval import ProjectScopeTemplate, project_scope_policy_digest
+        template = ProjectScopeTemplate(data["template_id"], tuple(Path(x) for x in data["repository_roots"]),
+            tuple(Path(x) for x in data["temporary_roots"]), tuple((x[0], tuple(x[1])) for x in data["git_remotes"]),
+            tuple(data["git_ref_rules"]), tuple(data["docker_registry_prefixes"]), frozenset(data["allowed_operations"]))
+        digest = scope["digest"]
+        if not isinstance(digest, str) or project_scope_policy_digest(template) != digest:
+            return None
+        return ActivatedProjectScope(template.template_id, context.session_key, scope["root_ref"],
                                      time.time(), template, digest)
     except Exception:
         return None
