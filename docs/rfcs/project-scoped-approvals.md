@@ -42,7 +42,15 @@ reestablishes them; there is no implicit restore from a Kanban row. On Unix the
 parent dispatcher also owns a run-local private (0700 directory, 0600 socket)
 liveness broker. Workers receive only an opaque attempt reference and broker
 address; the broker verifies kernel peer PID credentials against the actual
-post-spawn direct child registration, then revalidates the exact root session,
+post-spawn direct-child registration and, on Linux, binds that PID to its
+`/proc` process-start identity so a recycled numeric PID is rejected. The
+worker reaper atomically removes every broker mapping by the complete worker
+lifecycle (board, card, run, claim lock, and opaque attempt), closes its socket
+and thread, and retires that exact durable attempt. It retires the root only
+when no active sibling attempt remains. Exit-before-registration is denied and
+retired rather than becoming a late broker registration. The broker also
+self-closes and retires on an observable stale/exited/recycled child as defense
+in depth. The broker then revalidates the exact root session,
 activation ID, immutable snapshot digest, board/card/run/claim/assignee and
 active state in the parent process on every terminal lookup. The socket accepts
 a bounded typed resolve request only; it is not a policy, mint, grant, revoke,
