@@ -2147,6 +2147,21 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    # Only the dispatcher owns child session/subagent identities. Mint here,
+    # after construction, never from prompt/caller-provided delegation fields.
+    try:
+        from tools.project_scope_approval import _mint_dispatcher_child_scope, get_delegated_project_scope
+        parent_session = str(getattr(parent_agent, "session_id", "") or "")
+        child_session = str(getattr(child, "session_id", "") or "")
+        parent_grant = get_delegated_project_scope(parent_session)
+        child._project_scope_grant = (
+            _mint_dispatcher_child_scope(parent_session, child_session, subagent_id,
+                parent_subagent_id=parent_subagent_id,
+                parent_grant_id=parent_grant.grant_id if parent_grant else None)
+            if parent_session and child_session else None
+        )
+    except Exception:
+        child._project_scope_grant = None
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.

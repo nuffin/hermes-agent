@@ -8,8 +8,8 @@ from pathlib import Path
 
 from agent.redact import redact_sensitive_text
 from tools.project_scope_approval import (
-    ProjectScopeTemplate, activate_project_scope_template, get_active_project_scope,
-    grant_delegated_project_scope, load_project_scope_templates,
+    ProjectScopeTemplate, _activate_confirmed_project_scope, get_active_project_scope,
+    load_project_scope_templates,
     project_scope_policy_digest, revoke_project_scope,
 )
 
@@ -54,16 +54,8 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
     if action == "list":
         ids = sorted(templates)
         return "Configured project scopes: " + (", ".join(ids) if ids else "none")
-    if action == "grant-delegate" and len(parts) == 3:
-        # Exact runtime identifiers are issued by the trusted delegation
-        # runtime. This narrow interactive control cannot choose a template;
-        # it can only copy this session's already-confirmed immutable snapshot.
-        grant = grant_delegated_project_scope(session_key, parts[1], parts[2])
-        if grant is None:
-            return "Project scope delegate grant was rejected; no child scope was granted."
-        return ("Project scope delegate grant created for session "
-                f"`{redact_sensitive_text(parts[1], force=True)}` and subagent "
-                f"`{redact_sensitive_text(parts[2], force=True)}`.")
+    if action == "grant-delegate":
+        return "Project scope child grants are issued only by the delegation runtime."
     if action == "grant-kanban" and len(parts) == 3:
         # The interactive parent names a concrete board/card; no task text is
         # authority.  Snapshot the active immutable activation for confirmation.
@@ -140,7 +132,7 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
         if (pending is None or pending[0] != parts[1] or pending[3] < time.monotonic()
                 or pending[2] != project_scope_policy_digest(pending[1])):
             return "Project scope confirmation is unavailable, expired, or mismatched; no scope was activated."
-        activation = activate_project_scope_template(session_key, pending[1], delegated=False)
+        activation = _activate_confirmed_project_scope(session_key, pending[1])
         return (f"Project scope `{pending[1].template_id}` activated for this session."
                 if activation is not None else "Project scope activation failed closed; no scope was activated.")
-    return "Usage: /project-scope [list|activate <template-id>|confirm <token>|grant-kanban <board> <card>|confirm-kanban <token>|grant-delegate <child-session> <subagent-id>|revoke]"
+    return "Usage: /project-scope [list|activate <template-id>|confirm <token>|grant-kanban <board> <card>|confirm-kanban <token>|revoke]"
