@@ -7,7 +7,7 @@ import time
 
 from agent.redact import redact_sensitive_text
 from tools.project_scope_approval import (
-    ProjectScopeTemplate, activate_project_scope_template,
+    ProjectScopeTemplate, activate_project_scope_template, get_active_project_scope,
     grant_delegated_project_scope, load_project_scope_templates,
     project_scope_policy_digest, revoke_project_scope,
 )
@@ -15,6 +15,8 @@ from tools.project_scope_approval import (
 _PENDING_TTL_SECONDS = 120.0
 _lock = threading.RLock()
 _pending: dict[str, tuple[str, ProjectScopeTemplate, str, float]] = {}
+# session -> token, board-db path, board, card, assignee, immutable activation, expiry
+_pending_kanban: dict[str, tuple[str, str, str, str, str | None, object, float]] = {}
 
 
 def _summary(template: ProjectScopeTemplate) -> str:
@@ -61,6 +63,50 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
         return ("Project scope delegate grant created for session "
                 f"`{redact_sensitive_text(parts[1], force=True)}` and subagent "
                 f"`{redact_sensitive_text(parts[2], force=True)}`.")
+    if action == "grant-kanban" and len(parts) == 3:
+        # The interactive parent names a concrete board/card; no task text is
+        # authority.  Snapshot the active immutable activation for confirmation.
+        activation = get_active_project_scope(session_key)
+        if activation is None:
+            return "Kanban scope grant was rejected: activate a project scope in this parent session first."
+        board, card = parts[1], parts[2]
+        try:
+            from hermes_cli import kanban_db as kb
+            conn = kb.connect(board=board)
+            try:
+                task = kb.get_task(conn, card)
+                board_db = str(kb.kanban_db_path(board=board))
+            finally:
+                conn.close()
+        except Exception:
+            task = None
+            board_db = ""
+        if task is None:
+            return "Kanban scope grant was rejected: board/card identity was not found."
+        token = secrets.token_urlsafe(18)
+        with _lock:
+            _pending_kanban[session_key] = (token, board_db, board, card, task.assignee, activation,
+                                             time.monotonic() + _PENDING_TTL_SECONDS)
+        identity = f"board `{redact_sensitive_text(board, force=True)}`, card `{redact_sensitive_text(card, force=True)}`, assignee `{redact_sensitive_text(str(task.assignee or 'unassigned'), force=True)}`"
+        return (f"{_summary(activation.template)}\nAuthorize this exact Kanban root: {identity}.\n"
+                f"Descendants inherit only dispatcher-verified lineage; workers cannot grant or revoke it.\n"
+                f"To confirm, run: /project-scope confirm-kanban {token}")
+    if action == "confirm-kanban" and len(parts) == 2:
+        with _lock:
+            pending_kanban = _pending_kanban.pop(session_key, None)
+        if pending_kanban is None or pending_kanban[0] != parts[1] or pending_kanban[6] < time.monotonic():
+            return "Kanban scope confirmation is unavailable, expired, or mismatched; no root grant was created."
+        token, board_db, board, card, assignee, activation, _expiry = pending_kanban
+        # Replacement/revoke between review and confirmation invalidates it.
+        live = get_active_project_scope(session_key)
+        if live is None or live.activation_id != activation.activation_id:
+            return "Kanban scope confirmation is stale; no root grant was created."
+        try:
+            from hermes_cli.kanban_scope_lineage import grant_root
+            grant_root(board_db, board, card, assignee, activation)
+        except Exception:
+            return "Kanban scope root grant failed closed; no scope was granted."
+        return f"Kanban root scope grant created for board `{redact_sensitive_text(board, force=True)}` card `{redact_sensitive_text(card, force=True)}`."
     if action == "revoke" and len(parts) == 1:
         return "Project scope revoked for this session." if revoke_project_scope(session_key) else "No active project scope for this session."
     if action == "activate" and len(parts) == 2 and parts[1] in templates:
@@ -83,4 +129,4 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
         activation = activate_project_scope_template(session_key, pending[1], delegated=False)
         return (f"Project scope `{pending[1].template_id}` activated for this session."
                 if activation is not None else "Project scope activation failed closed; no scope was activated.")
-    return "Usage: /project-scope [list|activate <template-id>|confirm <token>|grant-delegate <child-session> <subagent-id>|revoke]"
+    return "Usage: /project-scope [list|activate <template-id>|confirm <token>|grant-kanban <board> <card>|confirm-kanban <token>|grant-delegate <child-session> <subagent-id>|revoke]"
