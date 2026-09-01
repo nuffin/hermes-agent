@@ -42,6 +42,7 @@ class TerminalApprovalContext:
     effective_cwd: str
     background: bool
     has_host_access: bool
+    execution_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,22 @@ class ActivatedProjectScope:
 
 
 @dataclass(frozen=True)
+class DelegatedProjectScopeGrant:
+    """Immutable, runtime-identity-bound parent authorization edge."""
+    grant_id: str
+    root_activation_id: str
+    root_session_key: str
+    recipient_session_key: str
+    recipient_subagent_id: str
+    parent_grant_id: str | None
+    parent_subagent_id: str | None
+    template: ProjectScopeTemplate
+    policy_digest: str
+    depth: int
+    issued_at: float
+
+
+@dataclass(frozen=True)
 class ScopeDecision:
     status: str  # not_applicable | denied | approved
     operation: str | None = None
@@ -80,6 +97,9 @@ class ScopeDecision:
 
 _lock = threading.RLock()
 _active: dict[str, ActivatedProjectScope] = {}
+_delegated_grants: dict[str, DelegatedProjectScopeGrant] = {}
+_grant_by_recipient: dict[str, str] = {}
+_MAX_LINEAGE_DEPTH = 8
 
 
 def _policy_digest(template: ProjectScopeTemplate) -> str:
@@ -283,6 +303,66 @@ def clear_project_scope_session(session_key: str) -> None:
 def get_active_project_scope(session_key: str) -> ActivatedProjectScope | None:
     with _lock:
         return _active.get(session_key)
+
+
+def grant_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
+                                  recipient_subagent_id: str, *,
+                                  parent_subagent_id: str | None = None) -> DelegatedProjectScopeGrant | None:
+    """Create an explicit root edge for one trusted delegate runtime identity."""
+    if not all(isinstance(value, str) and value for value in
+               (parent_session_key, recipient_session_key, recipient_subagent_id)):
+        return None
+    if parent_session_key == recipient_session_key:
+        return None
+    with _lock:
+        root = _active.get(parent_session_key)
+        if root is None or recipient_session_key in _grant_by_recipient:
+            return None
+        grant = DelegatedProjectScopeGrant(
+            uuid.uuid4().hex, root.activation_id, root.session_key, recipient_session_key,
+            recipient_subagent_id, None, parent_subagent_id, root.template,
+            root.policy_digest, 1, time.time(),
+        )
+        _delegated_grants[grant.grant_id] = grant
+        _grant_by_recipient[recipient_session_key] = grant.grant_id
+    _observe("project_scope_root_grant", root)
+    return grant
+
+
+def derive_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
+                                   recipient_subagent_id: str, *, parent_grant_id: str) -> DelegatedProjectScopeGrant | None:
+    """Derive an exact immutable descendant; never a new root or template."""
+    if not all(isinstance(value, str) and value for value in
+               (parent_session_key, recipient_session_key, recipient_subagent_id, parent_grant_id)):
+        return None
+    if parent_session_key == recipient_session_key:
+        return None
+    with _lock:
+        parent = _delegated_grants.get(parent_grant_id)
+        root = _active.get(parent.root_session_key) if parent else None
+        if (parent is None or root is None or parent.recipient_session_key != parent_session_key
+                or parent.depth >= _MAX_LINEAGE_DEPTH or recipient_session_key in _grant_by_recipient):
+            return None
+        grant = DelegatedProjectScopeGrant(
+            uuid.uuid4().hex, parent.root_activation_id, parent.root_session_key,
+            recipient_session_key, recipient_subagent_id, parent.grant_id,
+            parent.recipient_subagent_id, parent.template, parent.policy_digest,
+            parent.depth + 1, time.time(),
+        )
+        _delegated_grants[grant.grant_id] = grant
+        _grant_by_recipient[recipient_session_key] = grant.grant_id
+    _observe("project_scope_derived_grant", root)
+    return grant
+
+
+def get_delegated_project_scope(session_key: str) -> DelegatedProjectScopeGrant | None:
+    """Live lookup: revoked/replaced roots make all descendant grants inert."""
+    with _lock:
+        grant = _delegated_grants.get(_grant_by_recipient.get(session_key, ""))
+        root = _active.get(grant.root_session_key) if grant else None
+        if grant is None or root is None or root.activation_id != grant.root_activation_id:
+            return None
+        return grant
 
 
 def _parse_argv(command: str) -> list[str] | None:
@@ -511,6 +591,15 @@ def _decorate_decision(decision: ScopeDecision, activation: ActivatedProjectScop
 def evaluate_project_scope(context: TerminalApprovalContext) -> ScopeDecision:
     """Evaluate the immutable activation snapshot; no active scope is inert."""
     activation = get_active_project_scope(context.session_key)
+    if activation is None:
+        grant = get_delegated_project_scope(context.session_key)
+        if grant is not None and context.execution_identity == grant.recipient_subagent_id:
+            # Preserve the child session in decision/audit while binding every
+            # policy field to the original immutable root snapshot.
+            activation = ActivatedProjectScope(
+                grant.template.template_id, context.session_key, grant.root_activation_id,
+                grant.issued_at, grant.template, grant.policy_digest,
+            )
     if activation is None:
         return ScopeDecision("not_applicable")
     argv = _parse_argv(context.raw_command)

@@ -13,6 +13,23 @@ Repeated confirmation for bounded release-adjacent work is costly, while broad c
 
 A project scope is a reusable, **inert** template under `approvals.project_scope_templates`. Configuration declares intent only: it does not activate on startup, matching CWD, command text, task, prompt, skill, delegation, or child-worker activity.
 
+## Delegation and Kanban lineage
+
+An activated parent session does **not** automatically authorize delegates or
+Kanban workers. A trusted interactive parent must make a separate, explicit
+root grant for the exact runtime recipient. The approval registry binds a
+direct delegate grant to its child session and subagent identity; descendants
+may only derive the same immutable policy digest through that verified edge.
+They cannot select a template, renew, replace, transfer, widen, or create an
+unrelated root. Lineages are depth-bounded and live-checked at guard and
+execution time, so root revocation, session clear, expiry, or a broken parent
+edge makes all descendants inert before execution.
+
+Kanban cards are noninteractive and inert without an explicit parent root
+grant. A future card binding must be made by the dispatcher against the exact
+board/card and each worker attempt's task run and claim lock; card text,
+comments, worker profile data, and environment values are never authority.
+
 The following are not authority sources and cannot select, activate, extend, or renew a policy: task directories or titles, prompt text, skills, agent/delegation instructions, model output, turn environment variables, child agents, `task_id`, or a command-embedded `cd`.
 
 Templates have a unique lowercase-kebab-case ASCII `id`; absolute, accessible directory roots; canonical normalized remote URL prefixes; restricted full-ref rules; normalized registry/namespace prefixes ending in `/`; and a closed `allowed_operations` enum. Empty, relative, inaccessible, non-directory, duplicate-after-canonicalization, malformed, or unknown values invalidate that template. Unknown operation IDs fail closed.
