@@ -176,3 +176,62 @@ def test_temp_home_worker_binding_blocks_after_parent_revoke(tmp_path, monkeypat
     assert evaluate_project_scope(context).status == "approved"
     lineage.revoke_activation("root-a", registry_path=lineage.registry_path(db))
     assert evaluate_project_scope(context).status == "not_applicable"
+
+
+def test_replaced_parent_activation_revokes_prebound_attempt_before_terminal_guard(tmp_path):
+    from hermes_cli import kanban_scope_lineage as lineage
+    from tools import project_scope_approval as scope
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id and task.claim_lock
+    activation = _activation(tmp_path)
+    _grant(db, "board-a", task.id, "worker", activation)
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    replacement = scope.ActivatedProjectScope(
+        activation.template_id, activation.session_key, "root-b", 1, activation.template,
+        activation.policy_digest, "replacement-confirmation",
+    )
+    with scope._lock:
+        scope._active[activation.session_key] = replacement
+    assert lineage.resolve_attempt(
+        db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
+    ) is None
+    assert lineage.template_for_attempt(db, attempt) is None
+
+
+def test_session_clear_revokes_prebound_attempt_without_registry_revoke_path(tmp_path):
+    from hermes_cli import kanban_scope_lineage as lineage
+    from tools import project_scope_approval as scope
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id and task.claim_lock
+    activation = _activation(tmp_path)
+    _grant(db, "board-a", task.id, "worker", activation)
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    lineage._known_registry_paths.clear()
+    scope.clear_project_scope_session(activation.session_key)
+    assert lineage.resolve_attempt(
+        db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
+    ) is None
+
+
+def test_fresh_approvals_process_fails_closed_for_durable_root(tmp_path):
+    from hermes_cli import kanban_scope_lineage as lineage
+    from tools import project_scope_approval as scope
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id and task.claim_lock
+    activation = _activation(tmp_path)
+    _grant(db, "board-a", task.id, "worker", activation)
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    # A daemon restart has no activation registry. The durable row is metadata,
+    # never an authority source that can restore this entry.
+    with scope._lock:
+        scope._active.clear()
+    assert lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock) is None
+    assert lineage.resolve_attempt(
+        db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
+    ) is None
