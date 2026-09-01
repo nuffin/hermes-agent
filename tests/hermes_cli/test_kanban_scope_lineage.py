@@ -175,7 +175,8 @@ def test_temp_home_worker_binding_blocks_after_parent_revoke(tmp_path, monkeypat
     monkeypatch.setenv("HERMES_KANBAN_SCOPE_ATTEMPT", attempt.attempt_ref)
     repo = activation.template.repository_roots[0]
     context = TerminalApprovalContext(f"git -C {repo} commit -S -m ok", "local", "worker", str(repo), str(repo), False, True)
-    assert evaluate_project_scope(context).status == "approved"
+    # A process holding only durable/env metadata is never an authority source.
+    assert evaluate_project_scope(context).status == "not_applicable"
     lineage.revoke_activation("root-a", registry_path=lineage.registry_path(db))
     assert evaluate_project_scope(context).status == "not_applicable"
 
@@ -245,3 +246,50 @@ def test_fresh_approvals_process_fails_closed_for_durable_root(tmp_path):
     assert lineage.resolve_attempt(
         db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
     ) is None
+
+
+def test_dispatcher_broker_allows_exact_child_then_rechecks_live_parent(tmp_path):
+    """A real child gets only opaque broker routing data and is rechecked."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from hermes_cli import kanban_scope_lineage as lineage
+    from tools import project_scope_approval as scope
+
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    activation = _activation(tmp_path)
+    _grant(db, "board-a", task.id, "worker", activation)
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    broker = lineage.DispatcherScopeBroker(db, "board-a", attempt)
+    broker.start()
+    code = textwrap.dedent("""
+        import os, sys
+        from tools.project_scope_approval import TerminalApprovalContext, evaluate_project_scope
+        repo = os.environ['TEST_REPO']
+        def check():
+            c = TerminalApprovalContext('git -C ' + repo + ' commit -S -m ok', 'local', 'worker', repo, repo, False, True)
+            return evaluate_project_scope(c).status
+        print('before=' + check(), flush=True)
+        sys.stdin.readline()
+        print('after=' + check(), flush=True)
+    """)
+    env = {**os.environ, "HERMES_KANBAN_SCOPE_ATTEMPT": attempt.attempt_ref,
+           "HERMES_KANBAN_SCOPE_BROKER": broker.endpoint, "HERMES_KANBAN_DB": str(db),
+           "HERMES_KANBAN_BOARD": "board-a", "HERMES_KANBAN_TASK": task.id,
+           "HERMES_KANBAN_RUN_ID": str(task.current_run_id), "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock,
+           "TEST_REPO": str(activation.template.repository_roots[0])}
+    proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True, env=env)
+    try:
+        broker.register_child(proc.pid)
+        assert proc.stdout.readline().strip() == "before=approved"
+        assert lineage.request_broker_scope(broker.endpoint, attempt.attempt_ref) is None
+        scope.revoke_project_scope(activation.session_key)
+        proc.stdin.write("go\n"); proc.stdin.flush()
+        assert proc.stdout.readline().strip() == "after=not_applicable"
+    finally:
+        proc.kill(); proc.wait()
+        broker.close()
