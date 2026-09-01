@@ -100,6 +100,8 @@ _active: dict[str, ActivatedProjectScope] = {}
 _delegated_grants: dict[str, DelegatedProjectScopeGrant] = {}
 _grant_by_recipient: dict[str, str] = {}
 _MAX_LINEAGE_DEPTH = 8
+_TRUSTED_UI_MINT = object()
+_DISPATCHER_MINT = object()
 
 
 def _policy_digest(template: ProjectScopeTemplate) -> str:
@@ -254,10 +256,11 @@ def project_scope_summary(template_id: str) -> dict[str, object] | None:
 
 def activate_project_scope_template(
     session_key: str, template: ProjectScopeTemplate, *, delegated: bool = False,
+    _authority: object | None = None,
 ) -> ActivatedProjectScope | None:
-    """Activate one already-validated immutable template for a trusted session."""
-    if delegated:
-        raise PermissionError("delegated callers cannot activate a project scope")
+    """Raw template activation is reserved for the confirmed trusted UI path."""
+    if delegated or _authority is not _TRUSTED_UI_MINT:
+        return None
     if not isinstance(session_key, str) or not session_key:
         return None
     activation = ActivatedProjectScope(
@@ -284,7 +287,11 @@ def activate_project_scope(session_key: str, template_id: str, *, delegated: boo
     template = load_project_scope_templates().get(template_id)
     if template is None:
         return None
-    return activate_project_scope_template(session_key, template, delegated=delegated)
+    return _activate_confirmed_project_scope(session_key, template)
+
+
+def _activate_confirmed_project_scope(session_key: str, template: ProjectScopeTemplate) -> ActivatedProjectScope | None:
+    return activate_project_scope_template(session_key, template, _authority=_TRUSTED_UI_MINT)
 
 
 def revoke_project_scope(session_key: str) -> bool:
@@ -312,8 +319,11 @@ def get_active_project_scope(session_key: str) -> ActivatedProjectScope | None:
 
 def grant_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
                                   recipient_subagent_id: str, *,
-                                  parent_subagent_id: str | None = None) -> DelegatedProjectScopeGrant | None:
-    """Create an explicit root edge for one trusted delegate runtime identity."""
+                                  parent_subagent_id: str | None = None,
+                                  _authority: object | None = None) -> DelegatedProjectScopeGrant | None:
+    """Create a root edge only for the dispatcher-owned child constructor."""
+    if _authority is not _DISPATCHER_MINT:
+        return None
     if not all(isinstance(value, str) and value for value in
                (parent_session_key, recipient_session_key, recipient_subagent_id)):
         return None
@@ -335,8 +345,11 @@ def grant_delegated_project_scope(parent_session_key: str, recipient_session_key
 
 
 def derive_delegated_project_scope(parent_session_key: str, recipient_session_key: str,
-                                   recipient_subagent_id: str, *, parent_grant_id: str) -> DelegatedProjectScopeGrant | None:
+                                   recipient_subagent_id: str, *, parent_grant_id: str,
+                                   _authority: object | None = None) -> DelegatedProjectScopeGrant | None:
     """Derive an exact immutable descendant; never a new root or template."""
+    if _authority is not _DISPATCHER_MINT:
+        return None
     if not all(isinstance(value, str) and value for value in
                (parent_session_key, recipient_session_key, recipient_subagent_id, parent_grant_id)):
         return None
@@ -346,8 +359,21 @@ def derive_delegated_project_scope(parent_session_key: str, recipient_session_ke
         parent = _delegated_grants.get(parent_grant_id)
         root = _active.get(parent.root_session_key) if parent else None
         if (parent is None or root is None or parent.recipient_session_key != parent_session_key
-                or parent.depth >= _MAX_LINEAGE_DEPTH or recipient_session_key in _grant_by_recipient):
+                or parent.depth >= _MAX_LINEAGE_DEPTH or recipient_session_key in _grant_by_recipient
+                or recipient_session_key == parent.root_session_key
+                or recipient_session_key in _active):
             return None
+        # A recipient cannot be the root or any live ancestor, even if a stale
+        # registry mapping was cleared. Walk only trusted immutable grant edges.
+        ancestor = parent
+        for _ in range(_MAX_LINEAGE_DEPTH):
+            if recipient_session_key == ancestor.recipient_session_key:
+                return None
+            if ancestor.parent_grant_id is None:
+                break
+            ancestor = _delegated_grants.get(ancestor.parent_grant_id)
+            if ancestor is None:
+                return None
         grant = DelegatedProjectScopeGrant(
             uuid.uuid4().hex, parent.root_activation_id, parent.root_session_key,
             recipient_session_key, recipient_subagent_id, parent.grant_id,
@@ -358,6 +384,23 @@ def derive_delegated_project_scope(parent_session_key: str, recipient_session_ke
         _grant_by_recipient[recipient_session_key] = grant.grant_id
     _observe("project_scope_derived_grant", root)
     return grant
+
+
+def _mint_dispatcher_child_scope(parent_session_key: str, recipient_session_key: str,
+                                 recipient_subagent_id: str, *, parent_subagent_id: str | None = None,
+                                 parent_grant_id: str | None = None) -> DelegatedProjectScopeGrant | None:
+    """Mint only from runtime-issued parent/child identities."""
+    if parent_grant_id:
+        return derive_delegated_project_scope(parent_session_key, recipient_session_key, recipient_subagent_id, parent_grant_id=parent_grant_id, _authority=_DISPATCHER_MINT)
+    return grant_delegated_project_scope(parent_session_key, recipient_session_key, recipient_subagent_id, parent_subagent_id=parent_subagent_id, _authority=_DISPATCHER_MINT)
+
+
+def clear_delegated_project_scope(session_key: str, recipient_subagent_id: str) -> None:
+    with _lock:
+        grant = _delegated_grants.get(_grant_by_recipient.get(session_key, ""))
+        if grant is not None and grant.recipient_subagent_id == recipient_subagent_id:
+            _grant_by_recipient.pop(session_key, None)
+            _delegated_grants.pop(grant.grant_id, None)
 
 
 def get_delegated_project_scope(session_key: str) -> DelegatedProjectScopeGrant | None:
