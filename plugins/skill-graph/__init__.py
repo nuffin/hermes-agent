@@ -651,8 +651,8 @@ def _call_llm_for_tagging(prompt: str) -> dict[str, Any] | None:
 
         config = load_config()
         sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-        auto_tag_cfg = sg_config.get("auto_tag", {}) if isinstance(sg_config, dict) else {}
-        preferred_provider = auto_tag_cfg.get("provider", "")
+        enrichment_cfg = sg_config.get("enrichment", {}) if isinstance(sg_config, dict) else {}
+        preferred_provider = enrichment_cfg.get("provider", "")
 
         def _resolve_provider(pid: str) -> tuple[str, str] | None:
             """Return (api_key, base_url) for a provider, or None."""
@@ -697,11 +697,15 @@ def _call_llm_for_tagging(prompt: str) -> dict[str, Any] | None:
             logger.warning("skill-graph: auto-tag skipped — no provider with API key configured")
             return None
 
-        # Resolve model: config model.default > hardcoded fallback
+        # Resolve model: enrichment config > model.default > hardcoded fallback
         try:
             config = load_config()
+            sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
+            enrichment_cfg = sg_config.get("enrichment", {}) if isinstance(sg_config, dict) else {}
             model_cfg = config.get("model", {})
-            model_name = model_cfg.get("default", "") if isinstance(model_cfg, dict) else ""
+            model_name = enrichment_cfg.get("model", "")
+            if not model_name:
+                model_name = model_cfg.get("default", "") if isinstance(model_cfg, dict) else ""
         except Exception:
             model_name = ""
         if not model_name:
