@@ -26,9 +26,20 @@ execution time, so root revocation, session clear, expiry, or a broken parent
 edge makes all descendants inert before execution.
 
 Kanban cards are noninteractive and inert without an explicit parent root
-grant. A future card binding must be made by the dispatcher against the exact
-board/card and each worker attempt's task run and claim lock; card text,
-comments, worker profile data, and environment values are never authority.
+grant. The trusted `/project-scope grant-kanban <board> <card>` surface first
+renders the redacted immutable policy summary plus exact board/card/assignee
+identity, then requires `confirm-kanban <token>`. Confirmation writes a durable
+registry record adjacent to the board DB; it stores a policy snapshot/digest and
+opaque IDs only, never card text or a model-facing policy token. The dispatcher
+mints a fresh opaque attempt reference after each claim and binds it to exact
+board, card, run ID, and claim lock. Same-card retries mint a new reference;
+replay, moved-board, lock/run mismatch, reassignment, ambiguous parent lineage,
+cycle, and depth overflow fail closed. A direct, uniquely verified parent card
+may pass the identical snapshot/digest to a descendant automatically, but this
+does not grant child ownership or card mutation. Parent activation replacement,
+revoke/session clear, root cancellation, claim loss, or worker exit makes the
+root and every derived attempt inert; lookup happens at every terminal guard and
+again immediately before execution.
 
 The following are not authority sources and cannot select, activate, extend, or renew a policy: task directories or titles, prompt text, skills, agent/delegation instructions, model output, turn environment variables, child agents, `task_id`, or a command-embedded `cd`.
 

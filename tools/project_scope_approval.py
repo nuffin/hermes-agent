@@ -291,6 +291,11 @@ def revoke_project_scope(session_key: str) -> bool:
     with _lock:
         activation = _active.pop(session_key, None)
     if activation is not None:
+        try:
+            from hermes_cli.kanban_scope_lineage import revoke_activation_everywhere
+            revoke_activation_everywhere(activation.activation_id)
+        except Exception:
+            pass
         _observe("project_scope_revoked", activation)
         return True
     return False
@@ -588,6 +593,33 @@ def _decorate_decision(decision: ScopeDecision, activation: ActivatedProjectScop
     )
 
 
+def _kanban_scope_activation(context: TerminalApprovalContext) -> ActivatedProjectScope | None:
+    """Resolve an opaque dispatcher attempt ref; env values are only lookup keys."""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        if not is_dispatcher_owned_worker_context():
+            return None
+        task_id = os.environ.get("HERMES_KANBAN_TASK", "")
+        board = os.environ.get("HERMES_KANBAN_BOARD", "")
+        claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
+        attempt_ref = os.environ.get("HERMES_KANBAN_SCOPE_ATTEMPT", "")
+        raw_run = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+        board_db = os.environ.get("HERMES_KANBAN_DB", "")
+        run_id = int(raw_run)
+        if not all((task_id, board, claim_lock, attempt_ref, board_db)) or run_id <= 0:
+            return None
+        from hermes_cli.kanban_scope_lineage import resolve_attempt, template_for_attempt
+        attempt = resolve_attempt(board_db, board, task_id, run_id, claim_lock, attempt_ref)
+        snapshot = template_for_attempt(board_db, attempt) if attempt else None
+        if snapshot is None:
+            return None
+        template, digest = snapshot
+        return ActivatedProjectScope(template.template_id, context.session_key, attempt.root_ref,
+                                     time.time(), template, digest)
+    except Exception:
+        return None
+
+
 def evaluate_project_scope(context: TerminalApprovalContext) -> ScopeDecision:
     """Evaluate the immutable activation snapshot; no active scope is inert."""
     activation = get_active_project_scope(context.session_key)
@@ -600,6 +632,8 @@ def evaluate_project_scope(context: TerminalApprovalContext) -> ScopeDecision:
                 grant.template.template_id, context.session_key, grant.root_activation_id,
                 grant.issued_at, grant.template, grant.policy_digest,
             )
+    if activation is None:
+        activation = _kanban_scope_activation(context)
     if activation is None:
         return ScopeDecision("not_applicable")
     argv = _parse_argv(context.raw_command)
