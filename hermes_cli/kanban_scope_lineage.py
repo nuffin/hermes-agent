@@ -161,13 +161,31 @@ def bind_attempt(board_db: str | Path, board: str, task_id: str, run_id: int, cl
         if source is None or source[1] > max_depth:
             return None
         row, depth = source
-        with conn:
-            conn.execute("UPDATE project_scope_attempts SET active=0 WHERE board=? AND task_id=?", (board, task_id))
-            attempt = KanbanScopeAttempt(uuid.uuid4().hex, row["root_ref"], board, task_id, run_id, claim_lock, depth)
-            conn.execute("""INSERT INTO project_scope_attempts
-              (attempt_ref,root_ref,board,task_id,run_id,claim_lock,depth,active,issued_at)
-              VALUES (?,?,?,?,?,?,?,1,?)""",
-              (attempt.attempt_ref, attempt.root_ref, board, task_id, run_id, claim_lock, depth, int(time.time())))
+        existing = conn.execute("""SELECT * FROM project_scope_attempts
+          WHERE board=? AND task_id=? AND run_id=?""", (board, task_id, run_id)).fetchone()
+        if existing is not None:
+            if (existing["active"] and existing["root_ref"] == row["root_ref"]
+                    and existing["claim_lock"] == claim_lock and int(existing["depth"]) == depth):
+                return KanbanScopeAttempt(existing["attempt_ref"], existing["root_ref"], board, task_id,
+                                          run_id, claim_lock, depth)
+            return None
+        try:
+            with conn:
+                conn.execute("UPDATE project_scope_attempts SET active=0 WHERE board=? AND task_id=?", (board, task_id))
+                attempt = KanbanScopeAttempt(uuid.uuid4().hex, row["root_ref"], board, task_id, run_id, claim_lock, depth)
+                conn.execute("""INSERT INTO project_scope_attempts
+                  (attempt_ref,root_ref,board,task_id,run_id,claim_lock,depth,active,issued_at)
+                  VALUES (?,?,?,?,?,?,?,1,?)""",
+                  (attempt.attempt_ref, attempt.root_ref, board, task_id, run_id, claim_lock, depth, int(time.time())))
+        except sqlite3.IntegrityError:
+            # A concurrent dispatcher may have claimed this exact run first.
+            existing = conn.execute("""SELECT * FROM project_scope_attempts
+              WHERE board=? AND task_id=? AND run_id=?""", (board, task_id, run_id)).fetchone()
+            if (existing is not None and existing["active"] and existing["root_ref"] == row["root_ref"]
+                    and existing["claim_lock"] == claim_lock and int(existing["depth"]) == depth):
+                return KanbanScopeAttempt(existing["attempt_ref"], existing["root_ref"], board, task_id,
+                                          run_id, claim_lock, depth)
+            return None
         return attempt
     finally:
         conn.close()
@@ -205,18 +223,30 @@ def bind_for_dispatch(board_db: str | Path, board: str, task_id: str, run_id: in
     task = _live_dispatch_claim(board_db, task_id, run_id, claim_lock)
     if task is None:
         return None
+    # Validate durable root metadata against the live session authority before
+    # touching attempt state.  A fresh approvals process must fail closed.
+    registry = _connect(board_db)
+    try:
+        root = registry.execute("SELECT * FROM project_scope_roots WHERE board=? AND task_id=? AND active=1",
+                                (board, task_id)).fetchone()
+        if root is not None:
+            # A root grant includes the concrete card's assignee.  A later
+            # reassignment is a new authority decision, never an implicit transfer.
+            if root["assignee"] != task["assignee"] or not _root_has_live_activation(root):
+                _deactivate_root(registry, root["root_ref"])
+                return None
+            existing = registry.execute("""SELECT * FROM project_scope_attempts
+              WHERE board=? AND task_id=? AND run_id=?""", (board, task_id, run_id)).fetchone()
+            if existing is not None:
+                if (existing["active"] and existing["root_ref"] == root["root_ref"]
+                        and existing["claim_lock"] == claim_lock and int(existing["depth"]) == 0):
+                    return KanbanScopeAttempt(existing["attempt_ref"], existing["root_ref"], board, task_id,
+                                              run_id, claim_lock, 0)
+                return None
+    finally:
+        registry.close()
     direct = bind_attempt(board_db, board, task_id, run_id, claim_lock)
     if direct is not None:
-        # A root grant includes the concrete card's assignee.  A later reassignment
-        # is a new authority decision, never an implicit transfer.
-        conn = _connect(board_db)
-        try:
-            root = conn.execute("SELECT * FROM project_scope_roots WHERE root_ref=? AND active=1", (direct.root_ref,)).fetchone()
-            if root is None or root["assignee"] != task["assignee"] or not _root_has_live_activation(root):
-                _deactivate_root(conn, direct.root_ref)
-                return None
-        finally:
-            conn.close()
         return direct
     try:
         board_conn = sqlite3.connect(board_db)
@@ -228,18 +258,18 @@ def bind_for_dispatch(board_db: str | Path, board: str, task_id: str, run_id: in
         return None
     registry = _connect(board_db)
     try:
-        candidates = registry.execute("""SELECT attempt_ref FROM project_scope_attempts a
+        candidates = registry.execute("""SELECT a.attempt_ref,r.* FROM project_scope_attempts a
           JOIN project_scope_roots r ON r.root_ref=a.root_ref
           WHERE a.board=? AND a.task_id IN (%s) AND a.active=1 AND r.active=1""" % ",".join("?" for _ in parents),
           [board, *parents]).fetchall() if parents else []
         if len(candidates) != 1:
             return None
-        attempt = bind_attempt(board_db, board, task_id, run_id, claim_lock, parent_attempt=candidates[0]["attempt_ref"])
-        if attempt is None:
+        root = candidates[0]
+        if not _root_has_live_activation(root):
+            _deactivate_root(registry, root["root_ref"])
             return None
-        root = registry.execute("SELECT * FROM project_scope_roots WHERE root_ref=? AND active=1", (attempt.root_ref,)).fetchone()
-        if root is None or not _root_has_live_activation(root):
-            _deactivate_root(registry, attempt.root_ref)
+        attempt = bind_attempt(board_db, board, task_id, run_id, claim_lock, parent_attempt=root["attempt_ref"])
+        if attempt is None:
             return None
         return attempt
     finally:
