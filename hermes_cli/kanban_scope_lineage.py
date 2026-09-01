@@ -378,8 +378,13 @@ class DispatcherScopeBroker:
     """Ephemeral Unix-peer-credential liveness oracle owned by dispatcher."""
     def __init__(self, board_db: str | Path, board: str, attempt: KanbanScopeAttempt):
         self.board_db, self.board, self.attempt = Path(board_db), board, attempt
-        self._directory = Path(tempfile.mkdtemp(prefix="hermes-scope-", dir=str(Path(board_db).parent)))
-        os.chmod(self._directory, 0o700)
+        directory = Path(tempfile.mkdtemp(prefix="hermes-scope-", dir=str(Path(board_db).parent)))
+        try:
+            os.chmod(directory, 0o700)
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        self._directory = directory
         self.endpoint = str(self._directory / "live.sock")
         self._child_pid: int | None = None
         self._child_start_token: str | None = None
@@ -389,20 +394,36 @@ class DispatcherScopeBroker:
     def start(self) -> None:
         if os.name == "nt" or not hasattr(socket, "SO_PEERCRED"):
             raise OSError("secure Kanban scope broker unavailable")
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(self.endpoint); os.chmod(self.endpoint, 0o600)
-        server.listen(4); server.settimeout(.2); self._server = server
-        self._thread = threading.Thread(target=self._serve, daemon=True); self._thread.start()
+        server = None
+        try:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(self.endpoint); os.chmod(self.endpoint, 0o600)
+            server.listen(4); server.settimeout(.2); self._server = server
+            self._thread = threading.Thread(target=self._serve, daemon=True); self._thread.start()
+        except BaseException:
+            if server is not None:
+                server.close()
+            self.close()
+            raise
 
     def register_child(self, pid: int) -> bool:
         if not isinstance(pid, int) or pid <= 0 or self._closed.is_set():
             return False
+        retire = False
         with self._child_lock:
-            if self._child_pid is not None or not self._pid_is_current(pid):
+            if self._child_pid is not None:
                 return False
-            self._child_pid = pid
-            self._child_start_token = self._pid_start_token(pid)
-            return True
+            if not self._pid_is_current(pid):
+                retire = True
+            else:
+                self._child_pid = pid
+                self._child_start_token = self._pid_start_token(pid)
+                return True
+        if retire:
+            # A direct child may have exited before dispatcher registration.
+            # Refuse the zombie and retire its one-use authority immediately.
+            self._retire_stale_child()
+        return False
 
     def close(self) -> None:
         self._closed.set()
@@ -412,25 +433,36 @@ class DispatcherScopeBroker:
         shutil.rmtree(self._directory, ignore_errors=True)
 
     @staticmethod
+    def _pid_identity(pid: int) -> tuple[str, str] | None:
+        """Read Linux process state and start time without being fooled by comm."""
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # The suffix begins at field 3 (state); field 22 is starttime.
+            fields = stat.rsplit(")", 1)[1].split()
+            return fields[0], fields[19]
+        except (FileNotFoundError, IndexError, OSError):
+            return None
+
+    @staticmethod
     def _pid_start_token(pid: int) -> str | None:
         """Linux PID start time distinguishes a recycled PID from its worker."""
         if not sys.platform.startswith("linux"):
             return None
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-            # Field 22 is starttime. ``comm`` may contain spaces or parentheses.
-            return stat.rsplit(")", 1)[1].split()[19]
-        except (FileNotFoundError, IndexError, OSError):
-            return None
+        identity = DispatcherScopeBroker._pid_identity(pid)
+        return identity[1] if identity is not None else None
 
     def _pid_is_current(self, pid: int) -> bool:
         try:
             os.kill(pid, 0)
         except OSError:
             return False
-        token = self._pid_start_token(pid)
-        # Linux exposes the token reliably; if it disappears, fail closed.
         if sys.platform.startswith("linux"):
+            identity = self._pid_identity(pid)
+            # kill(pid, 0) succeeds for a zombie: liveness requires a runnable
+            # direct child and a stable start identity, not a visible PID alone.
+            if identity is None or identity[0] == "Z":
+                return False
+            token = self._pid_start_token(pid)
             return token is not None and (self._child_start_token is None or token == self._child_start_token)
         return True
 

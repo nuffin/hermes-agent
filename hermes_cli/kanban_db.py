@@ -8128,6 +8128,16 @@ def _scope_broker_lifecycle_key(broker: Any) -> tuple[str, str, str, int, str, s
 
 def _retire_scope_broker(broker: Any) -> None:
     """Close one ephemeral transport and retire its exact durable attempt."""
+    # A launch failure may happen after the transport starts but before the
+    # reaper owns a PID. Remove this exact object from any partial/recycled PID
+    # bucket before closing so neither lifecycle map nor authority survives.
+    with _dispatcher_scope_brokers_lock:
+        for pid, bucket in tuple(_dispatcher_scope_brokers.items()):
+            for key, registered in tuple(bucket.items()):
+                if registered is broker:
+                    bucket.pop(key, None)
+            if not bucket:
+                _dispatcher_scope_brokers.pop(pid, None)
     try:
         broker.close()
     finally:
@@ -10859,25 +10869,10 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
-    # Scope lineage is dispatcher-owned and carries only an opaque attempt ref.
-    # Ordinary cards have no row and therefore retain pre-feature behavior.
+    # Scope lineage binding and its transport are created immediately before
+    # Popen, after all worker-context preparation has completed. This prevents
+    # earlier context/log setup errors from minting an unowned authority.
     resolved_board = _normalize_board_slug(board) or get_current_board()
-    scope_broker = None
-    if task.current_run_id is not None and task.claim_lock:
-        try:
-            from hermes_cli.kanban_scope_lineage import DispatcherScopeBroker, bind_for_dispatch
-            scope_attempt = bind_for_dispatch(kanban_db_path(board=resolved_board), resolved_board,
-                                              task.id, int(task.current_run_id), task.claim_lock)
-            if scope_attempt is not None:
-                scope_broker = DispatcherScopeBroker(kanban_db_path(board=resolved_board), resolved_board, scope_attempt)
-                scope_broker.start()
-                env["HERMES_KANBAN_SCOPE_ATTEMPT"] = scope_attempt.attempt_ref
-                env["HERMES_KANBAN_SCOPE_BROKER"] = scope_broker.endpoint
-        except Exception:
-            if scope_broker is not None:
-                scope_broker.close()
-            scope_broker = None
-            _log.debug("kanban scope lineage unavailable for task %s", task.id, exc_info=True)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -10983,7 +10978,35 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    scope_broker = None
     try:
+        # Scope transport is opt-in per claimed root. Ordinary cards have no
+        # binding and retain pre-feature behavior. Once a binding exists, every
+        # launch failure below retires it before propagating the failure.
+        if task.current_run_id is not None and task.claim_lock:
+            scope_attempt = None
+            try:
+                from hermes_cli.kanban_scope_lineage import DispatcherScopeBroker, bind_for_dispatch
+                scope_attempt = bind_for_dispatch(
+                    kanban_db_path(board=resolved_board), resolved_board,
+                    task.id, int(task.current_run_id), task.claim_lock,
+                )
+                if scope_attempt is not None:
+                    scope_broker = DispatcherScopeBroker(
+                        kanban_db_path(board=resolved_board), resolved_board, scope_attempt,
+                    )
+                    scope_broker.start()
+                    env["HERMES_KANBAN_SCOPE_ATTEMPT"] = scope_attempt.attempt_ref
+                    env["HERMES_KANBAN_SCOPE_BROKER"] = scope_broker.endpoint
+            except Exception:
+                if scope_broker is not None:
+                    _retire_scope_broker(scope_broker)
+                elif scope_attempt is not None:
+                    from hermes_cli.kanban_scope_lineage import deactivate_attempt_for_worker
+                    deactivate_attempt_for_worker(kanban_db_path(board=resolved_board), scope_attempt)
+                scope_broker = None
+                _log.debug("kanban scope lineage unavailable for task %s", task.id, exc_info=True)
+
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -10996,10 +11019,17 @@ def _default_spawn(
         )
     except FileNotFoundError:
         log_f.close()
+        if scope_broker is not None:
+            _retire_scope_broker(scope_broker)
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    except Exception:
+        log_f.close()
+        if scope_broker is not None:
+            _retire_scope_broker(scope_broker)
+        raise
     # Register only after Popen returns the kernel-assigned direct-child PID.
     # A request in the pre-registration race is denied by the broker.
     if scope_broker is not None:
