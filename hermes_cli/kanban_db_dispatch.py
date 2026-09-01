@@ -199,6 +199,9 @@ _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 # through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
 # here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
 _live_worker_procs: "dict[int, subprocess.Popen]" = {}
+# Dispatcher-owned brokers are keyed by the kernel-assigned direct-child PID.
+# They are closed by the worker-exit path after the brokered worker terminates.
+_dispatcher_scope_brokers: "dict[int, Any]" = {}
 
 
 def _wait_status_from_returncode(returncode: int) -> int:
@@ -2801,6 +2804,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             scrub_secrets=is_multiplex_active() or routed,
             inherit_profile_home=True,
         )
+    # Scope transport is opt-in per claimed root. Ordinary cards and every
+    # inherited dispatcher environment are strictly no-grant.
+    env.pop("HERMES_KANBAN_SCOPE_ATTEMPT", None)
+    env.pop("HERMES_KANBAN_SCOPE_BROKER", None)
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
@@ -2845,16 +2852,25 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Scope lineage is dispatcher-owned and carries only an opaque attempt ref.
     # Ordinary cards have no row and therefore retain pre-feature behavior.
     resolved_board = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    scope_broker = None
     if task.current_run_id is not None and task.claim_lock:
         try:
-            from hermes_cli.kanban_scope_lineage import bind_for_dispatch
+            from hermes_cli.kanban_scope_lineage import DispatcherScopeBroker, bind_for_dispatch
             scope_attempt = bind_for_dispatch(
                 _kb.kanban_db_path(board=resolved_board), resolved_board,
                 task.id, int(task.current_run_id), task.claim_lock,
             )
             if scope_attempt is not None:
+                scope_broker = DispatcherScopeBroker(
+                    _kb.kanban_db_path(board=resolved_board), resolved_board, scope_attempt,
+                )
+                scope_broker.start()
                 env["HERMES_KANBAN_SCOPE_ATTEMPT"] = scope_attempt.attempt_ref
+                env["HERMES_KANBAN_SCOPE_BROKER"] = scope_broker.endpoint
         except Exception:
+            if scope_broker is not None:
+                scope_broker.close()
+            scope_broker = None
             _kb._log.debug("kanban scope lineage unavailable for task %s", task.id, exc_info=True)
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
     # Only set when enabled so non-goal tasks keep a clean env.
@@ -2909,6 +2925,17 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    # Register only after Popen returns the kernel-assigned direct-child PID.
+    # A request in the pre-registration race is denied by the broker.
+    if scope_broker is not None:
+        if not scope_broker.register_child(proc.pid):
+            scope_broker.close()
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            raise RuntimeError("failed to bind Kanban scope broker to worker PID")
+        _dispatcher_scope_brokers[proc.pid] = scope_broker
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:
