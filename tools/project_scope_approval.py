@@ -349,6 +349,44 @@ def validate_trusted_kanban_grant(
         return live
 
 
+def _kanban_activation_snapshot(activation: ActivatedProjectScope) -> str:
+    """Canonical policy payload a Kanban registry may bind, never restore."""
+    template = activation.template
+    return json.dumps({
+        "template_id": template.template_id,
+        "repository_roots": [str(path) for path in template.repository_roots],
+        "temporary_roots": [str(path) for path in template.temporary_roots],
+        "git_remotes": [[name, list(prefixes)] for name, prefixes in template.git_remotes],
+        "git_ref_rules": list(template.git_ref_rules),
+        "docker_registry_prefixes": list(template.docker_registry_prefixes),
+        "allowed_operations": sorted(template.allowed_operations),
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def validate_live_kanban_activation(
+    session_key: object, activation_id: object, policy_digest: object, template_json: object,
+) -> ActivatedProjectScope | None:
+    """Validate a durable Kanban row against current session-only authority.
+
+    Registry metadata is never an activation source: missing, replaced, or
+    modified in-memory authority is deliberately indistinguishable from denial.
+    """
+    if not (isinstance(session_key, str) and session_key
+            and isinstance(activation_id, str) and activation_id
+            and isinstance(policy_digest, str) and policy_digest
+            and isinstance(template_json, str) and template_json):
+        return None
+    with _lock:
+        live = _active.get(session_key)
+        if (live is None or live.session_key != session_key
+                or live.activation_id != activation_id
+                or live.policy_digest != policy_digest
+                or _policy_digest(live.template) != policy_digest
+                or _kanban_activation_snapshot(live) != template_json):
+            return None
+        return live
+
+
 def revoke_project_scope(session_key: str) -> bool:
     with _lock:
         activation = _active.pop(session_key, None)
