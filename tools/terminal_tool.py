@@ -1362,12 +1362,17 @@ def terminal_tool(
         )
         # Pre-exec security checks (tirith + dangerous command detection);
         # force=True means the user already confirmed.
+        # Scope grants bind to the dispatcher-issued child identity, never the
+        # container task key (which deliberately collapses normal sa-* IDs).
+        from agent.delegation_context import dispatcher_subagent_execution_identity
+        child_identity = dispatcher_subagent_execution_identity()
+        scope_execution_identity = child_identity.subagent_id if child_identity is not None else None
         from tools.project_scope_approval import TerminalApprovalContext
         terminal_context = TerminalApprovalContext(
             raw_command=command, backend_type=env_type, session_key=session_key,
             supplied_workdir=workdir, effective_cwd=effective_cwd, background=background,
             has_host_access=_docker_has_host_access(plan.config),
-            execution_identity=effective_task_id,
+            execution_identity=scope_execution_identity,
         )
         verdict = _run_approval_guards(
             command, env_type, plan.config, force=force, terminal_context=terminal_context,

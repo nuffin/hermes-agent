@@ -10,9 +10,23 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
+
+
+@dataclass(frozen=True)
+class SubagentExecutionIdentity:
+    """Dispatcher-issued identity consumed by authorization gates only."""
+
+    subagent_id: str
+
+
+_SUBAGENT_EXECUTION_IDENTITY: ContextVar[SubagentExecutionIdentity | None] = ContextVar(
+    "hermes_subagent_execution_identity", default=None,
+)
+
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
@@ -27,23 +41,31 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
-    """Mark child execution and isolate its task-local session identity. Even a context
-    entered without an id must restore the parent's session ContextVar (child
-    construction calls ``set_current_session_id``)."""
+def delegated_child_context(
+    session_id: str | None = None,
+    execution_identity: SubagentExecutionIdentity | None = None,
+) -> Iterator[None]:
+    """Mark child execution and isolate session plus dispatcher identity."""
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    identity_token = _SUBAGENT_EXECUTION_IDENTITY.set(execution_identity)
     try:
         from gateway.session_context import scoped_current_session_id  # lazy: it calls is_delegated_child_context()
 
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _SUBAGENT_EXECUTION_IDENTITY.reset(identity_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
+
+
+def dispatcher_subagent_execution_identity() -> SubagentExecutionIdentity | None:
+    """Return the typed identity issued by the delegate dispatcher."""
+    return _SUBAGENT_EXECUTION_IDENTITY.get()
 
 
 def enter_non_dispatcher_owned_context() -> Token[bool]:

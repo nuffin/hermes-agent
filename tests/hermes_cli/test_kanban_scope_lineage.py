@@ -16,11 +16,22 @@ def _template(tmp_path: Path):
 
 def _activation(tmp_path: Path):
     template = _template(tmp_path)
-    from tools.project_scope_approval import project_scope_policy_digest
-    return type("Activation", (), {
-        "activation_id": "root-a", "session_key": "parent", "template": template,
-        "policy_digest": project_scope_policy_digest(template),
-    })()
+    from tools import project_scope_approval as scope
+    activation = scope.ActivatedProjectScope(
+        "release-scope", "parent", "root-a", 0, template,
+        scope.project_scope_policy_digest(template), "test-confirmation",
+    )
+    with scope._lock:
+        scope._active["parent"] = activation
+    return activation
+
+
+def _grant(db: Path, board: str, task_id: str, assignee: str | None, activation):
+    from hermes_cli import kanban_scope_lineage as lineage
+    from tools.project_scope_approval import _issue_trusted_kanban_grant
+    receipt = _issue_trusted_kanban_grant("parent", activation, board, task_id, assignee)
+    assert receipt is not None
+    return lineage.grant_root(db, board, task_id, assignee, receipt=receipt)
 
 
 def _claimed_task(db: Path, *, assignee: str = "worker"):
@@ -45,7 +56,7 @@ def test_root_grant_binds_exact_board_card_run_and_claim(tmp_path):
     activation = _activation(tmp_path)
     db = tmp_path / "board.db"
     task = _claimed_task(db)
-    root = lineage.grant_root(db, "board-a", task.id, "worker", activation)
+    root = _grant(db, "board-a", task.id, "worker", activation)
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
     assert attempt and attempt.root_ref == root.root_ref
     assert lineage.resolve_attempt(db, "board-a", task.id, task.current_run_id, task.claim_lock) == attempt
@@ -59,7 +70,7 @@ def test_retry_is_fresh_binding_and_revoke_cascades(tmp_path):
     activation = _activation(tmp_path)
     db = tmp_path / "board.db"
     task = _claimed_task(db)
-    lineage.grant_root(db, "board-a", task.id, "worker", activation)
+    _grant(db, "board-a", task.id, "worker", activation)
     one = lineage.bind_attempt(db, "board-a", task.id, 7, "lock-7")
     two = lineage.bind_attempt(db, "board-a", task.id, 8, "lock-8")
     assert one and two and one.attempt_ref != two.attempt_ref
@@ -72,7 +83,7 @@ def test_descendant_inherits_without_card_text_and_bounds_depth_cycle(tmp_path):
     from hermes_cli import kanban_scope_lineage as lineage
     activation = _activation(tmp_path)
     db = tmp_path / "board.db"
-    lineage.grant_root(db, "board-a", "root", "worker", activation)
+    _grant(db, "board-a", "root", "worker", activation)
     parent = lineage.bind_attempt(db, "board-a", "root", 1, "one")
     child = lineage.bind_attempt(db, "board-a", "child", 2, "two", parent_attempt=parent.attempt_ref)
     assert child and child.root_ref == parent.root_ref and child.depth == 1
@@ -83,7 +94,7 @@ def test_dispatcher_rejects_unknown_or_reassigned_root_card(tmp_path):
     from hermes_cli import kanban_scope_lineage as lineage
     db = tmp_path / "board.db"
     task = _claimed_task(db, assignee="worker")
-    lineage.grant_root(db, "board-a", task.id, "worker", _activation(tmp_path))
+    _grant(db, "board-a", task.id, "worker", _activation(tmp_path))
     assert lineage.bind_for_dispatch(db, "board-a", "unknown", task.current_run_id, task.claim_lock) is None
     conn = __import__("sqlite3").connect(db)
     try:
@@ -98,7 +109,7 @@ def test_reassignment_after_bind_revokes_before_execution(tmp_path):
     from hermes_cli import kanban_scope_lineage as lineage
     db = tmp_path / "board.db"
     task = _claimed_task(db, assignee="worker")
-    lineage.grant_root(db, "board-a", task.id, "worker", _activation(tmp_path))
+    _grant(db, "board-a", task.id, "worker", _activation(tmp_path))
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
     assert attempt is not None
     conn = __import__("sqlite3").connect(db)
@@ -115,7 +126,7 @@ def test_tampered_snapshot_digest_fails_closed(tmp_path):
     from hermes_cli import kanban_scope_lineage as lineage
     db = tmp_path / "board.db"
     task = _claimed_task(db)
-    lineage.grant_root(db, "board-a", task.id, "worker", _activation(tmp_path))
+    _grant(db, "board-a", task.id, "worker", _activation(tmp_path))
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
     assert attempt is not None
     conn = __import__("sqlite3").connect(lineage.registry_path(db))
@@ -133,7 +144,7 @@ def test_terminal_lookup_denies_archived_or_replayed_dispatch_attempt(tmp_path):
     activation = _activation(tmp_path)
     db = tmp_path / "board.db"
     task = _claimed_task(db)
-    lineage.grant_root(db, "board-a", task.id, "worker", activation)
+    _grant(db, "board-a", task.id, "worker", activation)
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
     assert attempt
     conn = kb.connect(db)
@@ -150,7 +161,7 @@ def test_temp_home_worker_binding_blocks_after_parent_revoke(tmp_path, monkeypat
     activation = _activation(tmp_path)
     db = tmp_path / "board.db"
     task = _claimed_task(db)
-    lineage.grant_root(db, "board-a", task.id, "worker", activation)
+    _grant(db, "board-a", task.id, "worker", activation)
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
     assert attempt
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
