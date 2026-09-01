@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import sqlite3
@@ -142,6 +143,43 @@ def revoke_activation_everywhere(activation_id: str) -> None:
             revoke_activation(activation_id, registry_path=path)
         except (OSError, sqlite3.Error):
             pass
+
+
+def deactivate_attempt_for_worker(board_db: str | Path, attempt: KanbanScopeAttempt) -> bool:
+    """Retire one dead worker attempt without revoking a live sibling.
+
+    This is deliberately keyed by the complete dispatcher lifecycle identity,
+    not a PID.  A PID is only the local reaper's routing hint and may be reused
+    after exit.  When this was the root's final live attempt, retire the root
+    too so a dead worker cannot be rebound from durable metadata.
+    """
+    conn = _connect(board_db)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT root_ref FROM project_scope_attempts
+               WHERE attempt_ref=? AND root_ref=? AND board=? AND task_id=?
+                 AND run_id=? AND claim_lock=? AND active=1""",
+            (attempt.attempt_ref, attempt.root_ref, attempt.board, attempt.task_id,
+             attempt.run_id, attempt.claim_lock),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        conn.execute("UPDATE project_scope_attempts SET active=0 WHERE attempt_ref=?", (attempt.attempt_ref,))
+        sibling = conn.execute(
+            "SELECT 1 FROM project_scope_attempts WHERE root_ref=? AND active=1 LIMIT 1",
+            (attempt.root_ref,),
+        ).fetchone()
+        if sibling is None:
+            conn.execute("UPDATE project_scope_roots SET active=0 WHERE root_ref=?", (attempt.root_ref,))
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 
 def _root_for(conn: sqlite3.Connection, board: str, task_id: str, parent_attempt: str | None) -> tuple[sqlite3.Row, int] | None:
@@ -344,6 +382,8 @@ class DispatcherScopeBroker:
         os.chmod(self._directory, 0o700)
         self.endpoint = str(self._directory / "live.sock")
         self._child_pid: int | None = None
+        self._child_start_token: str | None = None
+        self._child_lock = threading.Lock()
         self._closed = threading.Event(); self._server = None; self._thread = None
 
     def start(self) -> None:
@@ -355,16 +395,53 @@ class DispatcherScopeBroker:
         self._thread = threading.Thread(target=self._serve, daemon=True); self._thread.start()
 
     def register_child(self, pid: int) -> bool:
-        if not isinstance(pid, int) or pid <= 0 or self._closed.is_set() or self._child_pid is not None:
+        if not isinstance(pid, int) or pid <= 0 or self._closed.is_set():
             return False
-        self._child_pid = pid
-        return True
+        with self._child_lock:
+            if self._child_pid is not None or not self._pid_is_current(pid):
+                return False
+            self._child_pid = pid
+            self._child_start_token = self._pid_start_token(pid)
+            return True
 
     def close(self) -> None:
         self._closed.set()
         if self._server is not None: self._server.close()
-        if self._thread is not None: self._thread.join(timeout=1)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=1)
         shutil.rmtree(self._directory, ignore_errors=True)
+
+    @staticmethod
+    def _pid_start_token(pid: int) -> str | None:
+        """Linux PID start time distinguishes a recycled PID from its worker."""
+        if not sys.platform.startswith("linux"):
+            return None
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # Field 22 is starttime. ``comm`` may contain spaces or parentheses.
+            return stat.rsplit(")", 1)[1].split()[19]
+        except (FileNotFoundError, IndexError, OSError):
+            return None
+
+    def _pid_is_current(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        token = self._pid_start_token(pid)
+        # Linux exposes the token reliably; if it disappears, fail closed.
+        if sys.platform.startswith("linux"):
+            return token is not None and (self._child_start_token is None or token == self._child_start_token)
+        return True
+
+    def child_is_current(self) -> bool:
+        with self._child_lock:
+            return self._child_pid is not None and self._pid_is_current(self._child_pid)
+
+    def _retire_stale_child(self) -> None:
+        """Fail closed before a recycled PID can reuse this transport."""
+        deactivate_attempt_for_worker(self.board_db, self.attempt)
+        self.close()
 
     def _serve(self) -> None:
         while not self._closed.is_set():
@@ -377,7 +454,9 @@ class DispatcherScopeBroker:
                     request = json.loads(conn.recv(1024).decode())
                     if (not isinstance(request, dict) or set(request) != {"op", "attempt"}
                             or request["op"] != "resolve" or request["attempt"] != self.attempt.attempt_ref
-                            or pid != self._child_pid): raise ValueError
+                            or pid != self._child_pid or not self.child_is_current()):
+                        self._retire_stale_child()
+                        raise ValueError
                     value = self._resolve_live()
                     conn.sendall(json.dumps({"ok": value is not None, "scope": value}, separators=(",", ":")).encode())
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
