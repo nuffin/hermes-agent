@@ -259,6 +259,7 @@ def test_dispatcher_broker_allows_exact_child_then_rechecks_live_parent(tmp_path
 
     db = tmp_path / "board.db"
     task = _claimed_task(db)
+    assert task.current_run_id is not None and task.claim_lock is not None
     activation = _activation(tmp_path)
     _grant(db, "board-a", task.id, "worker", activation)
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
@@ -291,5 +292,125 @@ def test_dispatcher_broker_allows_exact_child_then_rechecks_live_parent(tmp_path
         proc.stdin.write("go\n"); proc.stdin.flush()
         assert proc.stdout.readline().strip() == "after=not_applicable"
     finally:
-        proc.kill(); proc.wait()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
         broker.close()
+
+
+def test_reaped_worker_closes_broker_and_revokes_exact_attempt(tmp_path):
+    """A reaped scoped worker cannot leave a PID-reusable broker behind."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    import time
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_scope_lineage as lineage
+
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id is not None and task.claim_lock is not None
+    activation = _activation(tmp_path)
+    _grant(db, "board-a", task.id, "worker", activation)
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    broker = lineage.DispatcherScopeBroker(db, "board-a", attempt)
+    broker.start()
+    endpoint = broker.endpoint
+    code = textwrap.dedent("""
+        import os
+        from tools.project_scope_approval import TerminalApprovalContext, evaluate_project_scope
+        repo = os.environ['TEST_REPO']
+        context = TerminalApprovalContext('git -C ' + repo + ' commit -S -m ok', 'local', 'worker', repo, repo, False, True)
+        print(evaluate_project_scope(context).status, flush=True)
+    """)
+    env = {**os.environ, "HERMES_KANBAN_SCOPE_ATTEMPT": attempt.attempt_ref,
+           "HERMES_KANBAN_SCOPE_BROKER": endpoint, "HERMES_KANBAN_DB": str(db),
+           "HERMES_KANBAN_BOARD": "board-a", "HERMES_KANBAN_TASK": task.id,
+           "HERMES_KANBAN_RUN_ID": str(task.current_run_id), "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock,
+           "TEST_REPO": str(activation.template.repository_roots[0])}
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, env=env)
+    try:
+        assert broker.register_child(proc.pid)
+        assert kb._register_dispatcher_scope_broker(proc.pid, broker)
+        assert proc.stdout.readline().strip() == "approved"
+
+        # Reap rather than Popen.wait(): production owns this exact lifecycle.
+        deadline = time.monotonic() + 2
+        reaped = []
+        while proc.pid not in reaped and time.monotonic() < deadline:
+            reaped.extend(kb.reap_worker_zombies())
+            if proc.pid not in reaped:
+                time.sleep(.01)
+        assert proc.pid in reaped
+
+        assert proc.poll() is not None
+        assert proc.pid not in kb._dispatcher_scope_brokers
+        assert not os.path.exists(endpoint)
+        assert lineage.request_broker_scope(endpoint, attempt.attempt_ref) is None
+        assert lineage.resolve_attempt(
+            db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
+        ) is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        broker.close()
+
+
+def test_broker_rejects_a_recycled_peer_pid_and_retires_attempt(tmp_path, monkeypatch):
+    """A changed Linux process-start token fails closed even with the same PID."""
+    import os
+    from hermes_cli import kanban_scope_lineage as lineage
+
+    db = tmp_path / "board.db"
+    task = _claimed_task(db)
+    assert task.current_run_id is not None and task.claim_lock is not None
+    activation = _activation(tmp_path)
+    _grant(db, "board-a", task.id, "worker", activation)
+    attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
+    assert attempt is not None
+    broker = lineage.DispatcherScopeBroker(db, "board-a", attempt)
+    broker.start()
+    endpoint = broker.endpoint
+    try:
+        assert broker.register_child(os.getpid())
+        assert lineage.request_broker_scope(endpoint, attempt.attempt_ref) is not None
+
+        # Simulate PID reuse after a worker exits: numeric SO_PEERCRED matches,
+        # but the process-start identity does not.
+        monkeypatch.setattr(broker, "_pid_start_token", lambda _pid: "recycled")
+        assert lineage.request_broker_scope(endpoint, attempt.attempt_ref) is None
+        assert not os.path.exists(endpoint)
+        assert lineage.resolve_attempt(
+            db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
+        ) is None
+    finally:
+        broker.close()
+
+
+def test_worker_retirement_keeps_root_only_while_a_sibling_attempt_is_live(tmp_path):
+    """Exact worker retirement cannot revoke an independently live sibling."""
+    import sqlite3
+    from hermes_cli import kanban_scope_lineage as lineage
+
+    db = tmp_path / "board.db"
+    _grant(db, "board-a", "root", "worker", _activation(tmp_path))
+    parent = lineage.bind_attempt(db, "board-a", "root", 1, "lock-1")
+    assert parent is not None
+    child = lineage.bind_attempt(db, "board-a", "child", 2, "lock-2", parent_attempt=parent.attempt_ref)
+    assert child is not None
+
+    assert lineage.deactivate_attempt_for_worker(db, child)
+    conn = sqlite3.connect(lineage.registry_path(db))
+    try:
+        assert conn.execute("SELECT active FROM project_scope_roots WHERE root_ref=?", (parent.root_ref,)).fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert lineage.deactivate_attempt_for_worker(db, parent)
+    conn = sqlite3.connect(lineage.registry_path(db))
+    try:
+        assert conn.execute("SELECT active FROM project_scope_roots WHERE root_ref=?", (parent.root_ref,)).fetchone()[0] == 0
+    finally:
+        conn.close()

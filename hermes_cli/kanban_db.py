@@ -8112,6 +8112,53 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# PID is only a reaper routing hint.  Each bucket is keyed again by the exact
+# attempt lifecycle so a recycled PID can never select a different authority.
+_dispatcher_scope_brokers: "dict[int, dict[tuple[str, str, str, int, str, str], Any]]" = {}
+_dispatcher_scope_brokers_lock = threading.RLock()
+
+
+def _scope_broker_lifecycle_key(broker: Any) -> tuple[str, str, str, int, str, str]:
+    attempt = broker.attempt
+    return (
+        str(broker.board_db), broker.board, attempt.task_id, attempt.run_id,
+        attempt.claim_lock, attempt.attempt_ref,
+    )
+
+
+def _retire_scope_broker(broker: Any) -> None:
+    """Close one ephemeral transport and retire its exact durable attempt."""
+    try:
+        broker.close()
+    finally:
+        try:
+            from hermes_cli.kanban_scope_lineage import deactivate_attempt_for_worker
+            deactivate_attempt_for_worker(broker.board_db, broker.attempt)
+        except Exception:
+            _log.debug("kanban scope broker retirement failed", exc_info=True)
+
+
+def _register_dispatcher_scope_broker(pid: int, broker: Any) -> bool:
+    """Atomically bind a live direct child or fail closed on exit-before-bind."""
+    with _dispatcher_scope_brokers_lock:
+        if not broker.child_is_current():
+            _retire_scope_broker(broker)
+            return False
+        bucket = _dispatcher_scope_brokers.setdefault(int(pid), {})
+        key = _scope_broker_lifecycle_key(broker)
+        if key in bucket:
+            return False
+        bucket[key] = broker
+        return True
+
+
+def _cleanup_reaped_scope_brokers(pid: int) -> None:
+    """Remove and retire every exact worker lifecycle mapped to a reaped PID."""
+    with _dispatcher_scope_brokers_lock:
+        brokers = tuple(_dispatcher_scope_brokers.pop(int(pid), {}).values())
+        for broker in brokers:
+            _retire_scope_broker(broker)
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -8196,6 +8243,7 @@ def reap_worker_zombies() -> "list[int]":
                 if pid == 0:
                     break
                 _record_worker_exit(pid, status)
+                _cleanup_reaped_scope_brokers(pid)
                 reaped.append(pid)
         except Exception:
             pass
@@ -10955,14 +11003,16 @@ def _default_spawn(
     # Register only after Popen returns the kernel-assigned direct-child PID.
     # A request in the pre-registration race is denied by the broker.
     if scope_broker is not None:
-        if not scope_broker.register_child(proc.pid):
-            scope_broker.close()
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-            raise RuntimeError("failed to bind Kanban scope broker to worker PID")
-        globals().setdefault("_dispatcher_scope_brokers", {})[proc.pid] = scope_broker
+        if not scope_broker.register_child(proc.pid) or not _register_dispatcher_scope_broker(proc.pid, scope_broker):
+            _retire_scope_broker(scope_broker)
+            # This is the Popen handle returned for this just-spawned direct
+            # child; never send a PID-targeted signal after it has exited.
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            raise RuntimeError("failed to bind Kanban scope broker to a live worker PID")
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
