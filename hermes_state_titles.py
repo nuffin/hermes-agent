@@ -131,6 +131,42 @@ class SessionTitlesMixin:
         ValueError on conflict or validation failure."""
         return self._set_session_title(session_id, title, source=self.TITLE_SOURCE_USER)
 
+    def refresh_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        """Refresh an automatic title only when its stored provenance matches *source*.
+
+        Unlike :meth:`set_auto_title`, this never promotes a derived title or
+        overwrites a user/legacy title. The read and write share one exact-value
+        compare-and-swap transaction, so a concurrent user rename wins.
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        title = self.sanitize_title(title)
+
+        def _do(conn):
+            current = conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+            if current is None or current["title_source"] != source:
+                return 0
+            if title:
+                conflict = conn.execute(
+                    "SELECT id FROM sessions WHERE title = ? AND id != ?", (title, session_id),
+                ).fetchone()
+                if conflict:
+                    conflict_id = conflict["id"]
+                    if self._is_compression_ancestor(
+                        conn, ancestor_id=conflict_id, descendant_id=session_id
+                    ):
+                        conn.execute("UPDATE sessions SET title = NULL WHERE id = ?", (conflict_id,))
+                    else:
+                        raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
+            return conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ? WHERE id = ? AND title IS ? AND title_source IS ?",
+                (title, source if title else None, session_id, current["title"], current["title_source"]),
+            ).rowcount
+
+        return self._execute_write(_do) > 0
+
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
         """Set an automatic title; False (untouched) when a higher-authority title holds the row."""
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
