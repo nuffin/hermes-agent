@@ -4,6 +4,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
+from pathlib import Path
 
 from agent.redact import redact_sensitive_text
 from tools.project_scope_approval import (
@@ -101,6 +102,19 @@ def run_project_scope_command(raw_args: str, *, session_key: str, delegated: boo
         live = get_active_project_scope(session_key)
         if live is None or live.activation_id != activation.activation_id:
             return "Kanban scope confirmation is stale; no root grant was created."
+        # Re-read the pinned DB rather than resolving a mutable board selection;
+        # confirmation must name the same concrete card and assignee reviewed.
+        try:
+            from hermes_cli import kanban_db as kb
+            conn = kb.connect(Path(board_db))
+            try:
+                task = kb.get_task(conn, card)
+            finally:
+                conn.close()
+        except Exception:
+            task = None
+        if task is None or task.assignee != assignee:
+            return "Kanban scope confirmation is stale; board/card/assignee changed and no root grant was created."
         try:
             from hermes_cli.kanban_scope_lineage import grant_root
             grant_root(board_db, board, card, assignee, activation)
