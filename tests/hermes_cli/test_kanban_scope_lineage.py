@@ -59,6 +59,8 @@ def test_root_grant_binds_exact_board_card_run_and_claim(tmp_path):
     root = _grant(db, "board-a", task.id, "worker", activation)
     attempt = lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock)
     assert attempt and attempt.root_ref == root.root_ref
+    # Dispatcher replay of the same claim reuses only the exact active binding.
+    assert lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock) == attempt
     assert lineage.resolve_attempt(db, "board-a", task.id, task.current_run_id, task.claim_lock) == attempt
     assert lineage.resolve_attempt(db, "board-b", task.id, task.current_run_id, task.claim_lock) is None
     assert lineage.resolve_attempt(db, "board-a", task.id, task.current_run_id + 1, task.claim_lock) is None
@@ -232,6 +234,14 @@ def test_fresh_approvals_process_fails_closed_for_durable_root(tmp_path):
     with scope._lock:
         scope._active.clear()
     assert lineage.bind_for_dispatch(db, "board-a", task.id, task.current_run_id, task.claim_lock) is None
+    conn = __import__("sqlite3").connect(lineage.registry_path(db))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM project_scope_attempts WHERE board=? AND task_id=? AND active=1",
+            ("board-a", task.id),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
     assert lineage.resolve_attempt(
         db, "board-a", task.id, task.current_run_id, task.claim_lock, attempt.attempt_ref,
     ) is None
