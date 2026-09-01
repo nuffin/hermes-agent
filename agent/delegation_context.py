@@ -15,11 +15,29 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import Iterator, Mapping, MutableMapping
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",
     default=False,
+)
+
+
+@dataclass(frozen=True)
+class SubagentExecutionIdentity:
+    """Dispatcher-issued identity consumed by authorization gates only.
+
+    Container task IDs intentionally remain storage/environment routing keys.
+    This value is separate so ordinary ``sa-*`` task IDs can still collapse to
+    ``default`` without weakening child grants.
+    """
+
+    subagent_id: str
+
+
+_SUBAGENT_EXECUTION_IDENTITY: ContextVar[SubagentExecutionIdentity | None] = ContextVar(
+    "hermes_subagent_execution_identity", default=None,
 )
 
 # Set for any in-process execution that is NOT the dispatcher-owned worker even
@@ -47,14 +65,13 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
-    """Mark child execution and isolate its task-local session identity.
-
-    Child construction calls ``set_current_session_id`` internally, so even a
-    context entered without an id must restore the parent's ContextVar.  Child
-    execution passes its explicit id and receives it only for this scope.
-    """
+def delegated_child_context(
+    session_id: str | None = None,
+    execution_identity: SubagentExecutionIdentity | None = None,
+) -> Iterator[None]:
+    """Mark child execution and isolate session plus dispatcher identity."""
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    identity_token = _SUBAGENT_EXECUTION_IDENTITY.set(execution_identity)
     try:
         # Import lazily: session_context calls is_delegated_child_context() when
         # deciding whether the compatibility os.environ mirror is safe.
@@ -63,12 +80,23 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _SUBAGENT_EXECUTION_IDENTITY.reset(identity_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
+
+
+def dispatcher_subagent_execution_identity() -> SubagentExecutionIdentity | None:
+    """Return the typed identity issued by the delegate dispatcher.
+
+    It is intentionally unrelated to container routing keys. Native arbitrary
+    in-process code is Hermes trusted-core TCB; plugin/model/prompt/tool caller
+    paths cannot supply this through public terminal or scope APIs.
+    """
+    return _SUBAGENT_EXECUTION_IDENTITY.get()
 
 
 @contextmanager

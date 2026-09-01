@@ -4,6 +4,8 @@
 **Decision:** Introduce opt-in, session-only, typed project-scope approvals as inert configuration templates. A matching template may approve only a narrowly parsed operation after explicit activation and all existing unconditional safeguards.
 
 > **Verified implementation note (2026-09-01):** The branch contains the internal evaluator, immutable session snapshot/digest, session registry, terminal context forwarding, execution-boundary revalidation, and focused contract coverage. `/project-scope activate` renders and stores a reviewed immutable policy snapshot; `confirm` binds that exact snapshot rather than reloading mutable configuration. Gateway control uses the shared approval/session trust predicate and denies delegated or unattended sources. It emits allowlisted audit metadata including root-match label, policy digest, timestamp, session/activation identifiers, and decision reason.
+>
+> **Mint authority boundary:** Public raw template, activation, and delegated-grant APIs cannot mint. A successful interactive `confirm` creates an immutable, one-use receipt bound to the exact session and reviewed template; `confirm-kanban` similarly creates a one-use receipt bound to live activation, board, card, and assignee. Every root mint validates the live activation/session and receipt binding. The dispatcher alone performs child lifecycle minting from its persisted parent edge. Python name privacy is not the boundary: arbitrary native in-process code is within Hermes' trusted-core TCB. Plugin, model, prompt, and tool-caller paths do not receive a public mint API or caller-provided boolean/token/duck-typed object path.
 
 ## Motivation
 

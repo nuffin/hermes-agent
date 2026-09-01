@@ -3250,12 +3250,19 @@ def terminal_tool(
         _approved_run = bool(force)
         scope_context = None
         scope_decision = None
+        # Scope grants bind to the dispatcher-issued child identity, never the
+        # container task key (which deliberately collapses normal sa-* IDs).
+        from agent.delegation_context import dispatcher_subagent_execution_identity
+        _child_identity = dispatcher_subagent_execution_identity()
+        scope_execution_identity = (
+            _child_identity.subagent_id if _child_identity is not None else None
+        )
         from tools.project_scope_approval import TerminalApprovalContext
         terminal_context = TerminalApprovalContext(
             raw_command=command, backend_type=env_type, session_key=session_key,
             supplied_workdir=workdir, effective_cwd=effective_cwd,
             background=background, has_host_access=_docker_has_host_access(config),
-            execution_identity=effective_task_id,
+            execution_identity=scope_execution_identity,
         )
         approval = _check_all_guards(
             command, env_type, has_host_access=_docker_has_host_access(config),

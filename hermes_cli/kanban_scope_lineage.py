@@ -84,8 +84,14 @@ def _snapshot(activation: Any) -> str:
     }, sort_keys=True, separators=(",", ":"))
 
 
-def grant_root(board_db: str | Path, board: str, task_id: str, assignee: str | None, activation: Any) -> KanbanScopeRoot:
-    """Persist an explicit parent-authorized card root from an active snapshot."""
+def grant_root(board_db: str | Path, board: str, task_id: str, assignee: str | None, *, receipt: object) -> KanbanScopeRoot:
+    """Persist only a live, exact receipt issued by trusted `/project-scope`."""
+    from tools.project_scope_approval import validate_trusted_kanban_grant
+    activation = validate_trusted_kanban_grant(
+        receipt, board=board, task_id=task_id, assignee=assignee,
+    )
+    if activation is None:
+        raise PermissionError("trusted Kanban confirmation receipt required")
     if not all(isinstance(x, str) and x for x in (board, task_id, activation.activation_id, activation.session_key)):
         raise ValueError("invalid root grant identity")
     root = KanbanScopeRoot(uuid.uuid4().hex, board, task_id, assignee, activation.activation_id,
