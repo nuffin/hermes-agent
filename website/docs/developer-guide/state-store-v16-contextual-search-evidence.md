@@ -16,7 +16,13 @@ Candidate visibility excludes hidden display rows and, unless requested, require
 
 The current PostgreSQL `search_messages()` lacks the SQLite `model` and `context` projections. More importantly, it does not provide backend-neutral equivalents for `get_anchored_view()`, `get_messages_around()`, or the public storage/rebuild state read that discovery reports. `session_search_tool` additionally reads SQLite private connection/lock state for anchor status. Adding only neighbour SQL would therefore leave discovery, detail, scroll, and degradation semantics backend-specific.
 
-No v16 schema migration is needed for a non-implementation decision. No source/runtime/configuration consumer was changed.
+## Implemented intermediate contract
+
+`state_store.ContextualSessionSearchStore` now publishes the atomic contextual-read boundary independently from the incremental write-oriented `StateStore`. `SqliteContextualSessionSearchStore` delegates every required operation to the existing `SessionDB` implementation: canonical candidate search, title/session lookup, anchored detail and scroll views, message visibility state, bounded browse, and public search-index rebuild status.
+
+`tools.session_search_tool` coerces both lazily acquired and injected SQLite stores through this capability before dispatching every public shape. The former tool-private `SessionDB._lock`/`_conn` visibility read now lives solely inside the SQLite adapter. Named-profile resolution likewise opens a read-only contextual store, preserving profile isolation and closing ownership.
+
+PostgreSQL is explicitly rejected by `contextual_session_search_store(backend="postgresql")` with `ContextualSessionSearchUnavailable`; no lexical PostgreSQL rows are attached to the contextual tool. No v16 schema migration or runtime backend cutover is implied.
 
 ## Required future atomic portability group
 
