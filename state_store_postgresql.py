@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import queue
+import re
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -18,7 +19,14 @@ from typing import Any
 from state_store import PostgreSQLStateStoreConfig, StateStoreConfigurationError
 
 _SCHEMA = "hermes_state_store_slice"
-_SCHEMA_VERSION = 2
+_SESSION_METADATA_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 5
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
+_NUMBERED_TITLE_RE = re.compile(r"^(.*?) #(\d+)$")
+_TITLE_SOURCE_RANK = {"derived": 0, "llm": 1, "user": 2}
+_CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
+_MAX_TITLE_LENGTH = 100
 _SESSION_METADATA_COLUMNS = (
     "user_id", "session_key", "chat_id", "chat_type", "thread_id", "display_name", "origin_json",
     "model", "model_config", "parent_session_id", "cwd", "profile_name", "git_repo_root",
@@ -28,6 +36,22 @@ _SESSION_METADATA_TYPES = {
     "display_name": "text", "origin_json": "text", "model": "text", "model_config": "jsonb",
     "parent_session_id": "text", "cwd": "text", "profile_name": "text", "git_repo_root": "text",
 }
+
+
+def _sanitize_title(title: str | None) -> str | None:
+    if not title:
+        return None
+    cleaned = _TITLE_INVISIBLE_RE.sub("", _TITLE_CONTROL_RE.sub("", str(title)))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > _MAX_TITLE_LENGTH:
+        raise ValueError(f"Title too long ({len(cleaned)} chars, max {_MAX_TITLE_LENGTH})")
+    return cleaned
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class PostgreSQLStateStore:
@@ -94,7 +118,7 @@ class PostgreSQLStateStore:
                     f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
                     (1, time.time()),
                 )
-            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SCHEMA_VERSION,))
+            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SESSION_METADATA_SCHEMA_VERSION,))
             if cursor.fetchone() is None:
                 for column in _SESSION_METADATA_COLUMNS:
                     cursor.execute(
@@ -104,7 +128,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_parent_session_id ON {_SCHEMA}.sessions (parent_session_id)")
                 cursor.execute(
                     f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
-                    (_SCHEMA_VERSION, time.time()),
+                    (_SESSION_METADATA_SCHEMA_VERSION, time.time()),
                 )
             cursor.execute(
                 "SELECT 1 FROM pg_constraint WHERE conname = %s AND connamespace = %s::regnamespace",
@@ -114,6 +138,19 @@ class PostgreSQLStateStore:
                 cursor.execute(
                     f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey "
                     f"FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID"
+                )
+            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SCHEMA_VERSION,))
+            if cursor.fetchone() is None:
+                cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title text")
+                cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title_source text")
+                cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false")
+                cursor.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS sessions_title_unique "
+                    f"ON {_SCHEMA}.sessions (title) WHERE title IS NOT NULL"
+                )
+                cursor.execute(
+                    f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
+                    (_SCHEMA_VERSION, time.time()),
                 )
         connection.commit()
 
@@ -209,10 +246,94 @@ class PostgreSQLStateStore:
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
-                f"SELECT id, source, started_at, ended_at, end_reason, {', '.join(_SESSION_METADATA_COLUMNS)} "
+                f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, {', '.join(_SESSION_METADATA_COLUMNS)} "
                 f"FROM {_SCHEMA}.sessions WHERE id = %s", (session_id,),
             )
             return cursor.fetchone()
+
+    def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {_SCHEMA}.sessions SET hidden = %s WHERE id = %s", (hidden, session_id))
+            return cursor.rowcount > 0
+
+    def _set_session_title(self, session_id: str, title: str, *, source: str) -> bool:
+        cleaned_title = _sanitize_title(title)
+        is_user = source == "user"
+        if not is_user and source not in {"derived", "llm"}:
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT title, title_source, hidden FROM {_SCHEMA}.sessions WHERE id = %s FOR UPDATE", (session_id,))
+            current = cursor.fetchone()
+            if current is None:
+                return False
+            if current["title"] == _CANONICAL_BOT_CHAT_TITLE and current["hidden"] and cleaned_title != _CANONICAL_BOT_CHAT_TITLE:
+                if is_user:
+                    raise ValueError("This is the bot's canonical Bot Chat — its name is its identity, and renaming it would orphan the conversation. To start fresh, create a new bot instead.")
+                return False
+            rank = _TITLE_SOURCE_RANK.get(current["title_source"], 2 if current["title_source"] is None else 0)
+            if not is_user and current["title"] is not None and rank >= _TITLE_SOURCE_RANK[source]:
+                return False
+            if cleaned_title:
+                cursor.execute(f"SELECT id FROM {_SCHEMA}.sessions WHERE title = %s AND id != %s FOR UPDATE", (cleaned_title, session_id))
+                conflict = cursor.fetchone()
+                if conflict:
+                    conflict_id = conflict["id"]
+                    cursor.execute(
+                        f"WITH RECURSIVE ancestors(id) AS (SELECT %s UNION SELECT parent.id FROM ancestors a JOIN {_SCHEMA}.sessions child ON child.id = a.id JOIN {_SCHEMA}.sessions parent ON parent.id = child.parent_session_id WHERE parent.end_reason = 'compression') SELECT 1 FROM ancestors WHERE id = %s AND id != %s LIMIT 1",
+                        (session_id, conflict_id, session_id),
+                    )
+                    if cursor.fetchone() is None:
+                        raise ValueError(f"Title '{cleaned_title}' is already in use by session {conflict_id}")
+                    cursor.execute(f"UPDATE {_SCHEMA}.sessions SET title = NULL WHERE id = %s", (conflict_id,))
+            cursor.execute(f"UPDATE {_SCHEMA}.sessions SET title = %s, title_source = %s WHERE id = %s", (cleaned_title, source if cleaned_title else None, session_id))
+            return cursor.rowcount > 0
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        return self._set_session_title(session_id, title, source="user")
+
+    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        return self._set_session_title(session_id, title, source=source)
+
+    def get_session_title(self, session_id: str) -> str | None:
+        row = self.get_session(session_id)
+        return None if row is None else row["title"]
+
+    def get_session_title_source(self, session_id: str) -> str | None:
+        row = self.get_session(session_id)
+        return None if row is None or row["title"] is None else row["title_source"]
+
+    def set_session_title_source(self, session_id: str, source: str) -> bool:
+        if source not in _TITLE_SOURCE_RANK:
+            raise ValueError(f"invalid title source: {source!r}")
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {_SCHEMA}.sessions SET title_source = %s WHERE id = %s AND title IS NOT NULL", (source, session_id))
+            return cursor.rowcount > 0
+
+    def get_session_by_title(self, title: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, {', '.join(_SESSION_METADATA_COLUMNS)} FROM {_SCHEMA}.sessions WHERE title = %s", (title,))
+            return cursor.fetchone()
+
+    def resolve_session_by_title(self, title: str) -> str | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id FROM {_SCHEMA}.sessions WHERE title LIKE %s ESCAPE '\\' ORDER BY started_at DESC", (_escape_like(title) + " #%",))
+            row = cursor.fetchone()
+            if row:
+                return str(row["id"])
+            cursor.execute(f"SELECT id FROM {_SCHEMA}.sessions WHERE title = %s", (title,))
+            row = cursor.fetchone()
+            return None if row is None else str(row["id"])
+
+    def get_next_title_in_lineage(self, base_title: str) -> str:
+        match = _NUMBERED_TITLE_RE.match(base_title)
+        base = match.group(1) if match else base_title
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT title FROM {_SCHEMA}.sessions WHERE title = %s OR title LIKE %s ESCAPE '\\'", (base, _escape_like(base) + " #%"))
+            rows = cursor.fetchall()
+        if not rows:
+            return base
+        numbers = [int(match.group(2)) for row in rows if (match := _NUMBERED_TITLE_RE.match(row["title"]))]
+        return f"{base} #{max([1, *numbers]) + 1}"
 
     def close(self) -> None:
         with self._lock:

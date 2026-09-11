@@ -97,3 +97,49 @@ def test_postgresql_store_rejects_missing_driver_before_open(monkeypatch):
         assert _DSN_ENV in str(exc)
     else:
         raise AssertionError("PostgreSQL selection unexpectedly opened a fallback store")
+
+
+def test_sqlite_and_postgresql_title_contract_parity(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    try:
+        for store in stores:
+            root, tip = f"title-root-{uuid.uuid4()}", f"title-tip-{uuid.uuid4()}"
+            base_title = f"Project Plan {uuid.uuid4()}"
+            store.ensure_session(root, source="integration")
+            store.end_session(root, "compression")
+            store.ensure_session(tip, source="integration", metadata={"parent_session_id": root})
+            assert store.set_session_title(root, base_title)
+            assert store.set_session_title(tip, f"{base_title} #2")
+            assert store.set_session_title(tip, base_title)
+            assert store.get_session_title(root) is None
+            assert store.get_session_title(tip) == base_title
+            assert store.get_session_by_title(base_title)["id"] == tip
+            assert store.resolve_session_by_title(base_title) == tip
+            assert store.get_next_title_in_lineage(base_title) == f"{base_title} #2"
+            derived_title, llm_title = f"Derived {uuid.uuid4()}", f"LLM {uuid.uuid4()}"
+            assert store.set_auto_title(tip, derived_title, source="derived") is False
+            assert store.set_session_title_source(tip, "derived")
+            assert store.set_auto_title(tip, llm_title, source="llm")
+            assert store.get_session_title_source(tip) == "llm"
+            canonical = store.get_session_by_title("Bot Chat")
+            if canonical is None:
+                ordinary = f"title-ordinary-{uuid.uuid4()}"
+                store.ensure_session(ordinary, source="integration")
+                assert store.set_session_title(ordinary, "Bot Chat")
+                assert store.set_session_hidden(ordinary, True)
+            else:
+                ordinary = canonical["id"]
+                assert bool(canonical["hidden"]) is True
+            with pytest.raises(ValueError, match="canonical Bot Chat"):
+                store.set_session_title(ordinary, "renamed")
+            observations.append({
+                "tip_source": store.get_session_title_source(tip),
+                "canonical_title": store.get_session_title(ordinary),
+                "canonical_hidden": bool(store.get_session(ordinary)["hidden"]),
+            })
+        assert observations == [{"tip_source": "llm", "canonical_title": "Bot Chat", "canonical_hidden": True}] * 2
+    finally:
+        for store in stores:
+            store.close()
