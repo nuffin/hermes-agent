@@ -24,13 +24,6 @@ def test_postgresql_state_store_fixture_is_live_with_named_pgdata_and_vector():
     extensions = _docker(
         "exec", "hermes-agent-postgresql-state-store-dev", "psql", "-At", "-v", "ON_ERROR_STOP=1",
         "-U", "hermes_state_store_test", "-d", "hermes_state_store_test",
-        "-c", "CREATE EXTENSION IF NOT EXISTS vector; SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+        "-c", "SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pg_trgm') ORDER BY extname",
     )
-    assert extensions.stdout.strip()
-
-    trgm = _docker(
-        "exec", "hermes-agent-postgresql-state-store-dev", "psql", "-At", "-v", "ON_ERROR_STOP=1",
-        "-U", "hermes_state_store_test", "-d", "hermes_state_store_test",
-        "-c", "CREATE EXTENSION IF NOT EXISTS pg_trgm; SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'",
-    )
-    assert trgm.stdout.strip().splitlines()[-1] == "pg_trgm"
+    assert extensions.stdout.strip().splitlines() == ["pg_trgm", "vector"]

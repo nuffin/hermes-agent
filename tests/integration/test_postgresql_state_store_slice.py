@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import uuid
 
 import pytest
 
-from state_store import open_state_store
+from state_store import StateStoreConfigurationError, open_state_store
 
 
 _DSN_ENV = "HERMES_STATE_STORE_TEST_DSN"
@@ -25,6 +26,37 @@ def _config() -> dict[str, object]:
             },
         },
     }
+
+
+def _psycopg():
+    return importlib.import_module("psycopg")
+
+
+def _reset_schema(dsn: str) -> None:
+    with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute("DROP SCHEMA IF EXISTS hermes_state_store_slice CASCADE")
+
+
+def _seed_v2_schema(dsn: str, ledger_versions: tuple[int, ...]) -> None:
+    """Seed the actual v1/v2 shape, optionally with historical ledger rows."""
+    with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute("CREATE SCHEMA hermes_state_store_slice")
+        cursor.execute("CREATE TABLE hermes_state_store_slice.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
+        cursor.execute("CREATE TABLE hermes_state_store_slice.sessions (id text PRIMARY KEY, source text NOT NULL, started_at double precision NOT NULL, ended_at double precision, end_reason text)")
+        cursor.execute("CREATE TABLE hermes_state_store_slice.messages (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, session_id text NOT NULL REFERENCES hermes_state_store_slice.sessions(id), role text NOT NULL, content text, created_at double precision NOT NULL)")
+        cursor.execute("CREATE INDEX messages_session_id_id ON hermes_state_store_slice.messages (session_id, id)")
+        for column, type_name in (("user_id", "text"), ("session_key", "text"), ("chat_id", "text"), ("chat_type", "text"), ("thread_id", "text"), ("display_name", "text"), ("origin_json", "text"), ("model", "text"), ("model_config", "jsonb"), ("parent_session_id", "text"), ("cwd", "text"), ("profile_name", "text"), ("git_repo_root", "text")):
+            cursor.execute(f"ALTER TABLE hermes_state_store_slice.sessions ADD COLUMN {column} {type_name}")
+        cursor.execute("CREATE INDEX sessions_source_session_key ON hermes_state_store_slice.sessions (source, session_key)")
+        cursor.execute("CREATE INDEX sessions_parent_session_id ON hermes_state_store_slice.sessions (parent_session_id)")
+        for version in ledger_versions:
+            cursor.execute("INSERT INTO hermes_state_store_slice.schema_migrations (version, applied_at) VALUES (%s, 1)", (version,))
+
+
+def _migration_versions(dsn: str) -> list[int]:
+    with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT version FROM hermes_state_store_slice.schema_migrations ORDER BY version")
+        return [int(row[0]) for row in cursor.fetchall()]
 
 
 def test_postgresql_store_persists_session_messages_and_closes_pool(monkeypatch):
@@ -134,6 +166,10 @@ def test_sqlite_and_postgresql_title_contract_parity(monkeypatch, tmp_path):
                 assert bool(canonical["hidden"]) is True
             with pytest.raises(ValueError, match="canonical Bot Chat"):
                 store.set_session_title(ordinary, "renamed")
+            surrogate_id = f"title-surrogate-{uuid.uuid4()}"
+            store.ensure_session(surrogate_id, source="integration")
+            assert store.set_session_title(surrogate_id, "\ud800 Clean\u200b Title")
+            assert store.get_session_title(surrogate_id) == "� Clean Title"
             observations.append({
                 "tip_source": store.get_session_title_source(tip),
                 "canonical_title": store.get_session_title(ordinary),
@@ -143,3 +179,68 @@ def test_sqlite_and_postgresql_title_contract_parity(monkeypatch, tmp_path):
     finally:
         for store in stores:
             store.close()
+
+
+def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_complete(monkeypatch):
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    _reset_schema(dsn)
+    try:
+        store = open_state_store(_config())
+        store.close()
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
+            columns = {row[0] for row in cursor.fetchall()}
+            assert {"id", "source", "started_at", "parent_session_id", "title", "title_source", "hidden"} <= columns
+            cursor.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'hermes_state_store_slice'")
+            assert {"messages_session_id_id", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique"} <= {row[0] for row in cursor.fetchall()}
+            cursor.execute("SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'hermes_state_store_slice.sessions'::regclass AND contype = 'f' ORDER BY conname")
+            assert cursor.fetchall() == [("sessions_parent_session_id_fkey", False)]
+        store = open_state_store(_config())
+        store.close()
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+    finally:
+        _reset_schema(dsn)
+
+
+def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypatch):
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    _reset_schema(dsn)
+    try:
+        _seed_v2_schema(dsn, (1, 2))
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("INSERT INTO hermes_state_store_slice.sessions (id, source, started_at) VALUES ('survives-v2', 'fixture', 1)")
+        store = open_state_store(_config())
+        session = store.get_session("survives-v2")
+        assert session is not None
+        assert session["source"] == "fixture"
+        store.close()
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+
+        _reset_schema(dsn)
+        _seed_v2_schema(dsn, (1, 2, 3, 4))
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
+        store = open_state_store(_config())
+        store.close()
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+
+        _reset_schema(dsn)
+        _seed_v2_schema(dsn, (1, 2, 5))
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD COLUMN title text")
+            cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD COLUMN title_source text")
+            cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD COLUMN hidden boolean NOT NULL DEFAULT false")
+            cursor.execute("CREATE UNIQUE INDEX sessions_title_unique ON hermes_state_store_slice.sessions (title) WHERE title IS NOT NULL")
+            cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
+        store = open_state_store(_config())
+        store.close()
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
+        with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
+            open_state_store(_config())
+    finally:
+        _reset_schema(dsn)
