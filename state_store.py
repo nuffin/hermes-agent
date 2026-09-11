@@ -100,6 +100,7 @@ class ContextualSessionSearchStore(Protocol):
         self, *, limit: int, exclude_sources: list[str], timeout_seconds: float,
     ) -> list[dict[str, Any]]: ...
     def search_index_status(self) -> dict[str, Any] | None: ...
+    def rebuild_search_index(self) -> dict[str, Any] | None: ...
     def close(self) -> None: ...
 
 
@@ -540,6 +541,10 @@ class SqliteContextualSessionSearchStore:
     def search_index_status(self) -> dict[str, Any] | None:
         return self._session_db.fts_rebuild_status()
 
+    def rebuild_search_index(self) -> dict[str, Any] | None:
+        self._session_db.rebuild_fts()
+        return self.search_index_status()
+
     def close(self) -> None:
         self._session_db.close()
 
@@ -552,6 +557,23 @@ def contextual_session_search_store(session_db=None, *, db_path: Path | None = N
     implementation; returning it here would expose partial histories and break
     lineage/compaction semantics.
     """
+    if backend == "postgresql":
+        required = (
+            "get_session", "get_messages", "get_messages_around", "get_anchored_view",
+            "get_message_storage_state", "search_messages", "resolve_session_by_title",
+            "list_recent_sessions_bounded", "search_index_status", "rebuild_search_index", "close",
+        )
+        candidate = session_db
+        missing = [name for name in required if not callable(getattr(candidate, name, None))]
+        if missing:
+            raise ContextualSessionSearchUnavailable(
+                "PostgreSQL state store does not implement contextual session search: missing " + ", ".join(missing))
+        assert candidate is not None
+        status = candidate.search_index_status()
+        if not status.get("available"):
+            raise ContextualSessionSearchUnavailable(
+                "PostgreSQL contextual session search is unavailable: generated-search health is not valid")
+        return cast(ContextualSessionSearchStore, session_db)
     if backend != "sqlite":
         raise ContextualSessionSearchUnavailable(
             f"state-store backend '{backend}' does not implement contextual session search")
