@@ -591,12 +591,17 @@ class SessionDB(
         # is queryable AND not marked stale.
         self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
         self._conn = None
-        # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
-        self._token_queue: deque = deque()
-        self._token_queue_cond = threading.Condition(threading.Lock())
-        self._token_writer_thread: Optional[threading.Thread] = None
-        self._token_writer_stop = self._token_writer_busy = False
-        self._token_atexit_hook: Optional[Callable[[], None]] = None
+        # Async token accounting is backend-neutral: SQLite supplies only the atomic
+        # one-delta persistence callback; the transport owns its queue/lifecycle.
+        from token_usage_transport import TokenUsageTransport
+        self._token_usage_transport = TokenUsageTransport(
+            lambda session_id, **kwargs: self.update_token_counts(session_id, **kwargs),
+            sum_fields=self._TOKEN_DELTA_SUM_FIELDS,
+            cost_fields=self._TOKEN_DELTA_COST_FIELDS,
+            route_fields=self._TOKEN_DELTA_ROUTE_FIELDS,
+            idle_seconds=lambda: self._TOKEN_WRITER_IDLE_SECONDS,
+            coalesce=lambda batch: self._coalesce_token_deltas(batch),
+        )
         # Opened via hermes_state_registry.acquire(): close() releases a refcount instead.
         # Set True when this instance is opened via hermes_state_registry.acquire(). Makes close() a no-op so the
         # registry (not individual callers) controls the connection lifecycle (#90837).
@@ -1445,10 +1450,7 @@ class SessionDB(
             from hermes_state_registry import release
             release(self)
             return
-        self._stop_token_writer()
-        hook, self._token_atexit_hook = self._token_atexit_hook, None
-        if hook is not None:
-            atexit.unregister(hook)
+        self._token_usage_transport.close()
         # Closed flag first: an in-flight reader then closes its own connection.
         with self._read_conns_lock:
             self._read_conns_closed = True
