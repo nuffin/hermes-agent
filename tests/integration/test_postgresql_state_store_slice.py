@@ -181,6 +181,57 @@ def test_sqlite_and_postgresql_title_contract_parity(monkeypatch, tmp_path):
             store.close()
 
 
+def test_sqlite_and_postgresql_visibility_summary_contract_parity(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    root, tip = f"visibility-root-{uuid.uuid4()}", f"visibility-tip-{uuid.uuid4()}"
+    hidden, archived, excluded, pinned = (f"visibility-{name}-{uuid.uuid4()}" for name in ("hidden", "archived", "excluded", "pinned"))
+    try:
+        for store in stores:
+            store.ensure_session(root, source="visible")
+            store.append_message(root, role="user", content="root")
+            store.end_session(root, "compression")
+            store.ensure_session(tip, source="visible", metadata={"parent_session_id": root})
+            store.append_message(tip, role="assistant", content="tip")
+            store.ensure_session(hidden, source="visible")
+            store.ensure_session(archived, source="visible")
+            store.ensure_session(excluded, source="excluded")
+            store.ensure_session(pinned, source="visible")
+            assert store.set_session_hidden(hidden, True)
+            assert store.set_session_archived(root, True)
+            assert store.set_session_pinned(pinned, True)
+            assert store.set_session_pinned(hidden, True)
+            assert store.get_session(root)["archived"] is True
+            assert store.get_session(tip)["archived"] is True
+            assert store.get_session(hidden)["hidden"] is False
+            assert store.set_session_archived("missing", True) is False
+            assert store.set_session_pinned("missing", True) is False
+            normal = store.list_session_summaries(source="visible", limit=2)
+            with_pins = store.list_session_summaries(source="visible", limit=2, include_pinned=True)
+            archived_rows = store.list_session_summaries(source="visible", archived_only=True, include_hidden=True)
+            visible_rows = store.list_session_summaries(source="visible", exclude_sources=("excluded",), include_hidden=True)
+            all_rows = store.list_session_summaries(source="visible", include_archived=True, include_hidden=True)
+            observations.append({
+                "normal_ids": [row["id"] for row in normal],
+                "with_pins_ids": [row["id"] for row in with_pins],
+                "archived_ids": sorted(row["id"] for row in archived_rows),
+                "visible_ids": sorted(row["id"] for row in visible_rows),
+                "tip_message_count": next(row["message_count"] for row in all_rows if row["id"] == tip),
+                "boolean_types": [type(row[key]) is bool for row in with_pins for key in ("hidden", "archived", "pinned")],
+            })
+        assert observations[0] == observations[1]
+        assert observations[0]["normal_ids"] == observations[0]["with_pins_ids"][:2]
+        assert pinned in observations[0]["with_pins_ids"]
+        assert observations[0]["archived_ids"] == sorted([root, tip])
+        assert excluded not in observations[0]["visible_ids"]
+        assert observations[0]["tip_message_count"] == 1
+        assert all(observations[0]["boolean_types"])
+    finally:
+        for store in stores:
+            store.close()
+
+
 def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_complete(monkeypatch):
     dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
     monkeypatch.setenv(_DSN_ENV, dsn)
@@ -188,18 +239,18 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
-            assert {"id", "source", "started_at", "parent_session_id", "title", "title_source", "hidden"} <= columns
+            assert {"id", "source", "started_at", "parent_session_id", "title", "title_source", "hidden", "archived", "pinned"} <= columns
             cursor.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'hermes_state_store_slice'")
-            assert {"messages_session_id_id", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique"} <= {row[0] for row in cursor.fetchall()}
+            assert {"messages_session_id_id", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute("SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'hermes_state_store_slice.sessions'::regclass AND contype = 'f' ORDER BY conname")
             assert cursor.fetchall() == [("sessions_parent_session_id_fkey", False)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
     finally:
         _reset_schema(dsn)
 
@@ -217,7 +268,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -225,7 +276,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -237,7 +288,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):

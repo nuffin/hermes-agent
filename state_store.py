@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, cast
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SUPPORTED_BACKENDS = frozenset({"sqlite", "postgresql"})
@@ -43,7 +43,7 @@ class ResolvedStateStoreConfig:
 
 
 class StateStore(Protocol):
-    """Incremental session/message/title contract; broader SessionDB APIs stay out of scope."""
+    """Incremental session/message/title/visibility contract; broader SessionDB APIs stay out of scope."""
 
     def ensure_session(
         self, session_id: str, source: str = "unknown", *, metadata: Mapping[str, Any] | None = None,
@@ -58,6 +58,17 @@ class StateStore(Protocol):
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
 
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool: ...
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool: ...
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool: ...
+
+    def list_session_summaries(
+        self, *, source: str | None = None, exclude_sources: tuple[str, ...] = (),
+        limit: int = 20, offset: int = 0, include_archived: bool = False,
+        archived_only: bool = False, include_hidden: bool = False,
+        include_pinned: bool = False,
+    ) -> list[dict[str, Any]]: ...
 
     def set_session_title(self, session_id: str, title: str) -> bool: ...
 
@@ -158,10 +169,46 @@ class SqliteStateStore:
         self._session_db.end_session(session_id, end_reason)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
-        return self._session_db.get_session(session_id)
+        row = self._session_db.get_session(session_id)
+        if row is not None:
+            for key in ("hidden", "archived", "pinned"):
+                row[key] = bool(row.get(key))
+        return row
 
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
         return self._session_db.set_session_hidden(session_id, hidden)
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        return self._session_db.set_session_archived(session_id, archived)
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        return self._session_db.set_session_pinned(session_id, pinned)
+
+    def list_session_summaries(
+        self, *, source: str | None = None, exclude_sources: tuple[str, ...] = (),
+        limit: int = 20, offset: int = 0, include_archived: bool = False,
+        archived_only: bool = False, include_hidden: bool = False,
+        include_pinned: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Narrow list contract retaining SessionDB's filters, MRU order, and pin back-fill."""
+        rows = self._session_db.list_sessions_rich(
+            source=cast(Any, source), exclude_sources=cast(Any, list(exclude_sources) or None), limit=limit, offset=offset,
+            include_archived=include_archived, archived_only=archived_only,
+            include_hidden=include_hidden, include_pinned=include_pinned,
+            include_children=True, project_compression_tips=False, order_by_last_active=True, compact_rows=True,
+        )
+        keys = (
+            "id", "source", "started_at", "ended_at", "end_reason", "parent_session_id", "title",
+            "title_source", "hidden", "archived", "pinned", "last_active",
+        )
+        return [
+            {
+                **{key: row.get(key) for key in keys},
+                "hidden": bool(row.get("hidden")), "archived": bool(row.get("archived")),
+                "pinned": bool(row.get("pinned")), "message_count": len(self._session_db.get_messages(row["id"])),
+            }
+            for row in rows
+        ]
 
     def set_session_title(self, session_id: str, title: str) -> bool:
         return self._session_db.set_session_title(session_id, title)
