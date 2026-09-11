@@ -13,7 +13,9 @@ from typing import Any, cast
 
 import pytest
 
-from state_store import MessageRecord, StateStoreConfigurationError, open_state_store
+from state_store import (
+    MessageRecord, StateStoreConfigurationError, contextual_session_search_store, open_state_store,
+)
 from hermes_state import SessionDB
 
 
@@ -315,7 +317,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 17))
+        assert _migration_versions(dsn) == list(range(1, 18))
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -340,7 +342,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 17))
+        assert _migration_versions(dsn) == list(range(1, 18))
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
             cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
@@ -363,7 +365,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 17))
+        assert _migration_versions(dsn) == list(range(1, 18))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -371,7 +373,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 17))
+        assert _migration_versions(dsn) == list(range(1, 18))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -383,7 +385,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 17))
+        assert _migration_versions(dsn) == list(range(1, 18))
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute(f"DROP INDEX {_SCHEMA}.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
@@ -643,7 +645,7 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
         postgresql = cast(Any, stores[1])
         with postgresql._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
-            assert [row[0] for row in cursor.fetchall()][-4:] == [13, 14, 15, 16]
+            assert [row[0] for row in cursor.fetchall()][-4:] == [14, 15, 16, 17]
     finally:
         for store in stores:
             store.close()
@@ -1073,6 +1075,59 @@ def test_postgresql_anchored_and_scroll_views_match_sqlite_physical_boundaries(m
         page = pg_contextual.get_messages_around("contextual", pg_ids[1], window=1)
         next_page = pg_contextual.get_messages_around("contextual", page["window"][-1]["id"], window=1)
         assert page["window"][-1]["id"] in [row["id"] for row in next_page["window"]]
+    finally:
+        sqlite.close()
+        postgresql.close()
+        _reset_schema(dsn)
+
+
+def test_postgresql_generated_search_health_rebuild_and_contextual_admission(monkeypatch, tmp_path):
+    """PG18 catalog drift is tenant-local, repairable, and never SQLite FTS progress."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    _reset_schema(dsn)
+    sqlite = SessionDB(tmp_path / "sqlite-state.db")
+    postgresql = cast(Any, open_state_store(_config()))
+    try:
+        postgresql.ensure_session("health", source="integration")
+        message_id = postgresql.append_message("health", role="user", content="health needle")
+        assert sqlite.fts_rebuild_status() is None
+        healthy = postgresql.search_index_status()
+        assert healthy["backend"] == "postgresql"
+        assert healthy["available"] is True and healthy["query_path_available"] is True
+        assert healthy["generated_document"] == "valid" and healthy["gin_index"] == "valid"
+        assert healthy["rebuild"] == {"supported": True, "operation": "reindex_or_create", "in_progress": False}
+        assert healthy["sqlite_fts_semantics"] == {
+            "corruption_detach": False, "canonical_like_fallback": False,
+            "deferred_backfill": False, "high_water": False, "retry_quarantine": False,
+        }
+        contextual = contextual_session_search_store(postgresql, backend="postgresql")
+        assert contextual.get_message_storage_state(message_id) == {"session_id": "health", "active": 1, "compacted": 0}
+        assert contextual.search_messages("health", fields=("session_id",)) == [{"session_id": "health"}]
+
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(f"DROP INDEX {_SCHEMA}.messages_search_document_gin")
+        missing = postgresql.search_index_status()
+        assert missing["available"] is False and missing["gin_index"] == "missing"
+        # The predicate can sequential-scan, but contextual admission is explicitly fail-closed.
+        assert postgresql.search_messages("health", fields=("session_id",)) == [{"session_id": "health"}]
+        with pytest.raises(Exception, match="generated-search health"):
+            contextual_session_search_store(postgresql, backend="postgresql")
+        repaired = postgresql.rebuild_search_index()
+        assert repaired["available"] is True and repaired["rebuild"]["operation"] == "create"
+        assert repaired["last_successful_rebuild_at"] is not None
+
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(f"DROP INDEX {_SCHEMA}.messages_search_document_gin")
+            cursor.execute(f"CREATE INDEX messages_search_document_gin ON {_SCHEMA}.messages (search_document)")
+        assert postgresql.search_index_status()["gin_index"] == "invalid"
+        assert postgresql.rebuild_search_index()["rebuild"]["operation"] == "replace_invalid"
+        assert postgresql.search_index_status()["gin_index"] == "valid"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _: postgresql.rebuild_search_index(), range(2)))
+        assert all(outcome["available"] for outcome in outcomes)
+        assert {outcome["rebuild"]["operation"] for outcome in outcomes} <= {"reindex", "already_running"}
     finally:
         sqlite.close()
         postgresql.close()
