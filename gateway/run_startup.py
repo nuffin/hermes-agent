@@ -330,7 +330,7 @@ class GatewayStartupMixin:
         return claimed
 
     @staticmethod
-    async def _release_runtime_claim_quiet(obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
+    async def _release_runtime_claim_quiet(receipt, log_fmt: str, error: str = "send_path_degraded") -> None:
         """Release an unsent runtime delivery-ledger claim; log-only on failure. ``error`` is what the row
         goes back to ``failed`` with: the claim's own pre-claim error when the caller knows it, so a
         flood-refused row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the
@@ -338,9 +338,9 @@ class GatewayStartupMixin:
         ``send_path_degraded``."""
         from gateway.delivery_ledger import release_runtime_claim
         try:
-            await asyncio.to_thread(release_runtime_claim, obligation_id, error)
+            await asyncio.to_thread(release_runtime_claim, receipt, error)
         except Exception:
-            logger.debug(log_fmt, obligation_id, exc_info=True)
+            logger.debug(log_fmt, getattr(receipt, "obligation_id", receipt), exc_info=True)
 
     def _schedule_flood_redelivery(self, platform, *, profile: Optional[str] = None) -> None:
         """Wake one deadline-driven ledger worker per bot identity, never sleep in a send."""
@@ -426,7 +426,7 @@ class GatewayStartupMixin:
                 result = None
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    await asyncio.to_thread(mark_delivered, row["receipt"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
@@ -434,7 +434,7 @@ class GatewayStartupMixin:
                     )
                 else:
                     await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        mark_failed, row["receipt"], str(getattr(result, "error", "") or "send failed")
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
@@ -464,8 +464,8 @@ class GatewayStartupMixin:
 
             last_error = row.get("last_error")
             await self._release_runtime_claim_quiet(
-                row["obligation_id"], "failed to release undispatched runtime obligation %s",
-                error=last_error if is_flood_error(last_error) else "send_path_degraded",
+                row["receipt"], "failed to release undispatched runtime obligation %s",
+                error=str(last_error) if is_flood_error(last_error) else "send_path_degraded",
             )
         return adapter
 
@@ -498,7 +498,7 @@ class GatewayStartupMixin:
         for row in claimed:
             if row["obligation_id"] not in sendable_ids:
                 await self._release_runtime_claim_quiet(
-                    row["obligation_id"], "failed to release runtime delivery claim %s",
+                    row["receipt"], "failed to release runtime delivery claim %s",
                     error=row.get("last_error") or "send_path_degraded",
                 )
         return await self._redeliver_claimed_obligations(sendable)

@@ -4023,7 +4023,7 @@ class BasePlatformAdapter(ABC):
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Any:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
@@ -4043,20 +4043,20 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
+            receipt = await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
-            return obligation_id
+            receipt = await asyncio.to_thread(mark_attempting, receipt)
+            return receipt
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
     async def _finalize_delivery_obligation(
-        self, obligation_id: str, result: Any, event: MessageEvent,
+        self, obligation_id: Any, result: Any, event: MessageEvent,
         delivery_adapter: "BasePlatformAdapter") -> None:
         """Mark the ledger row delivered/failed (best-effort). On ``send_path_degraded`` with a
         replacement adapter live, trigger another redelivery sweep (the watcher's may have run
