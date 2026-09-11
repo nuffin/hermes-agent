@@ -313,11 +313,16 @@ def _discover_payload(db, query: str, detail: str, results: list, **extra) -> st
     """Discovery response; notes FTS backfill progress so the agent can explain thin
     results instead of treating them as ground truth."""
     status = _quiet(db.search_index_status, None, "search-index status lookup failed")
-    rebuild = {} if status is None else {"index_rebuild": {"percent": status["percent"], "note": (
-        f"The search index is rebuilding in the background ({status['percent']}% done, "
-        f"{status['indexed']:,} of {status['total']:,} messages). Results from older messages "
-        f"may be incomplete until it finishes.")}}
-    return _ok(mode="discover", query=query, detail=detail, results=results, count=len(results), **extra, **rebuild)
+    if status is None:
+        health = {}
+    elif status.get("backend") == "postgresql":
+        health = {"search_index": status}
+    else:
+        health = {"index_rebuild": {"percent": status["percent"], "note": (
+            f"The search index is rebuilding in the background ({status['percent']}% done, "
+            f"{status['indexed']:,} of {status['total']:,} messages). Results from older messages "
+            f"may be incomplete until it finishes.")}}
+    return _ok(mode="discover", query=query, detail=detail, results=results, count=len(results), **extra, **health)
 
 
 def _bookend(view: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
@@ -356,6 +361,9 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
+    index_status = _quiet(db.search_index_status, None, "search-index status lookup failed")
+    if index_status and index_status.get("backend") == "postgresql" and not index_status.get("available"):
+        return tool_error("Search unavailable: PostgreSQL generated-search health is not valid", success=False)
     title_result = _title_match_result(db, query, current_lineage_root)
     # FTS rows are time-bounded in SQL (_search_filter_clauses); the title match bypasses that
     # query, so it is the one place the window is re-checked in Python.
