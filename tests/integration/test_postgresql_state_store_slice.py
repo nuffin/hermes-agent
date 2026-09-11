@@ -309,7 +309,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -328,7 +328,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             ]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     finally:
         _reset_schema(dsn)
 
@@ -346,7 +346,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -354,7 +354,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -366,7 +366,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
@@ -413,3 +413,51 @@ def test_sqlite_and_postgresql_resume_projection_and_lineage_parity(monkeypatch,
     finally:
         for store in stores:
             store.close()
+
+
+def test_sqlite_and_postgresql_token_usage_transport_parity(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    try:
+        for store in stores:
+            session_id = f"usage-{uuid.uuid4()}"
+            route = dict(model="m1", billing_provider="p1", billing_base_url="url", billing_mode="mode")
+            store.queue_token_counts(session_id, input_tokens=2, api_call_count=1, **route)
+            store.queue_token_counts(session_id, input_tokens=3, api_call_count=1, **route)
+            store.queue_token_counts(session_id, input_tokens=50, api_call_count=3, absolute=True, **route)
+            assert store.flush_token_counts()
+            store.record_auxiliary_usage(session_id, "vision", model="aux", billing_provider="auxp", input_tokens=7)
+            if hasattr(store, "_connection"):
+                with store._connection() as connection, connection.cursor() as cursor:
+                    cursor.execute("SELECT input_tokens, api_call_count FROM hermes_state_store_slice.sessions WHERE id=%s", (session_id,))
+                    observations.append(cursor.fetchone())
+                    cursor.execute("SELECT task, model, input_tokens FROM hermes_state_store_slice.session_model_usage WHERE session_id=%s ORDER BY task", (session_id,))
+                    assert cursor.fetchall() == [("", "m1", 5), ("vision", "aux", 7)]
+            else:
+                rows = store._session_db._read_all("SELECT task, model, input_tokens FROM session_model_usage WHERE session_id=? ORDER BY task", (session_id,))
+                assert [(row["task"], row["model"], row["input_tokens"]) for row in rows] == [("", "m1", 5), ("vision", "aux", 7)]
+                summary = store._session_db._read_one("SELECT input_tokens, api_call_count FROM sessions WHERE id=?", (session_id,))
+                observations.append((summary["input_tokens"], summary["api_call_count"]))
+        assert observations == [(50, 3), (50, 3)]
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_postgresql_token_usage_delta_rolls_back_summary_when_attribution_fails(monkeypatch):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    store = open_state_store(_config())
+    session_id = f"usage-rollback-{uuid.uuid4()}"
+    try:
+        store.ensure_session(session_id)
+        monkeypatch.setattr(store, "_record_model_usage", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected attribution failure")))
+        with pytest.raises(RuntimeError, match="injected attribution failure"):
+            store.update_token_counts(session_id, input_tokens=9, model="m", billing_provider="p", api_call_count=1)
+        with store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT input_tokens, api_call_count FROM hermes_state_store_slice.sessions WHERE id=%s", (session_id,))
+            assert cursor.fetchone() == (0, 0)
+            cursor.execute("SELECT COUNT(*) FROM hermes_state_store_slice.session_model_usage WHERE session_id=%s", (session_id,))
+            assert cursor.fetchone() == (0,)
+    finally:
+        store.close()

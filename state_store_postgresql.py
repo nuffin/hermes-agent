@@ -20,6 +20,7 @@ from typing import Any
 
 from hermes_cli.timefmt import coerce_epoch
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
+from token_usage_transport import TokenUsageTransport
 
 _SCHEMA = "hermes_state_store_slice"
 _SESSION_METADATA_SCHEMA_VERSION = 2
@@ -33,6 +34,11 @@ _VISIBILITY_SCHEMA_VERSION = 6
 _MESSAGE_RECORD_SCHEMA_VERSION = 7
 _RESUME_PROJECTION_SCHEMA_VERSION = 8
 _SYSTEM_PROMPT_SCHEMA_VERSION = 9
+_MODEL_USAGE_SCHEMA_VERSION = 10
+_USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+_USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
+_USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
+_USAGE_SESSION_COLUMNS = (*_USAGE_COUNTERS, "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode", "api_call_count")
 _MESSAGE_RECORD_COLUMNS = (
     "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "token_count", "finish_reason",
     "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
@@ -92,6 +98,11 @@ class PostgreSQLStateStore:
         self._created = 1
         self._lock = threading.Lock()
         self._closed = False
+        self._token_usage_transport = TokenUsageTransport(
+            self._persist_token_usage_delta, sum_fields=_USAGE_SUM_FIELDS,
+            cost_fields=("estimated_cost_usd", "actual_cost_usd"), route_fields=_USAGE_ROUTE_FIELDS,
+            idle_seconds=lambda: 1.0,
+        )
         connection = self._new_connection()
         try:
             self._probe_and_migrate(connection)
@@ -132,7 +143,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SYSTEM_PROMPT_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _MODEL_USAGE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -145,6 +156,7 @@ class PostgreSQLStateStore:
                     (_MESSAGE_RECORD_SCHEMA_VERSION, self._apply_v7, self._validate_v7),
                     (_RESUME_PROJECTION_SCHEMA_VERSION, self._apply_v8, self._validate_v8),
                     (_SYSTEM_PROMPT_SCHEMA_VERSION, self._apply_v9, self._validate_v9),
+                    (_MODEL_USAGE_SCHEMA_VERSION, self._apply_v10, self._validate_v10),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -306,6 +318,30 @@ class PostgreSQLStateStore:
         self._required_columns(cursor, "sessions", {"system_prompt_hash"})
         self._required_columns(cursor, "system_prompts", {"hash", "prompt"})
         self._require_foreign_key(cursor, "sessions_system_prompt_hash_fkey", "sessions", "system_prompts")
+
+    def _apply_v10(self, cursor: Any) -> None:
+        for column in _USAGE_SESSION_COLUMNS:
+            type_name = "bigint NOT NULL DEFAULT 0" if column in {*_USAGE_COUNTERS, "api_call_count"} else ("double precision" if column in {"estimated_cost_usd", "actual_cost_usd"} else "text")
+            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS {column} {type_name}")
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS {_SCHEMA}.session_model_usage (
+            session_id text NOT NULL REFERENCES {_SCHEMA}.sessions(id) ON DELETE CASCADE,
+            model text NOT NULL, billing_provider text NOT NULL DEFAULT '', billing_base_url text NOT NULL DEFAULT '',
+            billing_mode text NOT NULL DEFAULT '', task text NOT NULL DEFAULT '', api_call_count bigint NOT NULL DEFAULT 0,
+            input_tokens bigint NOT NULL DEFAULT 0, output_tokens bigint NOT NULL DEFAULT 0,
+            cache_read_tokens bigint NOT NULL DEFAULT 0, cache_write_tokens bigint NOT NULL DEFAULT 0,
+            reasoning_tokens bigint NOT NULL DEFAULT 0, estimated_cost_usd double precision NOT NULL DEFAULT 0,
+            actual_cost_usd double precision NOT NULL DEFAULT 0, cost_status text, cost_source text,
+            first_seen double precision, last_seen double precision,
+            PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task))''')
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS session_model_usage_session ON {_SCHEMA}.session_model_usage (session_id)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS session_model_usage_model ON {_SCHEMA}.session_model_usage (model)")
+
+    def _validate_v10(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", set(_USAGE_SESSION_COLUMNS))
+        self._required_columns(cursor, "session_model_usage", {"session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task", "api_call_count", *_USAGE_COUNTERS, "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source", "first_seen", "last_seen"})
+        self._require_index(cursor, "session_model_usage_session")
+        self._require_index(cursor, "session_model_usage_model")
+        self._require_foreign_key(cursor, "session_model_usage_session_id_fkey", "session_model_usage", "sessions")
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -601,6 +637,50 @@ class PostgreSQLStateStore:
             raise SessionResumeTooLargeError(count, max_messages, scope="in its tip segment" if tip_only else "across its lineage")
         return count
 
+    def queue_token_counts(self, session_id: str, **kwargs: Any) -> None:
+        self._token_usage_transport.queue_delta(session_id, kwargs)
+
+    def flush_token_counts(self, timeout: float = 5.0) -> bool:
+        return self._token_usage_transport.flush(timeout)
+
+    def _persist_token_usage_delta(self, session_id: str, **kwargs: Any) -> None:
+        self.update_token_counts(session_id, **kwargs)
+
+    def update_token_counts(self, session_id: str, input_tokens: int = 0, output_tokens: int = 0, model: str | None = None, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None, actual_cost_usd: float | None = None, cost_status: str | None = None, cost_source: str | None = None, pricing_version: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, billing_mode: str | None = None, api_call_count: int = 0, absolute: bool = False) -> None:
+        counters = (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+        has_usage = bool(any(counters) or api_call_count or estimated_cost_usd)
+        accounted = bool(has_usage or actual_cost_usd is not None)
+        self.ensure_session(session_id)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT model, billing_provider, api_call_count FROM {_SCHEMA}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            row = cursor.fetchone() or {}
+            if int(row.get("api_call_count") or 0) == 0 and accounted and model and billing_provider and (row.get("model") != model or row.get("billing_provider") != billing_provider):
+                cursor.execute(f"UPDATE {_SCHEMA}.sessions SET model=%s, billing_provider=%s, billing_base_url=%s, billing_mode=%s WHERE id=%s", (model, billing_provider, billing_base_url, billing_mode, session_id))
+            additions = not absolute
+            set_counters = ", ".join(f"{field} = {'%s' if not additions else field + ' + %s'}" for field in _USAGE_COUNTERS)
+            estimated = "COALESCE(%s, 0)" if absolute else "COALESCE(estimated_cost_usd, 0) + COALESCE(%s, 0)"
+            actual = "CASE WHEN %s::double precision IS NULL THEN actual_cost_usd ELSE %s::double precision END" if absolute else "CASE WHEN %s::double precision IS NULL THEN actual_cost_usd ELSE COALESCE(actual_cost_usd, 0) + %s::double precision END"
+            calls = "%s" if absolute else "api_call_count + %s"
+            route = (billing_provider if accounted else None, billing_base_url if accounted else None, billing_mode if accounted else None, model if accounted else None)
+            cursor.execute(f"UPDATE {_SCHEMA}.sessions SET {set_counters}, estimated_cost_usd={estimated}, actual_cost_usd={actual}, cost_status=COALESCE(%s,cost_status), cost_source=COALESCE(%s,cost_source), pricing_version=COALESCE(%s,pricing_version), billing_provider=COALESCE(billing_provider,%s), billing_base_url=COALESCE(billing_base_url,%s), billing_mode=COALESCE(billing_mode,%s), model=COALESCE(model,%s), api_call_count={calls} WHERE id=%s", (*counters, estimated_cost_usd, actual_cost_usd, actual_cost_usd, cost_status, cost_source, pricing_version, *route, api_call_count, session_id))
+            if not absolute and has_usage:
+                self._record_model_usage(cursor, session_id, model=model, billing_provider=billing_provider, billing_base_url=billing_base_url, billing_mode=billing_mode, input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens, estimated_cost_usd=estimated_cost_usd, actual_cost_usd=actual_cost_usd, cost_status=cost_status, cost_source=cost_source, api_call_count=api_call_count)
+
+    def _record_model_usage(self, cursor: Any, session_id: str, *, model: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, billing_mode: str | None = None, input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None, actual_cost_usd: float | None = None, cost_status: str | None = None, cost_source: str | None = None, api_call_count: int = 0, task: str = "") -> None:
+        session = {}
+        if not task:
+            cursor.execute(f"SELECT model, billing_provider, billing_base_url, billing_mode FROM {_SCHEMA}.sessions WHERE id=%s", (session_id,))
+            session = cursor.fetchone() or {}
+        now = time.time()
+        cursor.execute(f"""INSERT INTO {_SCHEMA}.session_model_usage (session_id,model,billing_provider,billing_base_url,billing_mode,task,api_call_count,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,estimated_cost_usd,actual_cost_usd,cost_status,cost_source,first_seen,last_seen) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (session_id,model,billing_provider,billing_base_url,billing_mode,task) DO UPDATE SET api_call_count=session_model_usage.api_call_count+EXCLUDED.api_call_count,input_tokens=session_model_usage.input_tokens+EXCLUDED.input_tokens,output_tokens=session_model_usage.output_tokens+EXCLUDED.output_tokens,cache_read_tokens=session_model_usage.cache_read_tokens+EXCLUDED.cache_read_tokens,cache_write_tokens=session_model_usage.cache_write_tokens+EXCLUDED.cache_write_tokens,reasoning_tokens=session_model_usage.reasoning_tokens+EXCLUDED.reasoning_tokens,estimated_cost_usd=session_model_usage.estimated_cost_usd+EXCLUDED.estimated_cost_usd,actual_cost_usd=session_model_usage.actual_cost_usd+EXCLUDED.actual_cost_usd,cost_status=COALESCE(EXCLUDED.cost_status,session_model_usage.cost_status),cost_source=COALESCE(EXCLUDED.cost_source,session_model_usage.cost_source),last_seen=EXCLUDED.last_seen""", (session_id,model or session.get("model") or "unknown",billing_provider or session.get("billing_provider") or "",billing_base_url or session.get("billing_base_url") or "",billing_mode or session.get("billing_mode") or "",task or "",api_call_count or 0,input_tokens or 0,output_tokens or 0,cache_read_tokens or 0,cache_write_tokens or 0,reasoning_tokens or 0,float(estimated_cost_usd or 0),float(actual_cost_usd or 0),cost_status,cost_source,now,now))
+
+    def record_auxiliary_usage(self, session_id: str, task: str, **kwargs: Any) -> None:
+        if not session_id or not task:
+            return
+        self.ensure_session(session_id)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._record_model_usage(cursor, session_id, task=task, api_call_count=int(kwargs.pop("api_call_count", 1) if kwargs.get("api_call_count") is not None else 1), **kwargs)
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -811,6 +891,7 @@ class PostgreSQLStateStore:
         return f"{base} #{max([1, *numbers]) + 1}"
 
     def close(self) -> None:
+        self._token_usage_transport.close()
         with self._lock:
             if self._closed:
                 return
