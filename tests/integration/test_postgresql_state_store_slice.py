@@ -312,11 +312,11 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
-            assert {"id", "source", "started_at", "parent_session_id", "system_prompt_hash", "title", "title_source", "hidden", "archived", "pinned"} <= columns
+            assert {"id", "source", "started_at", "parent_session_id", "system_prompt_hash", "title", "title_source", "hidden", "archived", "pinned", "git_branch", "git_metadata_generation"} <= columns
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'system_prompts'")
             assert {"hash", "prompt"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'messages'")
@@ -337,7 +337,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("ALTER TABLE hermes_state_store_slice.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
             cursor.execute("ALTER TABLE hermes_state_store_slice.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
@@ -360,7 +360,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -368,7 +368,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -380,7 +380,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
@@ -640,7 +640,106 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
         postgresql = cast(Any, stores[1])
         with postgresql._connection() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT version FROM hermes_state_store_slice.schema_migrations ORDER BY version")
-            assert [row[0] for row in cursor.fetchall()][-2:] == [11, 12]
+            assert [row[0] for row in cursor.fetchall()][-3:] == [11, 12, 13]
     finally:
         for store in stores:
             store.close()
+
+
+def test_sqlite_and_postgresql_git_metadata_claim_publish_parity(monkeypatch, tmp_path):
+    """Moves fence stale probes, while failed replacement probes preserve known metadata."""
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    try:
+        for store in stores:
+            parent, child = f"git-parent-{uuid.uuid4()}", f"git-child-{uuid.uuid4()}"
+            store.ensure_session(parent, source="integration", metadata={"cwd": "/parent"})
+            parent_generation = store.update_session_cwd(parent, "/parent")
+            assert isinstance(parent_generation, int)
+            assert store.publish_session_git_metadata(parent, "/parent", parent_generation, "main", "/parent")
+            store.ensure_session(child, source="integration", metadata={"parent_session_id": parent})
+            inherited = store.get_session(child)
+            assert inherited is not None
+            assert (inherited["cwd"], inherited["git_branch"], inherited["git_repo_root"]) == ("/parent", "main", "/parent")
+            session = f"git-metadata-{uuid.uuid4()}"
+            store.ensure_session(session, source="integration", metadata={"cwd": "/repo/A"})
+            first = store.update_session_cwd(session, "/repo/A")
+            assert isinstance(first, int) and not isinstance(first, bool)
+            assert store.publish_session_git_metadata(session, "/repo/A", first, "baseline", "/repo/A")
+            failed = store.update_session_cwd(session, "/repo/A")
+            assert isinstance(failed, int)
+            assert not store.publish_session_git_metadata(session, "/repo/A", failed)
+            baseline = store.get_session(session)
+            assert baseline is not None
+            assert (baseline["git_branch"], baseline["git_repo_root"]) == ("baseline", "/repo/A")
+            stale = store.update_session_cwd(session, "/repo/A")
+            moved = store.update_session_cwd(session, "/repo/B")
+            current = store.update_session_cwd(session, "/repo/A")
+            assert isinstance(stale, int) and isinstance(moved, int) and isinstance(current, int)
+            assert current > moved > stale > first
+            assert store.publish_session_git_metadata(session, "/repo/A", current, "current", "/repo/current")
+            assert not store.publish_session_git_metadata(session, "/repo/A", stale, "stale", "/repo/stale")
+            row = store.get_session(session)
+            assert row is not None
+            observations.append((row["cwd"], row["git_branch"], row["git_repo_root"], row["git_metadata_generation"]))
+        assert [(cwd, branch, root) for cwd, branch, root, _ in observations] == [
+            ("/repo/A", "current", "/repo/current"),
+        ] * 2
+        assert all(generation >= 4 for _, _, _, generation in observations)
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_postgresql_git_metadata_claims_are_fenced_under_concurrency(monkeypatch):
+    """Two writers may both claim, but only the current `(cwd, generation)` may publish."""
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    first_store, second_store = open_state_store(_config()), open_state_store(_config())
+    session = f"git-metadata-concurrent-{uuid.uuid4()}"
+    try:
+        first_store.ensure_session(session, source="integration", metadata={"cwd": "/initial"})
+        barrier = Barrier(2)
+
+        def claim(store, cwd: str) -> tuple[str, int | None]:
+            barrier.wait()
+            return cwd, store.update_session_cwd(session, cwd)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claims = list(executor.map(lambda args: claim(*args), ((first_store, "/repo/A"), (second_store, "/repo/B"))))
+        assert all(isinstance(generation, int) for _, generation in claims)
+        claimed = [(cwd, cast(int, generation)) for cwd, generation in claims]
+        outcomes = [
+            store.publish_session_git_metadata(session, cwd, generation, cwd.rsplit("/", 1)[-1], cwd)
+            for store, (cwd, generation) in zip((first_store, second_store), claimed)
+        ]
+        assert outcomes.count(True) == 1
+        row = first_store.get_session(session)
+        assert row is not None
+        assert row["git_metadata_generation"] == max(generation for _, generation in claimed)
+        assert row["git_branch"] == row["cwd"].rsplit("/", 1)[-1]
+        assert row["git_repo_root"] == row["cwd"]
+    finally:
+        first_store.close()
+        second_store.close()
+
+
+def test_postgresql_git_metadata_generation_catalog_drift_fails_closed(monkeypatch):
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    try:
+        for statement in (
+            "ALTER TABLE hermes_state_store_slice.sessions ALTER COLUMN git_metadata_generation SET DEFAULT 10",
+            "ALTER TABLE hermes_state_store_slice.sessions ALTER COLUMN git_branch TYPE bigint USING NULL",
+            "ALTER TABLE hermes_state_store_slice.sessions ALTER COLUMN git_branch SET NOT NULL",
+            "ALTER TABLE hermes_state_store_slice.sessions ALTER COLUMN git_branch SET DEFAULT 'main'",
+        ):
+            _reset_schema(dsn)
+            store = open_state_store(_config())
+            store.close()
+            with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+                cursor.execute(statement)
+            with pytest.raises(StateStoreConfigurationError, match="Git metadata columns"):
+                open_state_store(_config())
+    finally:
+        _reset_schema(dsn)

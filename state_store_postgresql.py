@@ -38,6 +38,7 @@ _SYSTEM_PROMPT_SCHEMA_VERSION = 9
 _MODEL_USAGE_SCHEMA_VERSION = 10
 _CONVERSATION_GENERATION_SCHEMA_VERSION = 11
 _MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION = 12
+_GIT_METADATA_GENERATION_SCHEMA_VERSION = 13
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
 _USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
@@ -146,7 +147,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _GIT_METADATA_GENERATION_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -162,6 +163,7 @@ class PostgreSQLStateStore:
                     (_MODEL_USAGE_SCHEMA_VERSION, self._apply_v10, self._validate_v10),
                     (_CONVERSATION_GENERATION_SCHEMA_VERSION, self._apply_v11, self._validate_v11),
                     (_MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION, self._apply_v12, self._validate_v12),
+                    (_GIT_METADATA_GENERATION_SCHEMA_VERSION, self._apply_v13, self._validate_v13),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -414,6 +416,29 @@ class PostgreSQLStateStore:
             raise StateStoreConfigurationError(
                 f"PostgreSQL State Store schema drift: {_SCHEMA}.sessions.model_config must be jsonb")
 
+    def _apply_v13(self, cursor: Any) -> None:
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS git_branch text")
+        cursor.execute(
+            f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS "
+            "git_metadata_generation bigint NOT NULL DEFAULT 0"
+        )
+
+    def _validate_v13(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {"git_branch", "git_metadata_generation"})
+        cursor.execute(
+            "SELECT branch.data_type, branch.is_nullable, branch.column_default, generation.data_type, generation.is_nullable, generation.column_default "
+            "FROM information_schema.columns AS branch JOIN information_schema.columns AS generation "
+            "ON generation.table_schema = branch.table_schema AND generation.table_name = branch.table_name "
+            "WHERE branch.table_schema = %s AND branch.table_name = 'sessions' "
+            "AND branch.column_name = 'git_branch' AND generation.column_name = 'git_metadata_generation'",
+            (_SCHEMA,),
+        )
+        row = cursor.fetchone()
+        if row is None or row[0] != "text" or row[1] != "YES" or row[2] is not None or row[3] != "bigint" or row[4] != "NO" or str(row[5] or "").strip() != "0":
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.sessions Git metadata columns "
+                "must be git_branch text and git_metadata_generation bigint NOT NULL DEFAULT 0")
+
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
         with self._lock:
@@ -476,6 +501,15 @@ class PostgreSQLStateStore:
                 "origin_json = COALESCE(sessions.origin_json, EXCLUDED.origin_json), "
                 "display_name = COALESCE(sessions.display_name, EXCLUDED.display_name)",
                 values,
+            )
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions AS child SET "
+                "cwd = COALESCE(child.cwd, parent.cwd), "
+                "git_branch = COALESCE(child.git_branch, parent.git_branch), "
+                "git_repo_root = COALESCE(child.git_repo_root, parent.git_repo_root) "
+                f"FROM {_SCHEMA}.sessions AS parent "
+                "WHERE child.id = %s AND child.parent_session_id IS NOT NULL AND parent.id = child.parent_session_id",
+                (session_id,),
             )
         return session_id
 
@@ -906,10 +940,52 @@ class PostgreSQLStateStore:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
                 f"SELECT s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.title, s.title_source, s.hidden, s.archived, s.pinned, "
-                f"s.system_prompt_hash, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
+                f"s.system_prompt_hash, s.git_branch, s.git_metadata_generation, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
                 f"FROM {_SCHEMA}.sessions s LEFT JOIN {_SCHEMA}.system_prompts p ON p.hash = s.system_prompt_hash WHERE s.id = %s", (session_id,),
             )
             return cursor.fetchone()
+
+    def update_session_cwd(
+        self, session_id: str, cwd: str, git_branch: str | None = None,
+        git_repo_root: str | None = None, replace_git_meta: bool = False,
+    ) -> int | None:
+        """Claim Git enrichment authority atomically, matching SessionDB's A→B→A fence."""
+        if not session_id or not cwd:
+            return None
+        branch, repo_root = (git_branch or "").strip(), (git_repo_root or "").strip()
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions SET cwd = %s, "
+                "git_metadata_generation = git_metadata_generation + 1, "
+                "git_branch = CASE WHEN cwd IS DISTINCT FROM %s OR %s THEN %s "
+                "WHEN %s <> '' THEN %s ELSE git_branch END, "
+                "git_repo_root = CASE WHEN cwd IS DISTINCT FROM %s OR %s THEN %s "
+                "WHEN %s <> '' THEN %s ELSE git_repo_root END "
+                "WHERE id = %s RETURNING git_metadata_generation",
+                (cwd, cwd, replace_git_meta, branch or None, branch, branch or None,
+                 cwd, replace_git_meta, repo_root or None, repo_root, repo_root or None, session_id),
+            )
+            row = cursor.fetchone()
+            return None if row is None else int(row[0])
+
+    def publish_session_git_metadata(
+        self, session_id: str, cwd: str, generation: int, git_branch: str | None = None,
+        git_repo_root: str | None = None,
+    ) -> bool:
+        """Publish an async Git probe only if its claim has not been superseded."""
+        if not session_id or not cwd or not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            return False
+        fields = [("git_branch", (git_branch or "").strip()), ("git_repo_root", (git_repo_root or "").strip())]
+        fields = [(column, value) for column, value in fields if value]
+        if not fields:
+            return False
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions SET {', '.join(f'{column} = %s' for column, _ in fields)} "
+                "WHERE id = %s AND cwd = %s AND git_metadata_generation = %s RETURNING id",
+                [*(value for _, value in fields), session_id, cwd, generation],
+            )
+            return cursor.fetchone() is not None
 
     def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None:
         prompt_hash = None if system_prompt is None else hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
@@ -1079,7 +1155,7 @@ class PostgreSQLStateStore:
 
     def get_session_by_title(self, title: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, archived, pinned, {', '.join(_SESSION_METADATA_COLUMNS)} FROM {_SCHEMA}.sessions WHERE title = %s", (title,))
+            cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, archived, pinned, git_branch, git_metadata_generation, {', '.join(_SESSION_METADATA_COLUMNS)} FROM {_SCHEMA}.sessions WHERE title = %s", (title,))
             return cursor.fetchone()
 
     def resolve_session_by_title(self, title: str) -> str | None:
