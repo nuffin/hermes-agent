@@ -30,6 +30,7 @@ _COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION = 4
 _SCHEMA_VERSION = 5
 _VISIBILITY_SCHEMA_VERSION = 6
 _MESSAGE_RECORD_SCHEMA_VERSION = 7
+_RESUME_PROJECTION_SCHEMA_VERSION = 8
 _MESSAGE_RECORD_COLUMNS = (
     "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "token_count", "finish_reason",
     "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
@@ -129,7 +130,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _MESSAGE_RECORD_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _RESUME_PROJECTION_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -140,6 +141,7 @@ class PostgreSQLStateStore:
                     (_SCHEMA_VERSION, self._apply_v5, self._validate_v5),
                     (_VISIBILITY_SCHEMA_VERSION, self._apply_v6, self._validate_v6),
                     (_MESSAGE_RECORD_SCHEMA_VERSION, self._apply_v7, self._validate_v7),
+                    (_RESUME_PROJECTION_SCHEMA_VERSION, self._apply_v8, self._validate_v8),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -275,6 +277,13 @@ class PostgreSQLStateStore:
 
     def _validate_v7(self, cursor: Any) -> None:
         self._required_columns(cursor, "messages", set(_MESSAGE_RECORD_COLUMNS))
+
+    def _apply_v8(self, cursor: Any) -> None:
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS messages_resume_projection ON {_SCHEMA}.messages (session_id, active, id)")
+
+    def _validate_v8(self, cursor: Any) -> None:
+        self._validate_v7(cursor)
+        self._require_index(cursor, "messages_resume_projection")
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -438,6 +447,137 @@ class PostgreSQLStateStore:
                 (session_id,),
             )
             return list(cursor.fetchall())
+
+    @staticmethod
+    def _is_explicit_branch(session: Mapping[str, Any]) -> bool:
+        config = session.get("model_config") or {}
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError:
+                config = {}
+        return isinstance(config, Mapping) and "_branched_from" in config
+
+    def get_compression_lineage(self, session_id: str) -> list[str]:
+        session = self.get_session(session_id)
+        if session is None or self._is_explicit_branch(session):
+            return [session_id] if session else []
+        root, seen = session, {session_id}
+        while root.get("parent_session_id"):
+            parent = self.get_session(str(root["parent_session_id"]))
+            if parent is None or str(parent["id"]) in seen or parent.get("end_reason") != "compression" or self._is_explicit_branch(root):
+                break
+            root = parent
+            seen.add(str(root["id"]))
+        lineage, current = [str(root["id"])], root
+        seen = {str(root["id"])}
+        while current.get("end_reason") == "compression":
+            with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+                cursor.execute(
+                    f"SELECT id, parent_session_id, end_reason, model_config FROM {_SCHEMA}.sessions "
+                    "WHERE parent_session_id = %s ORDER BY started_at ASC, id ASC", (current["id"],))
+                children = cursor.fetchall()
+            next_child = next((child for child in children if not self._is_explicit_branch(child)), None)
+            if next_child is None or next_child["id"] in seen:
+                break
+            current = next_child
+            lineage.append(str(current["id"]))
+            seen.add(str(current["id"]))
+        return lineage if session_id in lineage else [session_id]
+
+    def get_compression_tip(self, session_id: str) -> str | None:
+        lineage = self.get_compression_lineage(session_id)
+        return lineage[-1] if lineage else session_id
+
+    def get_conversation_root(self, session_id: str) -> str:
+        lineage = self.get_compression_lineage(session_id)
+        return lineage[0] if lineage else session_id
+
+    def _resume_lineage_ids(self, session_id: str) -> list[str]:
+        session = self.get_session(session_id)
+        return [session_id] if session is None or self._is_explicit_branch(session) else self.get_compression_lineage(session_id)
+
+    def _projection_rows(self, session_ids: list[str], *, display: bool) -> list[dict[str, Any]]:
+        if not session_ids:
+            return []
+        predicate = "(active OR compacted)" if display else "active"
+        placeholders = ", ".join("%s" for _ in session_ids)
+        columns = (
+            "id, session_id, role, content, created_at AS timestamp, tool_call_id, tool_calls, tool_name, "
+            "effect_disposition, finish_reason, reasoning, reasoning_content, reasoning_details, codex_reasoning_items, "
+            "codex_message_items, platform_message_id, observed, _compressed_summary, active, compacted, api_content, "
+            "display_kind, display_metadata"
+        )
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT {columns} FROM {_SCHEMA}.messages WHERE session_id IN ({placeholders}) AND {predicate} ORDER BY id", session_ids)
+            rows = list(cursor.fetchall())
+        for row in rows:
+            row["content"] = self._decode_content(row["content"])
+        if not display:
+            return rows
+        chosen, first = {}, {}
+        for row in rows:
+            key = (row["role"], json.dumps(row["content"], sort_keys=True, default=str), row["timestamp"], row["tool_call_id"], json.dumps(row["tool_calls"], sort_keys=True, default=str), row["tool_name"])
+            previous = chosen.get(key)
+            if previous is None or (bool(row["active"]), row["id"]) > (bool(previous["active"]), previous["id"]):
+                chosen[key] = row
+            first[key] = min(first.get(key, row["id"]), row["id"])
+        return [chosen[key] for key in sorted(chosen, key=first.__getitem__)]
+
+    @staticmethod
+    def _conversation(rows: list[dict[str, Any]], *, row_ids: bool = True) -> list[dict[str, Any]]:
+        messages = []
+        for row in rows:
+            message = {"role": row["role"], "content": row["content"]}
+            if row_ids:
+                message["_row_id"] = row["id"]
+            for key in ("timestamp", "tool_call_id", "tool_name", "effect_disposition", "api_content", "display_kind"):
+                if row.get(key):
+                    message[key] = row[key]
+            if row.get("tool_calls"):
+                message["tool_calls"] = row["tool_calls"]
+            if row.get("display_metadata"):
+                message["display_metadata"] = row["display_metadata"]
+            if row.get("observed"):
+                message["observed"] = True
+            if row["role"] == "assistant":
+                for key in ("finish_reason", "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items"):
+                    if row.get(key) is not None:
+                        message[key] = row[key]
+            messages.append(message)
+        return messages
+
+    def get_resume_conversations(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        lineage = self._resume_lineage_ids(session_id)
+        display_rows = self._projection_rows(lineage, display=True)
+        model_rows = [row for row in self._projection_rows([session_id], display=False) if row["active"]]
+        return self._conversation(model_rows), self._conversation(display_rows)
+
+    def get_ancestor_display_prefix(self, session_id: str) -> list[dict[str, Any]]:
+        lineage = self._resume_lineage_ids(session_id)
+        rows = self._projection_rows(lineage, display=True)
+        return [
+            {key: value for key, value in message.items() if key != "_row_id"}
+            for row, message in zip(rows, self._conversation(rows))
+            if row["session_id"] != session_id
+        ]
+
+    def get_resume_message_count(self, session_id: str, *, tip_only: bool = False) -> int:
+        return len(self._projection_rows([session_id] if tip_only else self._resume_lineage_ids(session_id), display=not tip_only))
+
+    def assert_resume_safe(self, session_id: str, max_messages: int | None = None, *, tip_only: bool = False) -> int:
+        if max_messages is None:
+            from hermes_state import resolved_max_resume_messages
+            max_messages = resolved_max_resume_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        if max_messages == 0:
+            return 0
+        count = self.get_resume_message_count(session_id, tip_only=tip_only)
+        if count > max_messages:
+            from hermes_state import SessionResumeTooLargeError
+            raise SessionResumeTooLargeError(count, max_messages, scope="in its tip segment" if tip_only else "across its lineage")
+        return count
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         with self._connection() as connection, connection.cursor() as cursor:

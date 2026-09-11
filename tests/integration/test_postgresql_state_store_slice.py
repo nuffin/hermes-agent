@@ -285,7 +285,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -294,12 +294,12 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             message_columns = {row[0] for row in cursor.fetchall()}
             assert {"tool_calls", "reasoning_details", "display_metadata", "active", "compacted"} <= message_columns
             cursor.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'hermes_state_store_slice'")
-            assert {"messages_session_id_id", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
+            assert {"messages_session_id_id", "messages_resume_projection", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute("SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'hermes_state_store_slice.sessions'::regclass AND contype = 'f' ORDER BY conname")
             assert cursor.fetchall() == [("sessions_parent_session_id_fkey", False)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8]
     finally:
         _reset_schema(dsn)
 
@@ -317,7 +317,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -325,7 +325,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -337,10 +337,50 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
             open_state_store(_config())
     finally:
         _reset_schema(dsn)
+
+
+def test_sqlite_and_postgresql_resume_projection_and_lineage_parity(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    root, tip = f"resume-root-{uuid.uuid4()}", f"resume-tip-{uuid.uuid4()}"
+    try:
+        for store in stores:
+            store.ensure_session(root, source="integration")
+            store.append_message_record(root, MessageRecord(role="user", content="before compression", timestamp=1))
+            store.end_session(root, "compression")
+            store.ensure_session(tip, source="integration", metadata={"parent_session_id": root})
+            store.append_message_record(tip, MessageRecord(role="assistant", content="after compression", timestamp=2))
+            model, display = store.get_resume_conversations(tip)
+            observations.append({
+                "tip": store.get_compression_tip(root),
+                "lineage": store.get_compression_lineage(tip),
+                "root": store.get_conversation_root(tip),
+                "model": [(row["role"], row["content"]) for row in model],
+                "display": [(row["role"], row["content"]) for row in display],
+                "ancestor": [(row["role"], row["content"]) for row in store.get_ancestor_display_prefix(tip)],
+                "all_count": store.get_resume_message_count(tip),
+                "tip_count": store.get_resume_message_count(tip, tip_only=True),
+                "guard": store.assert_resume_safe(tip, 2),
+            })
+        assert observations[0] == observations[1]
+        assert observations[0]["tip"] == observations[0]["lineage"][-1]
+        assert observations[0]["root"] == observations[0]["lineage"][0]
+        assert observations[0]["model"] == [("assistant", "after compression")]
+        assert observations[0]["display"] == [("user", "before compression"), ("assistant", "after compression")]
+        assert observations[0]["ancestor"] == [("user", "before compression")]
+        assert observations[0]["all_count"] == observations[0]["guard"] == 2
+        assert observations[0]["tip_count"] == 1
+        for store, observation in zip(stores, observations):
+            with pytest.raises(Exception):
+                store.assert_resume_safe(observation["lineage"][-1], 1)
+    finally:
+        for store in stores:
+            store.close()
