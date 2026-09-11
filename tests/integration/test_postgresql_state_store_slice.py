@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-from state_store import StateStoreConfigurationError, open_state_store
+from state_store import MessageRecord, StateStoreConfigurationError, open_state_store
 
 
 _DSN_ENV = "HERMES_STATE_STORE_TEST_DSN"
@@ -232,6 +232,52 @@ def test_sqlite_and_postgresql_visibility_summary_contract_parity(monkeypatch, t
             store.close()
 
 
+def test_sqlite_and_postgresql_active_message_record_contract_parity(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    expected_records = [
+        MessageRecord(
+            role="assistant", content=[{"type": "text", "text": "structured"}],
+            tool_call_id="call-1", tool_calls=[{"id": "call-1", "type": "function"}], tool_name="tool",
+            effect_disposition="applied", timestamp=1234.5, token_count=17, finish_reason="stop",
+            reasoning="because", reasoning_content="details", reasoning_details={"trace": [1]},
+            codex_reasoning_items=[{"kind": "reasoning"}], codex_message_items=[{"kind": "message"}],
+            platform_message_id="platform-1", observed=True, _compressed_summary=True, api_content="exact api",
+            display_kind="tool_result", display_metadata={"task_count": 1},
+        ),
+        MessageRecord(role="tool", content=None, timestamp=1235.5),
+    ]
+    observations = []
+    try:
+        for store in stores:
+            session_id = f"message-record-{uuid.uuid4()}"
+            store.ensure_session(session_id, source="integration")
+            assert store.append_message_records(session_id, expected_records) == 2
+            records = store.get_message_records(session_id)
+            assert [record["id"] for record in records] == sorted(record["id"] for record in records)
+            observations.append([{key: value for key, value in record.items() if key not in {"id", "session_id"}} for record in records])
+        assert observations[0] == observations[1]
+        assert observations[0][0]["content"] == expected_records[0].content
+        assert observations[0][1]["content"] is None
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_message_record_batch_failure_is_atomic_for_both_backends(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    try:
+        for store in stores:
+            session_id = f"message-record-atomic-{uuid.uuid4()}"
+            with pytest.raises(Exception):
+                store.append_message_records(session_id, [MessageRecord(role="user", content="must rollback")])
+            assert store.get_message_records(session_id) == []
+    finally:
+        for store in stores:
+            store.close()
+
+
 def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_complete(monkeypatch):
     dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
     monkeypatch.setenv(_DSN_ENV, dsn)
@@ -239,18 +285,21 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
             assert {"id", "source", "started_at", "parent_session_id", "title", "title_source", "hidden", "archived", "pinned"} <= columns
+            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'messages'")
+            message_columns = {row[0] for row in cursor.fetchall()}
+            assert {"tool_calls", "reasoning_details", "display_metadata", "active", "compacted"} <= message_columns
             cursor.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'hermes_state_store_slice'")
             assert {"messages_session_id_id", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute("SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'hermes_state_store_slice.sessions'::regclass AND contype = 'f' ORDER BY conname")
             assert cursor.fetchall() == [("sessions_parent_session_id_fkey", False)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
     finally:
         _reset_schema(dsn)
 
@@ -268,7 +317,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -276,7 +325,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -288,7 +337,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):

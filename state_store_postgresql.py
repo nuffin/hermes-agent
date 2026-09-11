@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import queue
 import re
 import threading
@@ -16,7 +17,8 @@ import time
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from state_store import PostgreSQLStateStoreConfig, StateStoreConfigurationError
+from hermes_cli.timefmt import coerce_epoch
+from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
 
 _SCHEMA = "hermes_state_store_slice"
 _SESSION_METADATA_SCHEMA_VERSION = 2
@@ -27,6 +29,16 @@ _PARENT_SESSION_FOREIGN_KEY_SCHEMA_VERSION = 3
 _COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION = 4
 _SCHEMA_VERSION = 5
 _VISIBILITY_SCHEMA_VERSION = 6
+_MESSAGE_RECORD_SCHEMA_VERSION = 7
+_MESSAGE_RECORD_COLUMNS = (
+    "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "token_count", "finish_reason",
+    "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
+    "platform_message_id", "observed", "_compressed_summary", "active", "compacted", "api_content",
+    "display_kind", "display_metadata", "display_identity",
+)
+_MESSAGE_RECORD_WRITE_COLUMNS = tuple(
+    column for column in _MESSAGE_RECORD_COLUMNS if column not in {"active", "compacted", "display_identity"}
+)
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
@@ -117,7 +129,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _VISIBILITY_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _MESSAGE_RECORD_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -127,6 +139,7 @@ class PostgreSQLStateStore:
                     (_COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION, self._apply_v4, self._validate_v4),
                     (_SCHEMA_VERSION, self._apply_v5, self._validate_v5),
                     (_VISIBILITY_SCHEMA_VERSION, self._apply_v6, self._validate_v6),
+                    (_MESSAGE_RECORD_SCHEMA_VERSION, self._apply_v7, self._validate_v7),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -247,6 +260,22 @@ class PostgreSQLStateStore:
         self._require_index(cursor, "sessions_visibility_started_at")
         self._require_index(cursor, "sessions_pinned_started_at")
 
+    def _apply_v7(self, cursor: Any) -> None:
+        types = {
+            "tool_call_id": "text", "tool_calls": "jsonb", "tool_name": "text", "effect_disposition": "text",
+            "token_count": "bigint", "finish_reason": "text", "reasoning": "text", "reasoning_content": "text",
+            "reasoning_details": "text", "codex_reasoning_items": "text", "codex_message_items": "text",
+            "platform_message_id": "text", "observed": "boolean NOT NULL DEFAULT false",
+            "_compressed_summary": "boolean NOT NULL DEFAULT false", "active": "boolean NOT NULL DEFAULT true",
+            "compacted": "boolean NOT NULL DEFAULT false", "api_content": "text", "display_kind": "text",
+            "display_metadata": "jsonb", "display_identity": "text",
+        }
+        for column in _MESSAGE_RECORD_COLUMNS:
+            cursor.execute(f"ALTER TABLE {_SCHEMA}.messages ADD COLUMN IF NOT EXISTS {column} {types[column]}")
+
+    def _validate_v7(self, cursor: Any) -> None:
+        self._required_columns(cursor, "messages", set(_MESSAGE_RECORD_COLUMNS))
+
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
         with self._lock:
@@ -312,13 +341,95 @@ class PostgreSQLStateStore:
             )
         return session_id
 
+    @staticmethod
+    def _encode_content(content: Any) -> Any:
+        if isinstance(content, str) or content is None or isinstance(content, (bytes, int, float)):
+            return content
+        try:
+            return "__hermes_state_json__:" + json.dumps(content)
+        except (TypeError, ValueError):
+            return str(content)
+
+    @staticmethod
+    def _record_json(value: Any, *, object_only: bool = False) -> Any:
+        if not value:
+            return None
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return None if object_only else []
+        if object_only and not isinstance(value, dict):
+            return None
+        return value
+
+    @staticmethod
+    def _record_json_text(value: Any) -> str | None:
+        return None if not value else (value if isinstance(value, str) else json.dumps(value))
+
+    def _record_params(self, session_id: str, record: MessageRecord) -> tuple[Any, ...]:
+        timestamp = coerce_epoch(record.timestamp, field="message timestamp")
+        tool_calls = self._record_json(record.tool_calls)
+        display_metadata = self._record_json(record.display_metadata, object_only=True)
+        return (
+            session_id, record.role, self._encode_content(record.content),
+            timestamp if timestamp is not None else time.time(), record.tool_call_id,
+            self._psycopg.types.json.Jsonb(tool_calls) if tool_calls else None, record.tool_name,
+            record.effect_disposition, record.token_count,
+            record.finish_reason, record.reasoning, record.reasoning_content,
+            self._record_json_text(record.reasoning_details), self._record_json_text(record.codex_reasoning_items),
+            self._record_json_text(record.codex_message_items), record.platform_message_id, bool(record.observed),
+            bool(record._compressed_summary), record.api_content, record.display_kind,
+            self._psycopg.types.json.Jsonb(display_metadata) if display_metadata else None,
+        )
+
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
+        return self.append_message_record(session_id, MessageRecord(role=role, content=content))
+
+    def append_message_record(self, session_id: str, record: MessageRecord) -> int:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
-                f"INSERT INTO {_SCHEMA}.messages (session_id, role, content, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
-                (session_id, role, content, time.time()),
+                f"INSERT INTO {_SCHEMA}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
+                f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id",
+                self._record_params(session_id, record),
             )
             return int(cursor.fetchone()[0])
+
+    def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int:
+        if not records:
+            return 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            for record in records:
+                cursor.execute(
+                    f"INSERT INTO {_SCHEMA}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
+                    f"VALUES ({', '.join('%s' for _ in range(21))})",
+                    self._record_params(session_id, record),
+                )
+        return len(records)
+
+    @staticmethod
+    def _decode_content(content: Any) -> Any:
+        prefix = "__hermes_state_json__:"
+        if isinstance(content, str) and content.startswith(prefix):
+            try:
+                return json.loads(content[len(prefix):])
+            except json.JSONDecodeError:
+                return content
+        return content
+
+    def get_message_records(self, session_id: str) -> list[dict[str, Any]]:
+        columns = (
+            "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+            "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
+            "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
+            "active, compacted, api_content, display_kind, display_metadata"
+        )
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT {columns} FROM {_SCHEMA}.messages WHERE session_id = %s AND active ORDER BY id", (session_id,))
+            records = list(cursor.fetchall())
+        for record in records:
+            record["content"] = self._decode_content(record["content"])
+        return records
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:

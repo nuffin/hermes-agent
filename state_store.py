@@ -42,6 +42,38 @@ class ResolvedStateStoreConfig:
     postgresql: PostgreSQLStateStoreConfig | None = None
 
 
+@dataclass(frozen=True)
+class MessageRecord:
+    """Canonical appendable transcript row for the bounded StateStore record slice.
+
+    This intentionally covers active-message persistence and ordered record reads;
+    rewrite, compaction, lineage, and conversation projections remain SessionDB-only.
+    ``timestamp`` is caller-supplied when present. Structured content, tool calls,
+    and display metadata retain SessionDB's decoded Python representation.
+    """
+
+    role: str
+    content: Any = None
+    tool_call_id: str | None = None
+    tool_calls: Any = None
+    tool_name: str | None = None
+    effect_disposition: str | None = None
+    timestamp: Any = None
+    token_count: int | None = None
+    finish_reason: str | None = None
+    reasoning: str | None = None
+    reasoning_content: str | None = None
+    reasoning_details: Any = None
+    codex_reasoning_items: Any = None
+    codex_message_items: Any = None
+    platform_message_id: str | None = None
+    observed: bool = False
+    _compressed_summary: bool = False
+    api_content: str | None = None
+    display_kind: str | None = None
+    display_metadata: dict[str, Any] | None = None
+
+
 class StateStore(Protocol):
     """Incremental session/message/title/visibility contract; broader SessionDB APIs stay out of scope."""
 
@@ -50,6 +82,12 @@ class StateStore(Protocol):
     ) -> str: ...
 
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int: ...
+
+    def append_message_record(self, session_id: str, record: MessageRecord) -> int: ...
+
+    def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int: ...
+
+    def get_message_records(self, session_id: str) -> list[dict[str, Any]]: ...
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]: ...
 
@@ -161,6 +199,37 @@ class SqliteStateStore:
         if content is None:
             return self._session_db.append_message(session_id, role=role)
         return self._session_db.append_message(session_id, role=role, content=content)
+
+    @staticmethod
+    def _record_kwargs(record: MessageRecord) -> dict[str, Any]:
+        return {
+            key: getattr(record, key) for key in (
+                "role", "content", "tool_call_id", "tool_calls", "tool_name", "effect_disposition",
+                "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
+                "reasoning_details", "codex_reasoning_items", "codex_message_items", "platform_message_id",
+                "observed", "_compressed_summary", "api_content", "display_kind", "display_metadata",
+            )
+        }
+
+    def append_message_record(self, session_id: str, record: MessageRecord) -> int:
+        return self._session_db.append_message(session_id, **self._record_kwargs(record))
+
+    def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int:
+        return self._session_db.append_messages_batch(
+            session_id, [self._record_kwargs(record) for record in records])
+
+    def get_message_records(self, session_id: str) -> list[dict[str, Any]]:
+        records = []
+        for row in self._session_db.get_messages(session_id):
+            record = dict(row)
+            record.pop("display_identity", None)
+            record.pop("display_order", None)
+            record["observed"] = bool(record["observed"])
+            record["active"] = bool(record["active"])
+            record["compacted"] = bool(record["compacted"])
+            record["_compressed_summary"] = bool(record.pop("_compressed_summary", False))
+            records.append(record)
+        return records
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]:
         return self._session_db.get_messages(session_id)
