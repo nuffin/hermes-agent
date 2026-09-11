@@ -121,6 +121,16 @@ class StateStore(Protocol):
 
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
 
+    def update_session_cwd(
+        self, session_id: str, cwd: str, git_branch: str | None = None,
+        git_repo_root: str | None = None, replace_git_meta: bool = False,
+    ) -> int | None: ...
+
+    def publish_session_git_metadata(
+        self, session_id: str, cwd: str, generation: int, git_branch: str | None = None,
+        git_repo_root: str | None = None,
+    ) -> bool: ...
+
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None: ...
 
     def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None: ...
@@ -322,6 +332,20 @@ class SqliteStateStore:
             for key in ("hidden", "archived", "pinned"):
                 row[key] = bool(row.get(key))
         return row
+
+    def update_session_cwd(
+        self, session_id: str, cwd: str, git_branch: str | None = None,
+        git_repo_root: str | None = None, replace_git_meta: bool = False,
+    ) -> int | None:
+        return self._session_db.update_session_cwd(
+            session_id, cwd, git_branch, git_repo_root, replace_git_meta)
+
+    def publish_session_git_metadata(
+        self, session_id: str, cwd: str, generation: int, git_branch: str | None = None,
+        git_repo_root: str | None = None,
+    ) -> bool:
+        return self._session_db.publish_session_git_metadata(
+            session_id, cwd, generation, git_branch, git_repo_root)
 
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
         self._session_db.update_session_meta(session_id, model_config_json, model)
