@@ -19,6 +19,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from hermes_cli.timefmt import coerce_epoch
+from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
 from token_usage_transport import TokenUsageTransport
 
@@ -35,6 +36,7 @@ _MESSAGE_RECORD_SCHEMA_VERSION = 7
 _RESUME_PROJECTION_SCHEMA_VERSION = 8
 _SYSTEM_PROMPT_SCHEMA_VERSION = 9
 _MODEL_USAGE_SCHEMA_VERSION = 10
+_CONVERSATION_GENERATION_SCHEMA_VERSION = 11
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
 _USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
@@ -143,7 +145,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _MODEL_USAGE_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _CONVERSATION_GENERATION_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -157,6 +159,7 @@ class PostgreSQLStateStore:
                     (_RESUME_PROJECTION_SCHEMA_VERSION, self._apply_v8, self._validate_v8),
                     (_SYSTEM_PROMPT_SCHEMA_VERSION, self._apply_v9, self._validate_v9),
                     (_MODEL_USAGE_SCHEMA_VERSION, self._apply_v10, self._validate_v10),
+                    (_CONVERSATION_GENERATION_SCHEMA_VERSION, self._apply_v11, self._validate_v11),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -342,6 +345,54 @@ class PostgreSQLStateStore:
         self._require_index(cursor, "session_model_usage_session")
         self._require_index(cursor, "session_model_usage_model")
         self._require_foreign_key(cursor, "session_model_usage_session_id_fkey", "session_model_usage", "sessions")
+
+    def _apply_v11(self, cursor: Any) -> None:
+        """Create the non-prunable peer generation ledger.
+
+        This intentionally has no foreign key to sessions: deleting or pruning
+        session history must never reissue an affinity generation (ABA).
+        """
+        cursor.execute(f"""CREATE TABLE IF NOT EXISTS {_SCHEMA}.conversation_generations (
+            source text NOT NULL,
+            session_key text NOT NULL,
+            generation bigint NOT NULL DEFAULT 0,
+            PRIMARY KEY (source, session_key))""")
+
+    def _validate_v11(self, cursor: Any) -> None:
+        self._required_columns(cursor, "conversation_generations", {"source", "session_key", "generation"})
+        cursor.execute(
+            "SELECT a.attname FROM pg_constraint c "
+            "JOIN unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinal) ON true "
+            "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum "
+            "WHERE c.conname = %s AND c.conrelid = %s::regclass AND c.contype = 'p' "
+            "ORDER BY key.ordinal",
+            ("conversation_generations_pkey", f"{_SCHEMA}.conversation_generations"),
+        )
+        if [row[0] for row in cursor.fetchall()] != ["source", "session_key"]:
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.conversation_generations primary key must be (source, session_key)")
+        cursor.execute(
+            "SELECT column_name, data_type, is_nullable, column_default "
+            "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+            (_SCHEMA, "conversation_generations"),
+        )
+        columns = {row[0]: row[1:] for row in cursor.fetchall()}
+        expected = {
+            "source": ("text", "NO"), "session_key": ("text", "NO"), "generation": ("bigint", "NO"),
+        }
+        if any(columns.get(name, (None, None))[:2] != contract for name, contract in expected.items()):
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.conversation_generations has invalid column contract")
+        if "0" not in str(columns["generation"][2] or ""):
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.conversation_generations.generation must default to 0")
+        cursor.execute(
+            "SELECT 1 FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'f'",
+            (f"{_SCHEMA}.conversation_generations",),
+        )
+        if cursor.fetchone() is not None:
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.conversation_generations must not reference prunable session rows")
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -685,9 +736,63 @@ class PostgreSQLStateStore:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"UPDATE {_SCHEMA}.sessions SET ended_at = %s, end_reason = %s "
-                "WHERE id = %s AND ended_at IS NULL",
+                "WHERE id = %s AND ended_at IS NULL RETURNING source, session_key",
                 (time.time(), end_reason, session_id),
             )
+            self._bump_conversation_generation(cursor, cursor.fetchone(), end_reason)
+
+    @staticmethod
+    def _bump_conversation_generation(cursor: Any, row: Any, end_reason: str) -> None:
+        """Advance only for the row this transaction newly marked as a reset.
+
+        The row-returning update makes first-end-reason and generation increment
+        one commit. The durable table has no session FK and is never pruned.
+        """
+        if row is None or end_reason not in _RESET_END_REASONS:
+            return
+        source, session_key = (str(value or "").strip() for value in row)
+        if source and session_key:
+            cursor.execute(
+                f"INSERT INTO {_SCHEMA}.conversation_generations (source, session_key, generation) VALUES (%s, %s, 1) "
+                "ON CONFLICT (source, session_key) DO UPDATE "
+                "SET generation = conversation_generations.generation + 1",
+                (source, session_key),
+            )
+
+    def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool:
+        """Promote a live/recoverably closed row atomically, matching SQLite.
+
+        Explicitly ended rows are immutable; only a successful promotion may
+        advance the peer generation.
+        """
+        if not session_id:
+            return False
+        try:
+            with self._connection() as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    f"UPDATE {_SCHEMA}.sessions SET ended_at = %s, end_reason = %s "
+                    "WHERE id = %s AND (ended_at IS NULL OR end_reason = ANY(%s)) "
+                    "RETURNING source, session_key",
+                    (time.time(), reason, session_id, list(_RECOVERABLE_END_REASONS)),
+                )
+                row = cursor.fetchone()
+                self._bump_conversation_generation(cursor, row, reason)
+                return row is not None
+        except Exception:
+            return False
+
+    def latest_conversation_boundary(self, session_key: str, source: str) -> int | None:
+        """Return the durable source-qualified generation, never an aggregate."""
+        if not session_key or not source:
+            return None
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT generation FROM {_SCHEMA}.conversation_generations WHERE source = %s AND session_key = %s",
+                (source, session_key),
+            )
+            row = cursor.fetchone()
+        generation = int(row[0]) if row is not None and row[0] is not None else 0
+        return generation if generation > 0 else None
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
