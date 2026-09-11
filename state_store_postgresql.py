@@ -44,6 +44,8 @@ _GIT_METADATA_GENERATION_SCHEMA_VERSION = 13
 _SEARCH_DOCUMENT_SCHEMA_VERSION = 14
 _SEARCH_INDEX_SCHEMA_VERSION = 15
 _BOUNDED_BROWSE_SCHEMA_VERSION = 16
+_SEARCH_HEALTH_SCHEMA_VERSION = 17
+_SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
 _USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
@@ -159,7 +161,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _BOUNDED_BROWSE_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _SEARCH_HEALTH_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -179,6 +181,7 @@ class PostgreSQLStateStore:
                     (_SEARCH_DOCUMENT_SCHEMA_VERSION, self._apply_v14, self._validate_v14),
                     (_SEARCH_INDEX_SCHEMA_VERSION, self._apply_v15, self._validate_v15),
                     (_BOUNDED_BROWSE_SCHEMA_VERSION, self._apply_v16, self._validate_v16),
+                    (_SEARCH_HEALTH_SCHEMA_VERSION, self._apply_v17, self._validate_v17),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -473,11 +476,11 @@ class PostgreSQLStateStore:
                 f"PostgreSQL State Store schema drift: {self._schema}.messages.search_document must be a generated tsvector")
 
     def _apply_v15(self, cursor: Any) -> None:
-        cursor.execute(f"CREATE INDEX IF NOT EXISTS messages_search_document_gin ON {self._schema}.messages USING GIN (search_document)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS {_SEARCH_INDEX_NAME} ON {self._schema}.messages USING GIN (search_document)")
 
     def _validate_v15(self, cursor: Any) -> None:
         self._validate_v14(cursor)
-        self._require_index(cursor, "messages_search_document_gin")
+        self._require_index(cursor, _SEARCH_INDEX_NAME)
 
     def _apply_v16(self, cursor: Any) -> None:
         """Add the durable activity projection needed by bounded contextual browse.
@@ -499,6 +502,22 @@ class PostgreSQLStateStore:
     def _validate_v16(self, cursor: Any) -> None:
         self._required_columns(cursor, "sessions", {"last_activity_at"})
         self._require_index(cursor, "sessions_effective_activity")
+
+    def _apply_v17(self, cursor: Any) -> None:
+        """Keep only maintenance outcomes; PostgreSQL has no deferred FTS backfill state."""
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.search_index_maintenance ("
+            "singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), "
+            "last_success_at double precision, last_error text)"
+        )
+        cursor.execute(
+            f"INSERT INTO {self._schema}.search_index_maintenance (singleton) VALUES (true) "
+            "ON CONFLICT (singleton) DO NOTHING"
+        )
+
+    def _validate_v17(self, cursor: Any) -> None:
+        self._validate_v15(cursor)
+        self._required_columns(cursor, "search_index_maintenance", {"singleton", "last_success_at", "last_error"})
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -529,6 +548,115 @@ class PostgreSQLStateStore:
                     connection.close()
                 else:
                     self._idle.put(connection)
+
+    def _search_maintenance_lock_name(self) -> str:
+        return f"{self._schema}:search-index-maintenance"
+
+    def _search_index_catalog(self, cursor: Any) -> tuple[str, str]:
+        """Return generated-document and GIN catalog health without trusting an index name alone."""
+        self._validate_v14(cursor)
+        cursor.execute(
+            "SELECT i.indisvalid, i.indisready, i.indislive, am.amname, "
+            "array_agg(a.attname ORDER BY key.ordinality) "
+            "FROM pg_class AS c JOIN pg_index AS i ON i.indexrelid = c.oid "
+            "JOIN pg_am AS am ON am.oid = c.relam "
+            "JOIN unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinality) ON true "
+            "JOIN pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = key.attnum "
+            "WHERE c.relnamespace = %s::regnamespace AND c.relname = %s "
+            "GROUP BY i.indisvalid, i.indisready, i.indislive, am.amname",
+            (self._schema, _SEARCH_INDEX_NAME),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return "valid", "missing"
+        valid, ready, live, access_method, columns = row
+        if bool(valid) and bool(ready) and bool(live) and access_method == "gin" and list(columns) == ["search_document"]:
+            return "valid", "valid"
+        return "valid", "invalid"
+
+    def search_index_status(self) -> dict[str, Any]:
+        """PostgreSQL generated-search health, deliberately unlike SQLite FTS rebuild progress.
+
+        Canonical rows synchronously derive ``search_document``; PostgreSQL therefore has no
+        detached-corruption fallback, deferred high-water backfill, retry, or quarantine state.
+        A missing/invalid GIN catalog entry makes contextual routing unavailable rather than
+        silently claiming SQLite's canonical-LIKE fallback semantics.
+        """
+        with self._connection() as connection, connection.cursor() as cursor:
+            document, gin_index = self._search_index_catalog(cursor)
+            cursor.execute(
+                f"SELECT last_success_at, last_error FROM {self._schema}.search_index_maintenance WHERE singleton"
+            )
+            maintenance = cursor.fetchone() or (None, None)
+            cursor.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (self._search_maintenance_lock_name(),))
+            acquired = bool(cursor.fetchone()[0])
+            if acquired:
+                cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (self._search_maintenance_lock_name(),))
+        available = document == "valid" and gin_index == "valid"
+        return {
+            "backend": "postgresql",
+            "available": available,
+            "query_path_available": available,
+            "generated_document": document,
+            "gin_index": gin_index,
+            "rebuild": {"supported": True, "operation": "reindex_or_create", "in_progress": not acquired},
+            "last_successful_rebuild_at": maintenance[0],
+            "last_error": maintenance[1],
+            "sqlite_fts_semantics": {
+                "corruption_detach": False, "canonical_like_fallback": False,
+                "deferred_backfill": False, "high_water": False, "retry_quarantine": False,
+            },
+        }
+
+    def rebuild_search_index(self) -> dict[str, Any]:
+        """Repair this trusted tenant's GIN catalog entry under one cross-process advisory lock.
+
+        ``REINDEX ... CONCURRENTLY`` and ``CREATE INDEX CONCURRENTLY`` require autocommit;
+        this deliberately uses a dedicated connection, never a pooled transaction connection.
+        """
+        connection = self._new_connection()
+        connection.autocommit = True
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET search_path TO "{self._schema}", pg_catalog')
+                cursor.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (self._search_maintenance_lock_name(),))
+                acquired = bool(cursor.fetchone()[0])
+                if not acquired:
+                    result = self.search_index_status()
+                    result["rebuild"] = {**result["rebuild"], "operation": "already_running"}
+                    return result
+                try:
+                    _document, gin_index = self._search_index_catalog(cursor)
+                    if gin_index == "missing":
+                        cursor.execute(f"CREATE INDEX CONCURRENTLY {_SEARCH_INDEX_NAME} ON {self._schema}.messages USING GIN (search_document)")
+                        operation = "create"
+                    elif gin_index == "invalid":
+                        cursor.execute(f"DROP INDEX CONCURRENTLY {self._schema}.{_SEARCH_INDEX_NAME}")
+                        cursor.execute(f"CREATE INDEX CONCURRENTLY {_SEARCH_INDEX_NAME} ON {self._schema}.messages USING GIN (search_document)")
+                        operation = "replace_invalid"
+                    else:
+                        cursor.execute(f"REINDEX INDEX CONCURRENTLY {self._schema}.{_SEARCH_INDEX_NAME}")
+                        operation = "reindex"
+                    _document, repaired = self._search_index_catalog(cursor)
+                    if repaired != "valid":
+                        raise StateStoreConfigurationError(f"PostgreSQL State Store search-index repair did not restore {self._schema}.{_SEARCH_INDEX_NAME}")
+                    cursor.execute(
+                        f"UPDATE {self._schema}.search_index_maintenance SET last_success_at = %s, last_error = NULL WHERE singleton",
+                        (time.time(),),
+                    )
+                except Exception as exc:
+                    cursor.execute(
+                        f"UPDATE {self._schema}.search_index_maintenance SET last_error = %s WHERE singleton",
+                        (str(exc)[:1000],),
+                    )
+                    raise
+                finally:
+                    cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (self._search_maintenance_lock_name(),))
+            result = self.search_index_status()
+            result["rebuild"] = {**result["rebuild"], "operation": operation}
+            return result
+        finally:
+            connection.close()
 
     def ensure_session(
         self, session_id: str, source: str = "unknown", *, metadata: Mapping[str, Any] | None = None,
@@ -1217,6 +1345,18 @@ class PostgreSQLStateStore:
                 f"FROM {self._schema}.sessions s LEFT JOIN {self._schema}.system_prompts p ON p.hash = s.system_prompt_hash WHERE s.id = %s", (session_id,),
             )
             return cursor.fetchone()
+
+    def get_message_storage_state(self, message_id: int) -> dict[str, Any] | None:
+        """Return only the tenant-local visibility state required by contextual recall."""
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT session_id, active, compacted FROM {self._schema}.messages WHERE id = %s",
+                (message_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {"session_id": row["session_id"], "active": int(row["active"]), "compacted": int(row["compacted"])}
 
     def update_session_cwd(
         self, session_id: str, cwd: str, git_branch: str | None = None,
