@@ -43,7 +43,7 @@ class ResolvedStateStoreConfig:
 
 
 class StateStore(Protocol):
-    """Incremental session/message contract; broader SessionDB APIs stay out of scope."""
+    """Incremental session/message/title contract; broader SessionDB APIs stay out of scope."""
 
     def ensure_session(
         self, session_id: str, source: str = "unknown", *, metadata: Mapping[str, Any] | None = None,
@@ -56,6 +56,24 @@ class StateStore(Protocol):
     def end_session(self, session_id: str, end_reason: str) -> None: ...
 
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
+
+    def set_session_hidden(self, session_id: str, hidden: bool) -> bool: ...
+
+    def set_session_title(self, session_id: str, title: str) -> bool: ...
+
+    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool: ...
+
+    def get_session_title(self, session_id: str) -> str | None: ...
+
+    def get_session_title_source(self, session_id: str) -> str | None: ...
+
+    def set_session_title_source(self, session_id: str, source: str) -> bool: ...
+
+    def get_session_by_title(self, title: str) -> dict[str, Any] | None: ...
+
+    def resolve_session_by_title(self, title: str) -> str | None: ...
+
+    def get_next_title_in_lineage(self, base_title: str) -> str: ...
 
     def close(self) -> None: ...
 
@@ -141,6 +159,33 @@ class SqliteStateStore:
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         return self._session_db.get_session(session_id)
+
+    def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
+        return self._session_db.set_session_hidden(session_id, hidden)
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        return self._session_db.set_session_title(session_id, title)
+
+    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        return self._session_db.set_auto_title(session_id, title, source=source)
+
+    def get_session_title(self, session_id: str) -> str | None:
+        return self._session_db.get_session_title(session_id)
+
+    def get_session_title_source(self, session_id: str) -> str | None:
+        return self._session_db.get_session_title_source(session_id)
+
+    def set_session_title_source(self, session_id: str, source: str) -> bool:
+        return self._session_db.set_session_title_source(session_id, source)
+
+    def get_session_by_title(self, title: str) -> dict[str, Any] | None:
+        return self._session_db.get_session_by_title(title)
+
+    def resolve_session_by_title(self, title: str) -> str | None:
+        return self._session_db.resolve_session_by_title(title)
+
+    def get_next_title_in_lineage(self, base_title: str) -> str:
+        return self._session_db.get_next_title_in_lineage(base_title)
 
     def close(self) -> None:
         self._session_db.close()
