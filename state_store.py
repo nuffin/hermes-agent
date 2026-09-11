@@ -43,9 +43,11 @@ class ResolvedStateStoreConfig:
 
 
 class StateStore(Protocol):
-    """First backend-neutral session/message slice; further SessionDB APIs stay out of scope."""
+    """Incremental session/message contract; broader SessionDB APIs stay out of scope."""
 
-    def ensure_session(self, session_id: str, source: str = "unknown") -> str: ...
+    def ensure_session(
+        self, session_id: str, source: str = "unknown", *, metadata: Mapping[str, Any] | None = None,
+    ) -> str: ...
 
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int: ...
 
@@ -121,8 +123,10 @@ class SqliteStateStore:
 
         self._session_db = SessionDB() if db_path is None else SessionDB(db_path=db_path)
 
-    def ensure_session(self, session_id: str, source: str = "unknown") -> str:
-        return self._session_db.ensure_session(session_id, source=source)
+    def ensure_session(
+        self, session_id: str, source: str = "unknown", *, metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        return self._session_db.ensure_session(session_id, source=source, **dict(metadata or {}))
 
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
         if content is None:
