@@ -75,6 +75,37 @@ class MessageRecord:
     display_metadata: dict[str, Any] | None = None
 
 
+class ContextualSessionSearchStore(Protocol):
+    """Read-only contextual recall contract used by ``session_search``.
+
+    This is deliberately separate from the incremental write-oriented
+    ``StateStore`` contract: recall needs lineage-aware anchors, bounded browse,
+    and index-health reporting as one atomic capability.  Backends must not
+    advertise it until every method is implemented.
+    """
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None: ...
+    def get_messages(self, session_id: str) -> list[dict[str, Any]]: ...
+    def get_messages_around(self, session_id: str, around_message_id: int, *, window: int) -> dict[str, Any]: ...
+    def get_anchored_view(self, session_id: str, around_message_id: int, *, window: int, bookend: int) -> dict[str, Any]: ...
+    def get_message_storage_state(self, message_id: int) -> dict[str, Any] | None: ...
+    def search_messages(
+        self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
+        include_inactive: bool = False, fields: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]: ...
+    def resolve_session_by_title(self, title: str) -> str | None: ...
+    def list_recent_sessions_bounded(
+        self, *, limit: int, exclude_sources: list[str], timeout_seconds: float,
+    ) -> list[dict[str, Any]]: ...
+    def search_index_status(self) -> dict[str, Any] | None: ...
+    def close(self) -> None: ...
+
+
+class ContextualSessionSearchUnavailable(RuntimeError):
+    """The selected backend has not implemented the complete recall contract."""
+
+
 class StateStore(Protocol):
     """Incremental session/message/title/visibility contract; broader SessionDB APIs stay out of scope."""
 
@@ -450,6 +481,82 @@ class SqliteStateStore:
 
     def close(self) -> None:
         self._session_db.close()
+
+
+class SqliteContextualSessionSearchStore:
+    """Complete SQLite implementation of :class:`ContextualSessionSearchStore`.
+
+    ``SessionDB`` remains the owner of SQLite lifecycle/WAL locking.  This
+    adapter is the only place the legacy private message visibility lookup is
+    expressed, so the public tool no longer reaches into a backend connection.
+    """
+
+    def __init__(self, session_db=None, *, db_path: Path | None = None, read_only: bool = False) -> None:
+        if session_db is None:
+            from hermes_state import SessionDB
+            session_db = SessionDB(db_path=db_path, read_only=read_only) if db_path is not None else SessionDB()
+        self._session_db = session_db
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        return self._session_db.get_session(session_id)
+
+    def get_messages(self, session_id: str) -> list[dict[str, Any]]:
+        return self._session_db.get_messages(session_id)
+
+    def get_messages_around(self, session_id: str, around_message_id: int, *, window: int) -> dict[str, Any]:
+        return self._session_db.get_messages_around(session_id, around_message_id, window=window)
+
+    def get_anchored_view(self, session_id: str, around_message_id: int, *, window: int, bookend: int) -> dict[str, Any]:
+        return self._session_db.get_anchored_view(session_id, around_message_id, window=window, bookend=bookend)
+
+    def get_message_storage_state(self, message_id: int) -> dict[str, Any] | None:
+        with self._session_db._lock:
+            row = self._session_db._conn.execute(
+                "SELECT session_id, active, compacted FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def search_messages(self, query: str, source_filter: list[str] | None = None,
+                        exclude_sources: list[str] | None = None, role_filter: list[str] | None = None,
+                        limit: int = 20, offset: int = 0, sort: str | None = None,
+                        include_inactive: bool = False, fields: Collection[str] | None = None) -> list[dict[str, Any]]:
+        return self._session_db.search_messages(
+            query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
+            limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
+        )
+
+    def resolve_session_by_title(self, title: str) -> str | None:
+        return self._session_db.resolve_session_by_title(title)
+
+    def list_recent_sessions_bounded(self, *, limit: int, exclude_sources: list[str],
+                                     timeout_seconds: float) -> list[dict[str, Any]]:
+        bounded = getattr(self._session_db, "list_recent_sessions_bounded", None)
+        if bounded is None:
+            raise RuntimeError("session database does not support bounded recent-session browse")
+        return bounded(
+            limit=limit, exclude_sources=exclude_sources, timeout_seconds=timeout_seconds)
+
+    def search_index_status(self) -> dict[str, Any] | None:
+        return self._session_db.fts_rebuild_status()
+
+    def close(self) -> None:
+        self._session_db.close()
+
+
+def contextual_session_search_store(session_db=None, *, db_path: Path | None = None,
+                                    read_only: bool = False, backend: str = "sqlite") -> ContextualSessionSearchStore:
+    """Resolve the complete recall capability, refusing partial backends.
+
+    PostgreSQL's current lexical StateStore slice intentionally has no recall
+    implementation; returning it here would expose partial histories and break
+    lineage/compaction semantics.
+    """
+    if backend != "sqlite":
+        raise ContextualSessionSearchUnavailable(
+            f"state-store backend '{backend}' does not implement contextual session search")
+    if isinstance(session_db, SqliteContextualSessionSearchStore):
+        return session_db
+    return SqliteContextualSessionSearchStore(session_db, db_path=db_path, read_only=read_only)
 
 
 def postgresql_tenant_schema() -> str:
