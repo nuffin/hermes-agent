@@ -1208,6 +1208,21 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
                    "or remove the quotes in config.yaml")
 
 
+def _validate_state_store(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
+    """Validate the backend-neutral store policy without rendering its secret value."""
+    try:
+        from state_store import StateStoreConfigurationError, resolve_state_store_config
+
+        resolve_state_store_config(config)
+    except StateStoreConfigurationError as exc:
+        _issue(
+            issues,
+            "error",
+            str(exc),
+            "Correct state_store in config.yaml; keep the DSN only in the active profile secret scope",
+        )
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return detected issues (accepts a pre-loaded dict).
     Catches common YAML mistakes that otherwise surface as confusing runtime errors."""
@@ -1248,6 +1263,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
+    _validate_state_store(config, issues)
     return issues
 
 
