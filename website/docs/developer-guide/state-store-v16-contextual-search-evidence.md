@@ -45,3 +45,9 @@ A valid PostgreSQL public cutover slice must introduce and differentially test t
 ## Exact remaining gaps / cutover boundary
 
 Not implemented or claimed: FTS5 BM25/tokenizer/CJK/trigram equivalence; SQLite corruption-detach/canonical-LIKE fallback/deferred-rebuild parity; migration/import/export; RLS authorization; production deployment; runtime/config cutover; or production readiness. The public PostgreSQL contextual route is limited to a configured tenant with a valid generated-document/GIN health gate; repair is local explicit maintenance, not a deployment recovery plan.
+
+## Delivery-obligation ledger cutover prerequisite
+
+`gateway.delivery_ledger` remains a separately durable SQLite recovery store; PostgreSQL ledger storage is not implemented or claimed. This refactor extracts its backend-neutral `DeliveryReceipt` fence contract and routes gateway production and recovery transitions through receipt-guarded claim, success, failure, and release calls. SQLite migration adds a zero-default `delivery_fence`, durable installation/host/process-generation ownership fields, expiry metadata, and a claim index; existing rows remain recoverable.
+
+The next PostgreSQL StateStore cutover must still make an explicit ledger decision: retain this SQLite ledger as a separately durable co-resident store, or port it atomically with schema migration, recovery/readback contract, rollback, and live PG18 parity. A table-only port is expressly insufficient because stale owners must not mutate a newer receipt fence.
