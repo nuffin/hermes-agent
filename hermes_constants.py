@@ -1598,6 +1598,25 @@ def translate_cwd_for_wsl_backend(cwd: str) -> str:
 _container_detected: bool | None = None
 
 
+def _root_mount_has_marker(path: str, markers: tuple[str, ...]) -> bool:
+    """Return whether a mountinfo root record contains a runtime marker.
+
+    Mountinfo field 5 (index 4) is the mount point.  A host that merely runs
+    containers exposes their containerd/CRI-O overlay paths at non-root mount
+    points; only ``/`` describes this process's own root filesystem.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            root_lines = [
+                line
+                for line in f
+                if len(fields := line.split()) >= 5 and fields[4] == "/"
+            ]
+    except OSError:
+        return False
+    return any(marker in line for line in root_lines for marker in markers)
+
+
 def is_container() -> bool:
     """Return True when running inside a container.
 
@@ -1637,17 +1656,13 @@ def is_container() -> bool:
                 return True
     except OSError:
         pass
-    # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
-    try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
-                _container_detected = True
-                return True
-    except OSError:
-        pass
+    # With cgroup v2, inspect only this process's root mount. Hosts expose
+    # container runtime paths in non-root mounts for every running container.
+    if _root_mount_has_marker(
+        "/proc/self/mountinfo", ("kubepods", "containerd", "crio")
+    ):
+        _container_detected = True
+        return True
     _container_detected = False
     return False
 

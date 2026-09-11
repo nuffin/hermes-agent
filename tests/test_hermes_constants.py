@@ -361,6 +361,28 @@ class TestIsContainer:
         monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.43.0.1")
         assert is_container() is True
 
+    def test_cgroup_v2_fallback_inspects_only_the_root_mount(self, tmp_path):
+        """A host's non-root container mounts must not identify this process as a container."""
+        from hermes_constants import _root_mount_has_marker
+
+        markers = ("kubepods", "containerd", "crio")
+        host = tmp_path / "host"
+        host.write_text(
+            "25 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n"
+            "469 554 0:94 / /var/lib/docker/rootfs/overlayfs/7dda83 rw,relatime shared:247 - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/33509/fs\n"
+        )
+        container = tmp_path / "container"
+        container.write_text(
+            "1 0 0:50 / / rw,relatime - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/9/fs\n"
+            "2 1 0:51 / /proc rw,nosuid - proc proc rw\n"
+        )
+
+        assert _root_mount_has_marker(str(host), markers) is False
+        assert _root_mount_has_marker(str(container), markers) is True
+        assert _root_mount_has_marker(str(tmp_path / "missing"), markers) is False
+
 
 
     def test_caches_result(self, monkeypatch):
