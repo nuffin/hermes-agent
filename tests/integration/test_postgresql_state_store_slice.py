@@ -6,6 +6,9 @@ import importlib
 import json
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from typing import Any, cast
 
 import pytest
 
@@ -309,7 +312,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -326,9 +329,20 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
                 ("sessions_parent_session_id_fkey", False),
                 ("sessions_system_prompt_hash_fkey", True),
             ]
+            cursor.execute(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = 'hermes_state_store_slice.conversation_generations'::regclass "
+                "AND contype = 'p'"
+            )
+            assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE hermes_state_store_slice.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
+            cursor.execute("ALTER TABLE hermes_state_store_slice.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
+        with pytest.raises(StateStoreConfigurationError, match="primary key must be"):
+            open_state_store(_config())
     finally:
         _reset_schema(dsn)
 
@@ -346,7 +360,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -354,7 +368,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -366,13 +380,130 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
             open_state_store(_config())
     finally:
         _reset_schema(dsn)
+
+
+def test_sqlite_and_postgresql_generation_lifecycle_parity_and_aba_survival(monkeypatch, tmp_path):
+    """Reset generation is source/key scoped, first-stamp-wins, and outlives sessions."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    try:
+        for store in stores:
+            raw_store = cast(Any, store)
+            source, key = f"generation-source-{uuid.uuid4()}", f"generation-key-{uuid.uuid4()}"
+            session = f"generation-session-{uuid.uuid4()}"
+            store.ensure_session(session, source=source, metadata={"session_key": key})
+            assert store.latest_conversation_boundary(key, source) is None
+            store.end_session(session, "compression")
+            assert store.latest_conversation_boundary(key, source) is None
+            assert store.promote_to_session_reset(session) is False
+
+            promoted = f"generation-promoted-{uuid.uuid4()}"
+            store.ensure_session(promoted, source=source, metadata={"session_key": key})
+            store.end_session(promoted, "agent_close")
+            assert store.promote_to_session_reset(promoted)
+            assert store.promote_to_session_reset(promoted) is False
+            store.end_session(promoted, "idle")
+            ended = store.get_session(promoted)
+            assert ended is not None and ended["end_reason"] == "session_reset"
+            assert store.latest_conversation_boundary(key, source) == 1
+
+            unkeyed = f"generation-unkeyed-{uuid.uuid4()}"
+            store.ensure_session(unkeyed, source=source)
+            store.end_session(unkeyed, "session_reset")
+            assert store.latest_conversation_boundary(key, source) == 1
+            assert store.latest_conversation_boundary(key, f"other-{source}") is None
+
+            if hasattr(store, "_session_db"):
+                assert raw_store._session_db.delete_session(promoted)
+            else:
+                with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
+                    cursor.execute("DELETE FROM hermes_state_store_slice.sessions WHERE id = %s", (promoted,))
+                    connection.commit()
+            successor = f"generation-successor-{uuid.uuid4()}"
+            store.ensure_session(successor, source=source, metadata={"session_key": key})
+            store.end_session(successor, "session_reset")
+            successor_row = store.get_session(successor)
+            assert successor_row is not None
+            observations.append((store.latest_conversation_boundary(key, source), successor_row["end_reason"]))
+        assert observations == [(2, "session_reset"), (2, "session_reset")]
+    finally:
+        for store in stores:
+            store.close()
+
+
+def test_postgresql_generation_end_and_promotion_are_atomic_under_concurrency(monkeypatch):
+    """Concurrent close/promotion commits one reset and one generation, never a half-boundary."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    store = open_state_store(_config())
+    competing_store = open_state_store(_config())
+    source, key = f"concurrent-source-{uuid.uuid4()}", f"concurrent-key-{uuid.uuid4()}"
+    session = f"concurrent-session-{uuid.uuid4()}"
+    try:
+        store.ensure_session(session, source=source, metadata={"session_key": key})
+        start = Barrier(2)
+
+        def close() -> None:
+            start.wait()
+            store.end_session(session, "agent_close")
+
+        def promote() -> bool:
+            start.wait()
+            return competing_store.promote_to_session_reset(session)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda operation: operation(), (close, promote)))
+        session_row = store.get_session(session)
+        assert session_row is not None and session_row["end_reason"] == "session_reset"
+        assert store.latest_conversation_boundary(key, source) == 1
+
+        duplicate = f"duplicate-session-{uuid.uuid4()}"
+        store.ensure_session(duplicate, source=source, metadata={"session_key": key})
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: store.end_session(duplicate, "session_reset"), range(2)))
+        duplicate_row = store.get_session(duplicate)
+        assert duplicate_row is not None and duplicate_row["end_reason"] == "session_reset"
+        assert store.latest_conversation_boundary(key, source) == 2
+    finally:
+        store.close()
+        competing_store.close()
+
+
+def test_postgresql_generation_update_rolls_back_with_failed_boundary(monkeypatch):
+    """A failed transaction cannot leave a generation whose end stamp vanished."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    store = open_state_store(_config())
+    source, key = f"rollback-source-{uuid.uuid4()}", f"rollback-key-{uuid.uuid4()}"
+    session = f"rollback-session-{uuid.uuid4()}"
+    raw_store = cast(Any, store)
+    original = raw_store._bump_conversation_generation
+    try:
+        store.ensure_session(session, source=source, metadata={"session_key": key})
+        raw_store._bump_conversation_generation = lambda *_args: (_ for _ in ()).throw(RuntimeError("inject rollback"))
+        with pytest.raises(RuntimeError, match="inject rollback"):
+            store.end_session(session, "session_reset")
+        session_row = store.get_session(session)
+        assert session_row is not None and session_row["end_reason"] is None
+        assert store.latest_conversation_boundary(key, source) is None
+        promotion = f"rollback-promotion-{uuid.uuid4()}"
+        store.ensure_session(promotion, source=source, metadata={"session_key": key})
+        assert store.promote_to_session_reset(promotion) is False
+        promotion_row = store.get_session(promotion)
+        assert promotion_row is not None and promotion_row["end_reason"] is None
+        assert store.latest_conversation_boundary(key, source) is None
+    finally:
+        raw_store._bump_conversation_generation = original
+        store.close()
 
 
 def test_sqlite_and_postgresql_resume_projection_and_lineage_parity(monkeypatch, tmp_path):

@@ -107,6 +107,10 @@ class StateStore(Protocol):
 
     def end_session(self, session_id: str, end_reason: str) -> None: ...
 
+    def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool: ...
+
+    def latest_conversation_boundary(self, session_key: str, source: str) -> int | None: ...
+
     def queue_token_counts(self, session_id: str, **kwargs: Any) -> None: ...
 
     def flush_token_counts(self, timeout: float = 5.0) -> bool: ...
@@ -283,6 +287,12 @@ class SqliteStateStore:
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         self._session_db.end_session(session_id, end_reason)
+
+    def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool:
+        return self._session_db.promote_to_session_reset(session_id, reason)
+
+    def latest_conversation_boundary(self, session_key: str, source: str) -> int | None:
+        return self._session_db.latest_conversation_boundary(session_key, source)
 
     def queue_token_counts(self, session_id: str, **kwargs: Any) -> None:
         self._session_db.queue_token_counts(session_id, **kwargs)
