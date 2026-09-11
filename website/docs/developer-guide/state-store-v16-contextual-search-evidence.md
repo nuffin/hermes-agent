@@ -1,5 +1,9 @@
 # PostgreSQL State Store v16 contextual-search projection audit
 
+## Direct-history reconciliation
+
+- `b68ccbe76f4e85b539a4c05d69ec59ea8e06f636` — `Change-Id: I83b2756b073f43529edf63e0a9edee40`; migration v16 bounded browse projection, 42 tests. This did not route the complete contextual tool or authorize a backend cutover.
+
 ## Decision: no partial contextual projection is portable
 
 No independently complete contextual `session_search` projection group is currently exposed through `StateStore`. PostgreSQL remains intentionally limited to raw lexical candidate rows. This document records a fail-closed non-implementation rather than returning lexical rows as a substitute for the existing contextual API.
@@ -12,9 +16,11 @@ The tool's discovery flow uses those raw candidates only as an input. It default
 
 Candidate visibility excludes hidden display rows and, unless requested, requires active or compaction-archived messages. SQLite's FTS failures detach derived FTS structures, mark search stale, serve canonical `LIKE` fallback, and during deferred backfill supplement the unindexed high-water gap. Rebuild admission, quarantine, retries, and tool-visible incompleteness are all part of the observable behavior.
 
-## Why PostgreSQL cannot claim it
+## Implemented PostgreSQL subcapability (still not a contextual cutover)
 
-The current PostgreSQL `search_messages()` lacks the SQLite `model` and `context` projections. More importantly, it does not provide backend-neutral equivalents for `get_anchored_view()`, `get_messages_around()`, or the public storage/rebuild state read that discovery reports. `session_search_tool` additionally reads SQLite private connection/lock state for anchor status. Adding only neighbour SQL would therefore leave discovery, detail, scroll, and degradation semantics backend-specific.
+PostgreSQL now has tenant-schema-qualified, parameterized anchored-detail/bookend and scroll primitives. They preserve the SQLite physical transcript identity order (`id`; timestamps are not a safe adjacency key), foreign-anchor empty view, anchor inclusion/repetition, role-filtered detail with tool-anchor retention, and strictly non-overlapping non-empty bookends. PG18 differential coverage exercises regressing timestamps, boundaries, tool anchors, same-session isolation, and repeated scroll anchors.
+
+This remains deliberately incomplete: PostgreSQL candidates lack SQLite's `model` and conditional context projection, and it has no equivalent public search-index/rebuild status. The tool continues to reject PostgreSQL through `ContextualSessionSearchStore`; no lexical PostgreSQL rows or new primitives are routed into contextual discovery, detail, scroll, browse, or read.
 
 ## Implemented intermediate contract
 
