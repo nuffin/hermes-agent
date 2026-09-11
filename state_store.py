@@ -107,6 +107,14 @@ class StateStore(Protocol):
 
     def end_session(self, session_id: str, end_reason: str) -> None: ...
 
+    def queue_token_counts(self, session_id: str, **kwargs: Any) -> None: ...
+
+    def flush_token_counts(self, timeout: float = 5.0) -> bool: ...
+
+    def update_token_counts(self, session_id: str, input_tokens: int = 0, output_tokens: int = 0, model: str | None = None, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None, actual_cost_usd: float | None = None, cost_status: str | None = None, cost_source: str | None = None, pricing_version: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, billing_mode: str | None = None, api_call_count: int = 0, absolute: bool = False) -> None: ...
+
+    def record_auxiliary_usage(self, session_id: str, task: str, **kwargs: Any) -> None: ...
+
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
 
     def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None: ...
@@ -275,6 +283,18 @@ class SqliteStateStore:
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         self._session_db.end_session(session_id, end_reason)
+
+    def queue_token_counts(self, session_id: str, **kwargs: Any) -> None:
+        self._session_db.queue_token_counts(session_id, **kwargs)
+
+    def flush_token_counts(self, timeout: float = 5.0) -> bool:
+        return self._session_db.flush_token_counts(timeout)
+
+    def update_token_counts(self, session_id: str, *args: Any, **kwargs: Any) -> None:
+        self._session_db.update_token_counts(session_id, *args, **kwargs)
+
+    def record_auxiliary_usage(self, session_id: str, task: str, **kwargs: Any) -> None:
+        self._session_db.record_auxiliary_usage(session_id, task, **kwargs)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         row = self._session_db.get_session(session_id)
