@@ -58,7 +58,9 @@ _MESSAGE_RECORD_WRITE_COLUMNS = tuple(
     column for column in _MESSAGE_RECORD_COLUMNS if column not in {"active", "compacted", "display_identity"}
 )
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_SEARCH_RESULT_FIELDS = ("id", "session_id", "role", "snippet", "timestamp", "tool_name", "source", "session_started")
+_SEARCH_RESULT_FIELDS = (
+    "id", "session_id", "role", "snippet", "timestamp", "tool_name", "source", "model", "session_started", "context",
+)
 _TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
 _NUMBERED_TITLE_RE = re.compile(r"^(.*?) #(\d+)$")
@@ -774,6 +776,44 @@ class PostgreSQLStateStore:
             "messages_after": primitive["messages_after"], "bookend_start": start_rows, "bookend_end": end_rows,
         }
 
+    @staticmethod
+    def _flatten_search_context(content: Any) -> str:
+        """Match SessionDB's contextual text projection for decoded content."""
+        if isinstance(content, list):
+            parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+            return " ".join(part for part in parts if part).strip() or "[multimodal content]"
+        return content if isinstance(content, str) else ""
+
+    def _search_contexts(self, message_ids: Collection[int]) -> dict[int, list[dict[str, str]]]:
+        """Batch same-session timestamp/identity neighbours for canonical candidates."""
+        contexts = {int(message_id): [] for message_id in message_ids}
+        if not contexts:
+            return contexts
+        sql = f"""
+            WITH target AS (
+                SELECT id, session_id, created_at FROM {self._schema}.messages WHERE id = ANY(%s)
+            )
+            SELECT t.id AS match_id, m.role, m.content
+            FROM target AS t JOIN {self._schema}.messages AS m ON m.id IN (
+                t.id,
+                (SELECT p.id FROM {self._schema}.messages AS p
+                 WHERE p.session_id = t.session_id AND (p.created_at, p.id) < (t.created_at, t.id)
+                 ORDER BY p.created_at DESC, p.id DESC LIMIT 1),
+                (SELECT n.id FROM {self._schema}.messages AS n
+                 WHERE n.session_id = t.session_id AND (n.created_at, n.id) > (t.created_at, t.id)
+                 ORDER BY n.created_at, n.id LIMIT 1)
+            )
+            ORDER BY t.id, m.created_at, m.id
+        """
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(sql, (list(contexts),))
+            for row in cursor.fetchall():
+                contexts[int(row["match_id"])].append({
+                    "role": row["role"],
+                    "content": self._flatten_search_context(self._decode_content(row["content"]))[:200],
+                })
+        return contexts
+
     def search_messages(
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
@@ -825,7 +865,7 @@ class PostgreSQLStateStore:
         params.extend([limit, offset])
         sql = (
             f"SELECT m.id, m.session_id, m.role, {snippet} AS snippet, m.created_at AS timestamp, m.tool_name, "
-            f"s.source, s.started_at AS session_started, {rank} AS rank "
+            f"s.source, s.model, s.started_at AS session_started, {rank} AS rank "
             f"FROM {self._schema}.messages m JOIN {self._schema}.sessions s ON s.id = m.session_id "
             f"WHERE {' AND '.join(predicates)} ORDER BY {order} LIMIT %s OFFSET %s"
         )
@@ -834,8 +874,15 @@ class PostgreSQLStateStore:
             rows = list(cursor.fetchall())
         for row in rows:
             row.pop("rank", None)
+        if result_fields is None or "context" in result_fields:
+            try:
+                contexts = self._search_contexts([int(row["id"]) for row in rows])
+            except Exception:  # Context is best-effort; lexical candidates remain usable on enrichment failure.
+                contexts = {}
+            for row in rows:
+                row["context"] = contexts.get(row["id"], [])
         if result_fields is not None:
-            rows = [{field: row[field] for field in result_fields} for row in rows]
+            rows = [{field: row[field] for field in result_fields if field in row} for row in rows]
         return rows
 
     @staticmethod
