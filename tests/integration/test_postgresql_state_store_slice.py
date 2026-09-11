@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -13,6 +14,7 @@ from typing import Any, cast
 import pytest
 
 from state_store import MessageRecord, StateStoreConfigurationError, open_state_store
+from hermes_state import SessionDB
 
 
 _DSN_ENV = "HERMES_STATE_STORE_TEST_DSN"
@@ -313,18 +315,18 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 16))
+        assert _migration_versions(dsn) == list(range(1, 17))
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
-            assert {"id", "source", "started_at", "parent_session_id", "system_prompt_hash", "title", "title_source", "hidden", "archived", "pinned", "git_branch", "git_metadata_generation"} <= columns
+            assert {"id", "source", "started_at", "last_activity_at", "parent_session_id", "system_prompt_hash", "title", "title_source", "hidden", "archived", "pinned", "git_branch", "git_metadata_generation"} <= columns
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'system_prompts'")
             assert {"hash", "prompt"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'messages'")
             message_columns = {row[0] for row in cursor.fetchall()}
             assert {"tool_calls", "reasoning_details", "display_metadata", "active", "compacted", "search_document"} <= message_columns
             cursor.execute(f"SELECT indexname FROM pg_indexes WHERE schemaname = '{_SCHEMA}'")
-            assert {"messages_session_id_id", "messages_resume_projection", "messages_search_document_gin", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
+            assert {"messages_session_id_id", "messages_resume_projection", "messages_search_document_gin", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at", "sessions_effective_activity"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute(f"SELECT conname, convalidated FROM pg_constraint WHERE conrelid = '{_SCHEMA}.sessions'::regclass AND contype = 'f' ORDER BY conname")
             assert cursor.fetchall() == [
                 ("sessions_parent_session_id_fkey", False),
@@ -338,7 +340,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 16))
+        assert _migration_versions(dsn) == list(range(1, 17))
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
             cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
@@ -361,7 +363,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 16))
+        assert _migration_versions(dsn) == list(range(1, 17))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -369,7 +371,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 16))
+        assert _migration_versions(dsn) == list(range(1, 17))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -381,7 +383,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 16))
+        assert _migration_versions(dsn) == list(range(1, 17))
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute(f"DROP INDEX {_SCHEMA}.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
@@ -641,7 +643,7 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
         postgresql = cast(Any, stores[1])
         with postgresql._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
-            assert [row[0] for row in cursor.fetchall()][-3:] == [13, 14, 15]
+            assert [row[0] for row in cursor.fetchall()][-4:] == [13, 14, 15, 16]
     finally:
         for store in stores:
             store.close()
@@ -761,23 +763,30 @@ def test_postgresql_tenant_acquisition_isolates_root_named_profiles_and_pool_sea
         monkeypatch.setenv("HERMES_HOME", str(root))
         root_store = open_state_store(_config())
         root_store.ensure_session("tenant-shared", metadata={"profile_name": "bob"})
+        root_store.append_message("tenant-shared", role="user", content="root browse only")
         stores.append(root_store)
 
         monkeypatch.setenv("HERMES_HOME", str(alice))
         alice_store = open_state_store(_config())
         alice_store.ensure_session("tenant-shared", metadata={"profile_name": "root"})
+        alice_store.append_message("tenant-shared", role="user", content="alice browse only")
         stores.append(alice_store)
 
         monkeypatch.setenv("HERMES_HOME", str(bob))
         bob_store = open_state_store(_config())
         assert bob_store.get_session("tenant-shared") is None
         bob_store.ensure_session("tenant-shared")
+        bob_store.append_message("tenant-shared", role="user", content="bob browse only")
         stores.append(bob_store)
 
         assert len({store._schema for store in stores}) == 3
         assert root_store.get_session("tenant-shared") is not None
         assert alice_store.get_session("tenant-shared") is not None
         assert bob_store.get_session("tenant-shared") is not None
+        for store, preview in ((root_store, "root browse only"), (alice_store, "alice browse only"), (bob_store, "bob browse only")):
+            row = next(item for item in cast(Any, store).list_recent_sessions_bounded(limit=128, exclude_sources=[], timeout_seconds=3)
+                       if item["id"] == "tenant-shared")
+            assert row["preview"] == preview
         for store in stores:
             with store._connection() as connection, connection.cursor() as cursor:
                 cursor.execute("SHOW search_path")
@@ -812,6 +821,60 @@ def test_postgresql_rejects_injection_looking_schema_before_connecting():
             "postgresql://invalid",
             schema='tenant"; DROP SCHEMA public; --',
         )
+
+
+def test_sqlite_and_postgresql_bounded_recent_compression_projection_parity(monkeypatch, tmp_path):
+    """Direct bounded browse parity; contextual routing remains unavailable."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    _reset_schema(dsn)
+    sqlite, postgres = SessionDB(tmp_path / "state.db"), cast(Any, open_state_store(_config()))
+    prefix, now = f"bounded-{uuid.uuid4()}", time.time()
+    root, tip, reset, hidden, delegated, excluded = (f"{prefix}-{name}" for name in ("root", "tip", "reset", "hidden", "delegated", "excluded"))
+
+    def seed_sqlite() -> None:
+        sqlite.create_session(root, source="visible")
+        sqlite.append_message(root, role="user", content="root preview")
+        sqlite.end_session(root, "compression")
+        sqlite.create_session(tip, source="visible", parent_session_id=root)
+        sqlite.append_message(tip, role="user", content="tip preview")
+        for session_id, source, config in ((reset, "visible", None), (hidden, "visible", None), (delegated, "visible", {"_delegate_from": "parent"}), (excluded, "excluded", None)):
+            sqlite.create_session(session_id, source=source, model_config=config)
+            sqlite.append_message(session_id, role="user", content=f"{session_id} preview")
+        sqlite.set_session_hidden(hidden, True)
+        for session_id, activity in ((root, now - 100), (tip, now), (reset, now - 10), (hidden, now + 10), (delegated, now + 20), (excluded, now + 30)):
+            sqlite._conn.execute("UPDATE sessions SET last_activity_at = ? WHERE id = ?", (activity, session_id))
+            sqlite._conn.execute("UPDATE messages SET timestamp = ? WHERE session_id = ?", (activity, session_id))
+        sqlite._conn.commit()
+
+    def seed_postgres() -> None:
+        postgres.ensure_session(root, source="visible")
+        postgres.append_message(root, role="user", content="root preview")
+        postgres.end_session(root, "compression")
+        postgres.ensure_session(tip, source="visible", metadata={"parent_session_id": root})
+        postgres.append_message(tip, role="user", content="tip preview")
+        for session_id, source, config in ((reset, "visible", None), (hidden, "visible", None), (delegated, "visible", {"_delegate_from": "parent"}), (excluded, "excluded", None)):
+            postgres.ensure_session(session_id, source=source, metadata={"model_config": config} if config else None)
+            postgres.append_message(session_id, role="user", content=f"{session_id} preview")
+        postgres.set_session_hidden(hidden, True)
+        with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
+            for session_id, activity in ((root, now - 100), (tip, now), (reset, now - 10), (hidden, now + 10), (delegated, now + 20), (excluded, now + 30)):
+                cursor.execute(f"UPDATE {_SCHEMA}.sessions SET last_activity_at = %s WHERE id = %s", (activity, session_id))
+                cursor.execute(f"UPDATE {_SCHEMA}.messages SET created_at = %s WHERE session_id = %s", (activity, session_id))
+
+    try:
+        seed_sqlite()
+        seed_postgres()
+        expected = sqlite.list_recent_sessions_bounded(limit=2, exclude_sources=["excluded"], timeout_seconds=3)
+        actual = postgres.list_recent_sessions_bounded(limit=2, exclude_sources=["excluded"], timeout_seconds=3)
+        assert [(row["id"], row["preview"], row.get("_lineage_root_id")) for row in actual] == [
+            (row["id"], row["preview"], row.get("_lineage_root_id")) for row in expected
+        ] == [(tip, "tip preview", root), (reset, f"{reset} preview", None)]
+        assert [row["id"] for row in postgres.list_recent_sessions_bounded(limit=1, exclude_sources=["excluded"], timeout_seconds=3)] == [tip]
+    finally:
+        sqlite.close()
+        postgres.close()
+        _reset_schema(dsn)
 
 
 def test_postgresql_search_contract_is_tenant_local_and_does_not_require_optional_extensions(monkeypatch, tmp_path):
