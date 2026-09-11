@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping, Protocol, cast
@@ -557,6 +558,105 @@ def contextual_session_search_store(session_db=None, *, db_path: Path | None = N
     if isinstance(session_db, SqliteContextualSessionSearchStore):
         return session_db
     return SqliteContextualSessionSearchStore(session_db, db_path=db_path, read_only=read_only)
+
+
+@contextmanager
+def _contextual_profile_home(home: Path):
+    """Temporarily bind backend acquisition to one canonical profile home.
+
+    The ContextVar override is task-local; unlike changing ``HERMES_HOME`` it
+    cannot redirect another multiplexed request while this resolver acquires a
+    named profile's store.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _profile_contextual_home(profile: str | None) -> Path:
+    """Return a canonical existing profile home without accepting caller paths."""
+    if profile is None:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home().expanduser().resolve(strict=True)
+    from hermes_cli import profiles as profiles_mod
+
+    canonical_profile = profiles_mod.normalize_profile_name(profile)
+    profiles_mod.validate_profile_name(canonical_profile)
+    if not profiles_mod.profile_exists(canonical_profile):
+        raise ValueError(f"profile '{canonical_profile}' does not exist")
+    return profiles_mod.get_profile_dir(canonical_profile).expanduser().resolve(strict=True)
+
+
+def _profile_state_store_config(home: Path) -> Mapping[str, Any]:
+    """Read exactly one profile's config, rejecting malformed config instead of defaulting.
+
+    ``load_config()`` targets the ambient profile and its cache, so it is not a
+    safe cross-profile resolver.  This deliberately reads the resolved home
+    directly and leaves defaults (including SQLite) to ``resolve_state_store_config``.
+    """
+    config_path = home / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        import yaml
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise StateStoreConfigurationError(f"cannot read state-store config for {home}") from exc
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise StateStoreConfigurationError("profile config.yaml must be a mapping")
+    return raw
+
+
+def resolve_contextual_session_search_store(
+    *, profile: str | None = None, session_db=None, session_db_factory: Callable[[], Any] | None = None,
+    read_only: bool = False,
+) -> ContextualSessionSearchStore:
+    """Resolve contextual recall through the requested profile's actual backend.
+
+    A named profile is identified only through the profile registry; neither a
+    caller-supplied database path nor a caller-supplied PostgreSQL schema is
+    accepted.  PostgreSQL is acquired under that canonical home so its tenant
+    selection remains the trusted ``postgresql_tenant_schema`` path, then fails
+    closed because it has not implemented contextual recall.
+    """
+    home = _profile_contextual_home(profile)
+    config = _profile_state_store_config(home)
+    resolved = resolve_state_store_config(
+        config,
+        secret_lookup=lambda name: _profile_secret_lookup(home, name),
+    )
+    if resolved.backend == "sqlite":
+        if session_db is None and session_db_factory is not None:
+            session_db = session_db_factory()
+        if session_db is not None:
+            return contextual_session_search_store(session_db, read_only=read_only)
+        return contextual_session_search_store(db_path=home / "state.db", read_only=read_only)
+
+    # Do not infer a fallback from the presence of state.db.  Acquiring this
+    # backend is intentional: it proves the configured tenant is selected by
+    # canonical profile identity before capability is considered.
+    with _contextual_profile_home(home):
+        store = open_state_store(config, secret_lookup=lambda name: _profile_secret_lookup(home, name))
+    try:
+        return contextual_session_search_store(store, backend=resolved.backend, read_only=read_only)
+    except Exception:
+        store.close()
+        raise
+
+
+def _profile_secret_lookup(home: Path, name: str) -> str | None:
+    """Read only the selected profile's secret scope, never ambient process secrets."""
+    from agent.secret_scope import build_profile_secret_scope
+
+    return build_profile_secret_scope(home).get(name)
 
 
 def postgresql_tenant_schema() -> str:

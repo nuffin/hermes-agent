@@ -433,16 +433,9 @@ def _resolve_profile_store(profile: str):
     """Resolve another profile's complete recall capability, read-only and isolated."""
     if profile is None or not str(profile).strip():
         return None
-    from hermes_cli import profiles as profiles_mod
-    from state_store import contextual_session_search_store
-    canon = profiles_mod.normalize_profile_name(profile)
-    profiles_mod.validate_profile_name(canon)
-    if not profiles_mod.profile_exists(canon):
-        raise ValueError(f"profile '{canon}' does not exist")
-    # PostgreSQL contextual search is deliberately unavailable until the complete
-    # lineage/anchor/browse/index contract is implemented for that backend.
-    return contextual_session_search_store(
-        db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
+    from state_store import resolve_contextual_session_search_store
+
+    return resolve_contextual_session_search_store(profile=profile, read_only=True)
 
 
 def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str = None) -> str:
@@ -623,21 +616,37 @@ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=
                    after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
-    from hermes_state import format_session_db_unavailable
-    from state_store import contextual_session_search_store
+    from state_store import resolve_contextual_session_search_store
     from hermes_state_registry import acquire, release_or_close
     owned_dbs: List[Any] = []
+    registry_owned_ids: set[int] = set()
     if db is None:
-        raw_db = _quiet(acquire, None, "SessionDB unavailable for session_search")
-        if raw_db is None:
-            return tool_error(format_session_db_unavailable(), success=False)
-        owned_dbs.append(raw_db)
-        db = _quiet(lambda: contextual_session_search_store(raw_db), None,
-                    "Contextual session-search capability unavailable")
+        acquired: List[Any] = []
+
+        def acquire_sqlite_session_db():
+            raw_db = acquire()
+            if raw_db is None:
+                raise RuntimeError("SessionDB unavailable for session_search")
+            acquired.append(raw_db)
+            return raw_db
+
+        db = _quiet(
+            lambda: resolve_contextual_session_search_store(session_db_factory=acquire_sqlite_session_db),
+            None,
+            "Contextual session-search capability unavailable",
+        )
         if db is None:
-            return tool_error("Contextual session search is unavailable for the selected state-store backend", success=False)
+            return tool_error(
+                "Contextual session search is unavailable for the selected state-store backend",
+                success=False,
+            )
+        if acquired:
+            owned_dbs.append(acquired[0])
+            registry_owned_ids.add(id(acquired[0]))
+        else:
+            owned_dbs.append(db)
     else:
-        db = _quiet(lambda: contextual_session_search_store(db), None,
+        db = _quiet(lambda: resolve_contextual_session_search_store(session_db=db), None,
                     "Contextual session-search capability unavailable")
         if db is None:
             return tool_error("Contextual session search is unavailable for the selected state-store backend", success=False)
@@ -647,7 +656,8 @@ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=
                          after=after, before=before, exclude_session_ids=exclude_session_ids)
     finally:
         for owned_db in reversed(owned_dbs):
-            _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
+            closer = (lambda db=owned_db: release_or_close(db)) if id(owned_db) in registry_owned_ids else owned_db.close
+            _quiet(closer, None, "Failed to close session_search store")
 
 
 def check_session_search_requirements() -> bool:
