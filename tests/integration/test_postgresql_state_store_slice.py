@@ -830,18 +830,33 @@ def test_postgresql_search_contract_is_tenant_local_and_does_not_require_optiona
             store.append_message("search-beta", role="assistant", content="needle private beta")
             store.append_message("search-beta", role="user", content="中文记忆断裂 substring")
 
-        for query, kwargs in (("needle", {}), ("needle", {"source_filter": ["alpha"]}),
-                              ("needle", {"role_filter": ["assistant"]}), ("中文记忆", {})):
-            sqlite_rows = sqlite.search_messages(query, fields=("session_id", "role", "source", "snippet"), **kwargs)
-            postgresql_rows = postgresql.search_messages(query, fields=("session_id", "role", "source", "snippet"), **kwargs)
+        supported_cases: tuple[tuple[str, dict[str, Any]], ...] = (
+            ("needle", {}),
+            ("lexical needle", {"source_filter": ["alpha"]}),
+            ('"lexical needle"', {"role_filter": ["assistant"]}),
+            ("need*", {"exclude_sources": ["beta"]}),
+            ("lexical AND needle", {}),
+            ("lexical OR private", {}),
+            ("needle NOT private", {"include_inactive": True}),
+            ("中文记忆", {}),
+        )
+        for query, kwargs in supported_cases:
+            sqlite_rows = sqlite.search_messages(query, fields=("id", "session_id", "role", "source", "snippet"), **kwargs)
+            postgresql_rows = postgresql.search_messages(query, fields=("id", "session_id", "role", "source", "snippet"), **kwargs)
             assert sorted((row["session_id"], row["role"], row["source"]) for row in postgresql_rows) == sorted(
                 (row["session_id"], row["role"], row["source"]) for row in sqlite_rows
             )
             assert all(row["snippet"] for row in postgresql_rows)
 
-        newest = postgresql.search_messages("needle", sort="newest", limit=1, fields=("session_id",))
-        assert newest == [{"session_id": "search-beta"}]
-        assert len(postgresql.search_messages("needle", sort="oldest", limit=1, offset=1)) == 1
+        for sort in ("newest", "oldest"):
+            sqlite_page = sqlite.search_messages("needle", sort=sort, limit=1, offset=1, fields=("session_id", "role", "source"))
+            postgresql_page = postgresql.search_messages("needle", sort=sort, limit=1, offset=1, fields=("session_id", "role", "source"))
+            assert postgresql_page == sqlite_page
+
+        from state_store_postgresql_search import PostgreSQLSearchQueryError
+        for unsupported in ("needle OR OR private", "(needle OR private)", '"needle', "need:private", "中文 AND memory"):
+            with pytest.raises(PostgreSQLSearchQueryError):
+                postgresql.search_messages(unsupported)
 
         # Generated tsvector maintenance survives canonical update/delete and an index rebuild.
         with postgresql._connection() as connection, connection.cursor() as cursor:
