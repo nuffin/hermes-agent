@@ -683,6 +683,97 @@ class PostgreSQLStateStore:
             )
             return list(cursor.fetchall())
 
+    def _contextual_message_rows(self, cursor: Any, session_id: str, ids: list[int]) -> list[dict[str, Any]]:
+        """Hydrate bounded contextual rows in the same snapshot as their seek.
+
+        Contextual browsing is physical transcript order: ids, rather than wall
+        timestamps, preserve tool-call adjacency when clocks tie or regress.
+        """
+        if not ids:
+            return []
+        columns = (
+            "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+            "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
+            "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
+            "active, compacted, api_content, display_kind, display_metadata"
+        )
+        cursor.execute(
+            f"SELECT {columns} FROM {self._schema}.messages "
+            "WHERE session_id = %s AND id = ANY(%s) ORDER BY id",
+            (session_id, ids),
+        )
+        rows = list(cursor.fetchall())
+        for row in rows:
+            row["content"] = self._decode_content(row["content"])
+        return rows
+
+    def get_messages_around(self, session_id: str, around_message_id: int, *, window: int = 5) -> dict[str, Any]:
+        """Return SQLite-compatible physical transcript neighbours around one anchor.
+
+        A foreign anchor deliberately yields an empty view.  The anchor is included
+        in the backward seek so re-anchoring at a page boundary repeats it.
+        """
+        window = max(int(window), 0)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.messages WHERE id = %s AND session_id = %s",
+                (around_message_id, session_id),
+            )
+            if cursor.fetchone() is None:
+                return {"window": [], "messages_before": 0, "messages_after": 0}
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.messages WHERE session_id = %s AND id <= %s "
+                "ORDER BY id DESC LIMIT %s",
+                (session_id, around_message_id, window + 1),
+            )
+            before_ids = [row["id"] for row in cursor.fetchall()]
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.messages WHERE session_id = %s AND id > %s "
+                "ORDER BY id ASC LIMIT %s",
+                (session_id, around_message_id, window),
+            )
+            after_ids = [row["id"] for row in cursor.fetchall()]
+            rows = self._contextual_message_rows(cursor, session_id, list(reversed(before_ids)) + after_ids)
+        return {"window": rows, "messages_before": max(0, len(before_ids) - 1), "messages_after": len(after_ids)}
+
+    def get_anchored_view(
+        self, session_id: str, around_message_id: int, *, window: int = 5, bookend: int = 3,
+        keep_roles: tuple[str, ...] | None = ("user", "assistant"),
+    ) -> dict[str, Any]:
+        """Return the filtered anchor view and non-overlapping same-session bookends."""
+        bookend = max(int(bookend), 0)
+        primitive = self.get_messages_around(session_id, around_message_id, window=window)
+        physical_window = primitive["window"]
+        if not physical_window:
+            return {"window": [], "messages_before": 0, "messages_after": 0, "bookend_start": [], "bookend_end": []}
+        filtered_window = physical_window
+        if keep_roles is not None:
+            keep_set = set(keep_roles)
+            filtered_window = [row for row in physical_window if row["id"] == around_message_id or row["role"] in keep_set]
+        start_rows: list[dict[str, Any]] = []
+        end_rows: list[dict[str, Any]] = []
+        if bookend:
+            role_clause, role_params = "", []
+            if keep_roles is not None:
+                role_clause, role_params = " AND role = ANY(%s)", [list(keep_roles)]
+            with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+                cursor.execute(
+                    f"SELECT id FROM {self._schema}.messages WHERE session_id = %s AND id < %s{role_clause} "
+                    "AND length(content) > 0 ORDER BY id ASC LIMIT %s",
+                    [session_id, physical_window[0]["id"], *role_params, bookend],
+                )
+                start_rows = self._contextual_message_rows(cursor, session_id, [row["id"] for row in cursor.fetchall()])
+                cursor.execute(
+                    f"SELECT id FROM {self._schema}.messages WHERE session_id = %s AND id > %s{role_clause} "
+                    "AND length(content) > 0 ORDER BY id DESC LIMIT %s",
+                    [session_id, physical_window[-1]["id"], *role_params, bookend],
+                )
+                end_rows = self._contextual_message_rows(cursor, session_id, list(reversed([row["id"] for row in cursor.fetchall()])))
+        return {
+            "window": filtered_window, "messages_before": primitive["messages_before"],
+            "messages_after": primitive["messages_after"], "bookend_start": start_rows, "bookend_end": end_rows,
+        }
+
     def search_messages(
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
