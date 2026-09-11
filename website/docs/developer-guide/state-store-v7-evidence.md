@@ -32,3 +32,28 @@ scripts/run_tests.sh tests/integration/test_postgresql_state_store_fixture.py te
 - Direct operational SQLite consumers remain in `agent/transcript_repair.py`, `hermes_cli/session_recovery.py`, `hermes_cli/session_lost_and_found.py`, `tools/session_search_tool.py`, and `hermes_cli/backup.py`.
 
 Therefore v7 does **not** claim compaction/rewind/lineage/transcript display or OpenAI conversation projection, FTS/search, counters/lease semantics, global consumer cutover, SQLite-to-PostgreSQL import, or production PostgreSQL selection parity.
+
+# StateStore v8 resume-projection evidence
+
+## Selected contract
+
+v8 ports the read-only compression-lineage resume projection: compression root/tip identity, full lineage display projection, tip-only model projection, ancestor display prefix, and bounded resume count/guard. The PostgreSQL adapter preserves active-only model rows and display rows where `active OR compacted`; it excludes rewind-only rows and deduplicates repeated carried-forward rows by the current SQLite display key preference (active, then newest row).
+
+This is deliberately not compaction or rewind mutation: those retain SQLite-only lease, watermark, counter, model-config-patch, FTS, and atomic publication behavior.
+
+## PostgreSQL migration and live evidence
+
+Migration v8 adds catalog-validated `messages_resume_projection (session_id, active, id)` to the sequential ledger. Fresh bootstrap, reopen, and v2/v5 upgrade paths now reach `[1, 2, 3, 4, 5, 6, 7, 8]`. Live PostgreSQL 18 and SQLite differential coverage verifies root/tip lineage, model/display split, ancestor-only prefix, count semantics, and guard rejection.
+
+Focused execution:
+
+```text
+scripts/run_tests.sh tests/integration/test_postgresql_state_store_fixture.py tests/integration/test_postgresql_state_store_slice.py tests/hermes_state/test_display_projection_parity.py tests/hermes_state/test_resolve_resume_session_id.py tests/test_state_store_config.py tests/test_state_store_factory.py
+36 passed, 0 failed
+```
+
+## Remaining raw SQLite gaps
+
+- `archive_and_compact`, `rewind_to_message`, compression leases, turn leases, counter repair, display-order backfill, and rotation publication remain `SessionDB`-only.
+- Full OpenAI replay fidelity still depends on `SessionMessagesMixin._rows_to_conversation`, including sanitization, persisted-marker stamping, exact clone/carrier handling, and alternation repair; v8 is not a global consumer cutover.
+- FTS/search, import/cutover/rollback, recovery, profile tenancy, and production PostgreSQL selection remain unported.

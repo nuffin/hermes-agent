@@ -91,6 +91,20 @@ class StateStore(Protocol):
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]: ...
 
+    def get_compression_tip(self, session_id: str) -> str | None: ...
+
+    def get_compression_lineage(self, session_id: str) -> list[str]: ...
+
+    def get_conversation_root(self, session_id: str) -> str: ...
+
+    def get_resume_conversations(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]: ...
+
+    def get_ancestor_display_prefix(self, session_id: str) -> list[dict[str, Any]]: ...
+
+    def get_resume_message_count(self, session_id: str, *, tip_only: bool = False) -> int: ...
+
+    def assert_resume_safe(self, session_id: str, max_messages: int | None = None, *, tip_only: bool = False) -> int: ...
+
     def end_session(self, session_id: str, end_reason: str) -> None: ...
 
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
@@ -233,6 +247,27 @@ class SqliteStateStore:
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]:
         return self._session_db.get_messages(session_id)
+
+    def get_compression_tip(self, session_id: str) -> str:
+        return self._session_db.get_compression_tip(session_id)
+
+    def get_compression_lineage(self, session_id: str) -> list[str]:
+        return self._session_db.get_compression_lineage(session_id)
+
+    def get_conversation_root(self, session_id: str) -> str:
+        return self._session_db.get_conversation_root(session_id)
+
+    def get_resume_conversations(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        return self._session_db.get_resume_conversations(session_id)
+
+    def get_ancestor_display_prefix(self, session_id: str) -> list[dict[str, Any]]:
+        return self._session_db.get_ancestor_display_prefix(session_id)
+
+    def get_resume_message_count(self, session_id: str, *, tip_only: bool = False) -> int:
+        return self._session_db.get_resume_message_count(session_id, tip_only=tip_only)
+
+    def assert_resume_safe(self, session_id: str, max_messages: int | None = None, *, tip_only: bool = False) -> int:
+        return self._session_db.assert_resume_safe(session_id, max_messages, tip_only=tip_only)
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         self._session_db.end_session(session_id, end_reason)
