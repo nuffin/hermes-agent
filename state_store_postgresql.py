@@ -8,6 +8,7 @@ is not yet a replacement for the full SessionDB state surface.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import json
 import queue
@@ -31,6 +32,7 @@ _SCHEMA_VERSION = 5
 _VISIBILITY_SCHEMA_VERSION = 6
 _MESSAGE_RECORD_SCHEMA_VERSION = 7
 _RESUME_PROJECTION_SCHEMA_VERSION = 8
+_SYSTEM_PROMPT_SCHEMA_VERSION = 9
 _MESSAGE_RECORD_COLUMNS = (
     "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "token_count", "finish_reason",
     "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
@@ -130,7 +132,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _RESUME_PROJECTION_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _SYSTEM_PROMPT_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -142,6 +144,7 @@ class PostgreSQLStateStore:
                     (_VISIBILITY_SCHEMA_VERSION, self._apply_v6, self._validate_v6),
                     (_MESSAGE_RECORD_SCHEMA_VERSION, self._apply_v7, self._validate_v7),
                     (_RESUME_PROJECTION_SCHEMA_VERSION, self._apply_v8, self._validate_v8),
+                    (_SYSTEM_PROMPT_SCHEMA_VERSION, self._apply_v9, self._validate_v9),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -284,6 +287,25 @@ class PostgreSQLStateStore:
     def _validate_v8(self, cursor: Any) -> None:
         self._validate_v7(cursor)
         self._require_index(cursor, "messages_resume_projection")
+
+    def _apply_v9(self, cursor: Any) -> None:
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.system_prompts (hash text PRIMARY KEY, prompt text NOT NULL)")
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS system_prompt_hash text")
+        cursor.execute(
+            "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass "
+            "AND contype = 'f' AND confrelid = %s::regclass",
+            ("sessions_system_prompt_hash_fkey", f"{_SCHEMA}.sessions", f"{_SCHEMA}.system_prompts"),
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_system_prompt_hash_fkey "
+                f"FOREIGN KEY (system_prompt_hash) REFERENCES {_SCHEMA}.system_prompts(hash)"
+            )
+
+    def _validate_v9(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {"system_prompt_hash"})
+        self._required_columns(cursor, "system_prompts", {"hash", "prompt"})
+        self._require_foreign_key(cursor, "sessions_system_prompt_hash_fkey", "sessions", "system_prompts")
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -590,10 +612,29 @@ class PostgreSQLStateStore:
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
-                f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, archived, pinned, {', '.join(_SESSION_METADATA_COLUMNS)} "
-                f"FROM {_SCHEMA}.sessions WHERE id = %s", (session_id,),
+                f"SELECT s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.title, s.title_source, s.hidden, s.archived, s.pinned, "
+                f"s.system_prompt_hash, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
+                f"FROM {_SCHEMA}.sessions s LEFT JOIN {_SCHEMA}.system_prompts p ON p.hash = s.system_prompt_hash WHERE s.id = %s", (session_id,),
             )
             return cursor.fetchone()
+
+    def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None:
+        prompt_hash = None if system_prompt is None else hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+        with self._connection() as connection, connection.cursor() as cursor:
+            if prompt_hash is not None:
+                cursor.execute(
+                    f"INSERT INTO {_SCHEMA}.system_prompts (hash, prompt) VALUES (%s, %s) ON CONFLICT (hash) DO NOTHING",
+                    (prompt_hash, system_prompt),
+                )
+            cursor.execute(f"UPDATE {_SCHEMA}.sessions SET system_prompt_hash = %s WHERE id = %s", (prompt_hash, session_id))
+            cursor.execute(
+                f"DELETE FROM {_SCHEMA}.system_prompts p WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {_SCHEMA}.sessions s WHERE s.system_prompt_hash = p.hash)"
+            )
+
+    def get_system_prompt(self, session_id: str) -> str | None:
+        row = self.get_session(session_id)
+        return None if row is None else row.get("system_prompt")
 
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
         return self._set_lineage_column("hidden", session_id, hidden)
