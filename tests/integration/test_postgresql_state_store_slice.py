@@ -312,7 +312,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'hermes_state_store_slice' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -337,7 +337,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("ALTER TABLE hermes_state_store_slice.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
             cursor.execute("ALTER TABLE hermes_state_store_slice.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
@@ -360,7 +360,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -368,7 +368,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -380,7 +380,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute("ALTER TABLE hermes_state_store_slice.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES hermes_state_store_slice.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute("DROP INDEX hermes_state_store_slice.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
@@ -592,3 +592,55 @@ def test_postgresql_token_usage_delta_rolls_back_summary_when_attribution_fails(
             assert cursor.fetchone() == (0,)
     finally:
         store.close()
+
+
+def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    stores = (open_state_store({}, db_path=tmp_path / "state.db"), open_state_store(_config()))
+    observations = []
+    try:
+        for store in stores:
+            session_id = f"model-config-{uuid.uuid4()}"
+            store.ensure_session(session_id, source="integration", metadata={"model": "initial", "model_config": {"keep": 1, "drop": "x"}})
+            store.set_system_prompt(session_id, "cached footer")
+            store.queue_token_counts(session_id, input_tokens=4, api_call_count=1, model="before", billing_provider="old", billing_base_url="old-url")
+            store.update_session_model(session_id, "after", "provider-after")
+            store.patch_session_model_config(session_id, {"keep": None, "nested": {"json": None}, "new": [1, 2]})
+            store.update_session_billing_route(session_id, provider="new-provider", base_url="new-url", billing_mode="metered")
+            assert store.get_session_model_config_value(session_id, "missing", "fallback") == "fallback"
+            before_rollback = store.get_session_model_config_value(session_id, "new")
+            with pytest.raises(TypeError):
+                store.patch_session_model_config(session_id, {"bad": object()})
+            assert store.get_session_model_config_value(session_id, "new") == before_rollback
+            session = store.get_session(session_id)
+            assert session is not None
+            config = json.loads(session["model_config"]) if isinstance(session["model_config"], str) else session["model_config"]
+            if hasattr(store, "_connection"):
+                raw_store = cast(Any, store)
+                with raw_store._connection() as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT billing_provider, billing_base_url, billing_mode, input_tokens, api_call_count "
+                        "FROM hermes_state_store_slice.sessions WHERE id=%s", (session_id,))
+                    row = cursor.fetchone()
+                    route, usage = row[:3], row[3:]
+            else:
+                raw_store = cast(Any, store)
+                raw_session = raw_store._session_db._read_one(
+                    "SELECT billing_provider, billing_base_url, billing_mode, input_tokens, api_call_count FROM sessions WHERE id=?", (session_id,))
+                route = tuple(raw_session[key] for key in ("billing_provider", "billing_base_url", "billing_mode"))
+                usage = tuple(raw_session[key] for key in ("input_tokens", "api_call_count"))
+            observations.append({
+                "model": session["model"], "config": config, "prompt": session["system_prompt"],
+                "route": route, "usage": usage,
+            })
+        assert observations == [{
+            "model": "after", "config": {"drop": "x", "model": "after", "provider": "provider-after", "nested": {"json": None}, "new": [1, 2]},
+            "prompt": None, "route": ("new-provider", "new-url", "metered"), "usage": (4, 1),
+        }] * 2
+        postgresql = cast(Any, stores[1])
+        with postgresql._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT version FROM hermes_state_store_slice.schema_migrations ORDER BY version")
+            assert [row[0] for row in cursor.fetchall()][-2:] == [11, 12]
+    finally:
+        for store in stores:
+            store.close()

@@ -121,6 +121,16 @@ class StateStore(Protocol):
 
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
 
+    def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None: ...
+
+    def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None: ...
+
+    def patch_session_model_config(self, session_id: str, patch: Mapping[str, Any]) -> None: ...
+
+    def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any: ...
+
+    def update_session_billing_route(self, session_id: str, *, provider: str, base_url: str, billing_mode: str | None = None) -> None: ...
+
     def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None: ...
 
     def get_system_prompt(self, session_id: str) -> str | None: ...
@@ -312,6 +322,24 @@ class SqliteStateStore:
             for key in ("hidden", "archived", "pinned"):
                 row[key] = bool(row.get(key))
         return row
+
+    def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
+        self._session_db.update_session_meta(session_id, model_config_json, model)
+
+    def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None:
+        self._session_db.update_session_model(session_id, model, provider)
+
+    def patch_session_model_config(self, session_id: str, patch: Mapping[str, Any]) -> None:
+        self._session_db.patch_session_model_config(session_id, dict(patch))
+
+    def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
+        return self._session_db.get_session_model_config_value(session_id, key, default)
+
+    def update_session_billing_route(
+        self, session_id: str, *, provider: str, base_url: str, billing_mode: str | None = None,
+    ) -> None:
+        self._session_db.update_session_billing_route(
+            session_id, provider=provider, base_url=base_url, billing_mode=billing_mode)
 
     def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None:
         self._session_db.update_system_prompt(session_id, system_prompt)

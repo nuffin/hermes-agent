@@ -37,6 +37,7 @@ _RESUME_PROJECTION_SCHEMA_VERSION = 8
 _SYSTEM_PROMPT_SCHEMA_VERSION = 9
 _MODEL_USAGE_SCHEMA_VERSION = 10
 _CONVERSATION_GENERATION_SCHEMA_VERSION = 11
+_MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION = 12
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
 _USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
@@ -145,7 +146,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _CONVERSATION_GENERATION_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -160,6 +161,7 @@ class PostgreSQLStateStore:
                     (_SYSTEM_PROMPT_SCHEMA_VERSION, self._apply_v9, self._validate_v9),
                     (_MODEL_USAGE_SCHEMA_VERSION, self._apply_v10, self._validate_v10),
                     (_CONVERSATION_GENERATION_SCHEMA_VERSION, self._apply_v11, self._validate_v11),
+                    (_MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION, self._apply_v12, self._validate_v12),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -393,6 +395,24 @@ class PostgreSQLStateStore:
         if cursor.fetchone() is not None:
             raise StateStoreConfigurationError(
                 f"PostgreSQL State Store schema drift: {_SCHEMA}.conversation_generations must not reference prunable session rows")
+
+    def _apply_v12(self, cursor: Any) -> None:
+        """Record the validated model/config mutation lifecycle contract; no new DDL."""
+        return None
+
+    def _validate_v12(self, cursor: Any) -> None:
+        self._validate_v2(cursor)
+        self._validate_v9(cursor)
+        self._validate_v10(cursor)
+        cursor.execute(
+            "SELECT data_type FROM information_schema.columns WHERE table_schema = %s "
+            "AND table_name = 'sessions' AND column_name = 'model_config'",
+            (_SCHEMA,),
+        )
+        row = cursor.fetchone()
+        if row is None or row[0] != "jsonb":
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.sessions.model_config must be jsonb")
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -794,7 +814,95 @@ class PostgreSQLStateStore:
         generation = int(row[0]) if row is not None and row[0] is not None else 0
         return generation if generation > 0 else None
 
+    @staticmethod
+    def _model_config_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
+        """Replace model config and optionally fill a missing model after queued usage is durable."""
+        self.flush_token_counts()
+        config = self._model_config_object(model_config_json)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions SET model_config = %s, model = COALESCE(%s, model) WHERE id = %s",
+                (self._psycopg.types.json.Jsonb(config) if config else None, model, session_id),
+            )
+
+    def patch_session_model_config(self, session_id: str, patch: Mapping[str, Any]) -> None:
+        """Atomically shallow-merge config; a ``None`` value removes its key."""
+        if not session_id or not patch:
+            return
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT model_config FROM {_SCHEMA}.sessions WHERE id = %s FOR UPDATE", (session_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return
+            config = self._model_config_object(row.get("model_config"))
+            for key, value in patch.items():
+                if value is None:
+                    config.pop(key, None)
+                else:
+                    config[key] = value
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions SET model_config = %s WHERE id = %s",
+                (self._psycopg.types.json.Jsonb(config) if config else None, session_id),
+            )
+
+    def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
+        session = self.get_session(session_id) or {}
+        return self._model_config_object(session.get("model_config")).get(key, default)
+
+    def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None:
+        """Switch the persisted route after queued pre-switch usage has drained."""
+        self.flush_token_counts()
+        patch: dict[str, Any] = {"browser_model_lock": None}
+        if model:
+            patch["model"] = model
+        if provider:
+            patch["provider"] = provider
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT model_config FROM {_SCHEMA}.sessions WHERE id = %s FOR UPDATE", (session_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return
+            config = self._model_config_object(row.get("model_config"))
+            for key, value in patch.items():
+                if value is None:
+                    config.pop(key, None)
+                else:
+                    config[key] = value
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions SET model = %s, model_config = %s, system_prompt_hash = NULL WHERE id = %s",
+                (model, self._psycopg.types.json.Jsonb(config) if config else None, session_id),
+            )
+            cursor.execute(
+                f"DELETE FROM {_SCHEMA}.system_prompts p WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {_SCHEMA}.sessions s WHERE s.system_prompt_hash = p.hash)"
+            )
+
+    def update_session_billing_route(
+        self, session_id: str, *, provider: str, base_url: str, billing_mode: str | None = None,
+    ) -> None:
+        """Persist the latest billable route after queued pre-switch usage has drained."""
+        self.flush_token_counts()
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {_SCHEMA}.sessions SET billing_provider = %s, billing_base_url = %s, "
+                "billing_mode = COALESCE(%s, billing_mode), system_prompt_hash = NULL WHERE id = %s",
+                (provider, base_url, billing_mode, session_id),
+            )
+            cursor.execute(
+                f"DELETE FROM {_SCHEMA}.system_prompts p WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {_SCHEMA}.sessions s WHERE s.system_prompt_hash = p.hash)"
+            )
+
     def get_session(self, session_id: str) -> dict[str, Any] | None:
+        self.flush_token_counts()
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
                 f"SELECT s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.title, s.title_source, s.hidden, s.archived, s.pinned, "
