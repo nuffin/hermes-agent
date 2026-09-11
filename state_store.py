@@ -7,6 +7,7 @@ keeping existing SQLite installations operational without configuration changes.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -435,6 +436,27 @@ class SqliteStateStore:
         self._session_db.close()
 
 
+def postgresql_tenant_schema() -> str:
+    """Return the identifier-safe schema for the already resolved Hermes profile.
+
+    The profile identity comes only from the active ``HERMES_HOME`` resolution,
+    never from StateStore caller metadata or a configuration value.  Hashing the
+    canonical home and canonical profile name makes identifiers deterministic and
+    keeps even unusual profile names out of SQL text.
+    """
+    from hermes_constants import get_hermes_home, profile_name_for_home
+
+    home = get_hermes_home().resolve()
+    profile_name = profile_name_for_home(home)
+    # The formerly global schema is deliberately the root/default compatibility
+    # tenant only. Named profiles never acquire it, so a shared DSN cannot expose
+    # legacy root rows to a named profile.
+    if profile_name == "default":
+        return "hermes_state_store_slice"
+    digest = hashlib.sha256(f"{home}\0{profile_name}".encode("utf-8")).hexdigest()[:32]
+    return f"hermes_state_store_tenant_{digest}"
+
+
 def open_state_store(
     config: Mapping[str, Any], *, db_path: Path | None = None,
     secret_lookup: Callable[[str], str | None] | None = None,
@@ -450,4 +472,4 @@ def open_state_store(
             f"PostgreSQL state store requires secret {resolved.postgresql.dsn_env}; configure it in the active profile secret scope")
     from state_store_postgresql import PostgreSQLStateStore
 
-    return PostgreSQLStateStore(resolved.postgresql, str(dsn))
+    return PostgreSQLStateStore(resolved.postgresql, str(dsn), schema=postgresql_tenant_schema())
