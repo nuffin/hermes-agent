@@ -787,6 +787,9 @@ def test_postgresql_tenant_acquisition_isolates_root_named_profiles_and_pool_sea
             row = next(item for item in cast(Any, store).list_recent_sessions_bounded(limit=128, exclude_sources=[], timeout_seconds=3)
                        if item["id"] == "tenant-shared")
             assert row["preview"] == preview
+            assert store.search_messages("browse", fields=("session_id", "context")) == [{
+                "session_id": "tenant-shared", "context": [{"role": "user", "content": preview}],
+            }]
         for store in stores:
             with store._connection() as connection, connection.cursor() as cursor:
                 cursor.execute("SHOW search_path")
@@ -949,6 +952,69 @@ def test_postgresql_search_contract_is_tenant_local_and_does_not_require_optiona
         sqlite.close()
         if postgresql is not None:
             postgresql.close()
+        _reset_schema(dsn)
+
+
+def test_postgresql_candidate_context_projection_matches_sqlite_contract(monkeypatch, tmp_path):
+    """Candidate rows retain model/metadata and timestamp-identity neighbours without routing tools."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    _reset_schema(dsn)
+    sqlite, postgresql = open_state_store({}, db_path=tmp_path / "context.db"), open_state_store(_config())
+    try:
+        structured_neighbour = "structured " + ("x" * 240)
+        records = (
+            MessageRecord(role="user", content="before candidate", timestamp=10),
+            MessageRecord(role="user", content="candidate needle first", timestamp=20),
+            MessageRecord(role="assistant", content=[{"type": "text", "text": structured_neighbour}], timestamp=20),
+            MessageRecord(role="user", content="candidate needle second", timestamp=20),
+            MessageRecord(role="tool", content="candidate needle tool body", tool_name="lookup", timestamp=30),
+            MessageRecord(role="assistant", content="candidate needle hidden", display_kind="hidden", timestamp=40),
+        )
+        for store in (sqlite, postgresql):
+            store.ensure_session("candidate-main", source="alpha", metadata={"model": "candidate-model"})
+            store.ensure_session("candidate-other", source="beta", metadata={"model": "other-model"})
+            store.append_message_records("candidate-main", list(records))
+            store.append_message_record("candidate-other", MessageRecord(role="user", content="candidate needle foreign", timestamp=20))
+
+        def projection(store, **kwargs):
+            return [{key: row[key] for key in (
+                "session_id", "role", "tool_name", "source", "model", "context",
+            )} for row in store.search_messages("candidate needle", sort="oldest", **kwargs)]
+
+        sqlite_rows, pg_rows = projection(sqlite), projection(postgresql)
+        assert pg_rows == sqlite_rows
+        assert all(isinstance(row["session_started"], float) for row in postgresql.search_messages(
+            "candidate needle", sort="oldest"))
+        assert [tuple(row) for row in postgresql.search_messages("candidate needle", sort="oldest", limit=1)] == [
+            ("id", "session_id", "role", "snippet", "timestamp", "tool_name", "source", "model", "session_started", "context"),
+        ]
+        main_rows = [row for row in pg_rows if row["session_id"] == "candidate-main" and row["role"] == "user"]
+        assert main_rows[0]["context"] == [
+            {"role": "user", "content": "before candidate"},
+            {"role": "user", "content": "candidate needle first"},
+            {"role": "assistant", "content": structured_neighbour[:200]},
+        ]
+        assert all("foreign" not in item["content"] for row in main_rows for item in row["context"])
+        first_candidate_id = next(row["id"] for row in postgresql.search_messages(
+            "candidate needle", sort="oldest", fields=("id", "session_id")) if row["session_id"] == "candidate-main")
+        assert cast(Any, postgresql)._search_contexts([first_candidate_id, first_candidate_id])[first_candidate_id] == main_rows[0]["context"]
+        assert projection(sqlite, source_filter=["alpha"], role_filter=["user"]) == projection(
+            postgresql, source_filter=["alpha"], role_filter=["user"])
+        assert projection(sqlite, exclude_sources=["beta"]) == projection(postgresql, exclude_sources=["beta"])
+        assert sqlite.search_messages("candidate needle", fields=("id", "model"), sort="oldest") == postgresql.search_messages(
+            "candidate needle", fields=("id", "model"), sort="oldest")
+        assert all("context" not in row for row in postgresql.search_messages("candidate needle", fields=("id",), sort="oldest"))
+        assert sqlite.search_messages("candidate needle", role_filter=["tool"], fields=("role", "context")) == postgresql.search_messages(
+            "candidate needle", role_filter=["tool"], fields=("role", "context"))
+        assert sqlite.search_messages("candidate needle", sort="oldest", limit=2, offset=1, fields=("session_id", "role")) == postgresql.search_messages(
+            "candidate needle", sort="oldest", limit=2, offset=1, fields=("session_id", "role"))
+        monkeypatch.setattr(cast(Any, postgresql), "_search_contexts", lambda *_args: (_ for _ in ()).throw(RuntimeError("injected context failure")))
+        assert all(row["context"] == [] for row in postgresql.search_messages(
+            "candidate needle", sort="oldest", fields=("id", "context")))
+    finally:
+        sqlite.close()
+        postgresql.close()
         _reset_schema(dsn)
 
 
