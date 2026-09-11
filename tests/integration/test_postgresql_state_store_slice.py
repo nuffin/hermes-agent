@@ -950,3 +950,64 @@ def test_postgresql_search_contract_is_tenant_local_and_does_not_require_optiona
         if postgresql is not None:
             postgresql.close()
         _reset_schema(dsn)
+
+
+def test_postgresql_anchored_and_scroll_views_match_sqlite_physical_boundaries(monkeypatch, tmp_path):
+    """The partial PostgreSQL store may expose primitives without enabling tool routing."""
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    dsn = os.environ[_DSN_ENV]
+    _reset_schema(dsn)
+    sqlite = SessionDB(tmp_path / "contextual.db")
+    postgresql = open_state_store(_config())
+    try:
+        ids: dict[str, list[int]] = {}
+        sqlite.create_session("contextual", source="integration")
+        sqlite.create_session("other", source="integration")
+        sqlite_records = (
+            ("user", "opening", None, 30.0), ("tool", "tool body", "lookup", 10.0),
+            ("assistant", "anchor", None, 20.0), ("user", "", None, 40.0),
+            ("assistant", "resolution", None, 50.0),
+        )
+        ids["sqlite"] = [sqlite.append_message("contextual", role=role, content=content, tool_name=tool_name, timestamp=timestamp)
+                         for role, content, tool_name, timestamp in sqlite_records]
+        sqlite.append_message("other", role="user", content="foreign")
+        postgresql.ensure_session("contextual", source="integration")
+        postgresql.ensure_session("other", source="integration")
+        records = (
+            MessageRecord(role="user", content="opening", timestamp=30.0),
+            MessageRecord(role="tool", content="tool body", tool_name="lookup", timestamp=10.0),
+            MessageRecord(role="assistant", content="anchor", timestamp=20.0),
+            MessageRecord(role="user", content="", timestamp=40.0),
+            MessageRecord(role="assistant", content="resolution", timestamp=50.0),
+        )
+        ids["postgresql"] = [postgresql.append_message_record("contextual", record) for record in records]
+        postgresql.append_message("other", role="user", content="foreign")
+
+        def projection(view):
+            return {
+                key: ([ (row["role"], row["content"]) for row in value ] if isinstance(value, list) else value)
+                for key, value in view.items()
+            }
+
+        sqlite_contextual, pg_contextual = cast(Any, sqlite), cast(Any, postgresql)
+        sqlite_ids, pg_ids = ids["sqlite"], ids["postgresql"]
+        for window in (-1, 0, 1, 20):
+            assert projection(pg_contextual.get_messages_around("contextual", pg_ids[1], window=window)) == projection(
+                sqlite_contextual.get_messages_around("contextual", sqlite_ids[1], window=window)
+            )
+        assert pg_contextual.get_messages_around("other", pg_ids[1], window=5) == {
+            "window": [], "messages_before": 0, "messages_after": 0,
+        }
+
+        sqlite_view = sqlite_contextual.get_anchored_view("contextual", sqlite_ids[1], window=1, bookend=3)
+        pg_view = pg_contextual.get_anchored_view("contextual", pg_ids[1], window=1, bookend=3)
+        assert projection(pg_view) == projection(sqlite_view)
+        # The filtered detail retains the tool anchor, while the physical scroll page repeats it.
+        assert [row["role"] for row in pg_view["window"]] == ["user", "tool", "assistant"]
+        page = pg_contextual.get_messages_around("contextual", pg_ids[1], window=1)
+        next_page = pg_contextual.get_messages_around("contextual", page["window"][-1]["id"], window=1)
+        assert page["window"][-1]["id"] in [row["id"] for row in next_page["window"]]
+    finally:
+        sqlite.close()
+        postgresql.close()
+        _reset_schema(dsn)
