@@ -43,6 +43,7 @@ _MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION = 12
 _GIT_METADATA_GENERATION_SCHEMA_VERSION = 13
 _SEARCH_DOCUMENT_SCHEMA_VERSION = 14
 _SEARCH_INDEX_SCHEMA_VERSION = 15
+_BOUNDED_BROWSE_SCHEMA_VERSION = 16
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
 _USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
@@ -156,7 +157,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SEARCH_INDEX_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _BOUNDED_BROWSE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -175,6 +176,7 @@ class PostgreSQLStateStore:
                     (_GIT_METADATA_GENERATION_SCHEMA_VERSION, self._apply_v13, self._validate_v13),
                     (_SEARCH_DOCUMENT_SCHEMA_VERSION, self._apply_v14, self._validate_v14),
                     (_SEARCH_INDEX_SCHEMA_VERSION, self._apply_v15, self._validate_v15),
+                    (_BOUNDED_BROWSE_SCHEMA_VERSION, self._apply_v16, self._validate_v16),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -475,6 +477,27 @@ class PostgreSQLStateStore:
         self._validate_v14(cursor)
         self._require_index(cursor, "messages_search_document_gin")
 
+    def _apply_v16(self, cursor: Any) -> None:
+        """Add the durable activity projection needed by bounded contextual browse.
+
+        Existing stores are backfilled from persisted message timestamps rather
+        than wall clock so an upgrade cannot reorder historical sessions.
+        """
+        cursor.execute(f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS last_activity_at double precision")
+        cursor.execute(
+            f"UPDATE {self._schema}.sessions AS s SET last_activity_at = COALESCE("
+            f"(SELECT MAX(m.created_at) FROM {self._schema}.messages AS m WHERE m.session_id = s.id), s.started_at) "
+            "WHERE s.last_activity_at IS NULL"
+        )
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS sessions_effective_activity ON {self._schema}.sessions "
+            "(archived, hidden, last_activity_at DESC, started_at DESC, id DESC)"
+        )
+
+    def _validate_v16(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {"last_activity_at"})
+        self._require_index(cursor, "sessions_effective_activity")
+
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
         with self._lock:
@@ -599,10 +622,16 @@ class PostgreSQLStateStore:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id",
+                f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id, created_at",
                 self._record_params(session_id, record),
             )
-            return int(cursor.fetchone()[0])
+            message_id, created_at = cursor.fetchone()
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET last_activity_at = GREATEST("
+                "COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
+                (created_at, session_id),
+            )
+            return int(message_id)
 
     def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int:
         if not records:
@@ -611,8 +640,14 @@ class PostgreSQLStateStore:
             for record in records:
                 cursor.execute(
                     f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                    f"VALUES ({', '.join('%s' for _ in range(21))})",
+                    f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING created_at",
                     self._record_params(session_id, record),
+                )
+                created_at = cursor.fetchone()[0]
+                cursor.execute(
+                    f"UPDATE {self._schema}.sessions SET last_activity_at = GREATEST("
+                    "COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
+                    (created_at, session_id),
                 )
         return len(records)
 
@@ -1164,6 +1199,125 @@ class PostgreSQLStateStore:
                     (session_id, session_id),
                 )
             return changed
+
+    def list_recent_sessions_bounded(
+        self, *, limit: int = 20, exclude_sources: list[str] | None = None,
+        timeout_seconds: float = 3.0, candidate_limit: int | None = None,
+        lineage_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the bounded, compression-aware contextual browse projection.
+
+        This is intentionally a direct StateStore operation, not an opt-in to
+        ``ContextualSessionSearchStore``: PostgreSQL still lacks the other
+        contextual shapes.  The CTE follows only compression-continuation
+        edges, rejects incomplete/cyclic/cap-exhausted lineages, and projects a
+        visible root to its freshest terminal tip in one tenant-scoped snapshot.
+        """
+        limit = max(1, int(limit))
+        timeout_seconds = max(0.0, float(timeout_seconds))
+        if candidate_limit is None:
+            candidate_limit = max(128, limit * 8)
+        candidate_limit = max(limit, min(int(candidate_limit), 2048))
+        if lineage_limit is None:
+            lineage_limit = min(8192, candidate_limit * 8)
+        lineage_limit = max(candidate_limit, min(int(lineage_limit), 8192))
+        excluded = list(exclude_sources or [])
+        candidate_filter = "NOT s.archived AND NOT s.hidden AND NOT (COALESCE(s.model_config, '{}'::jsonb) ? '_delegate_from')"
+        params: list[Any] = []
+        if excluded:
+            candidate_filter += " AND NOT (s.source = ANY(%s))"
+            params.append(excluded)
+        edge = (
+            "parent.end_reason = 'compression' AND child.parent_session_id = parent.id "
+            "AND NOT (COALESCE(child.model_config, '{}'::jsonb) ? '_branched_from') "
+            "AND NOT (COALESCE(child.model_config, '{}'::jsonb) ? '_delegate_from') "
+            "AND COALESCE(child.source, '') <> 'tool'"
+        )
+        query = f"""
+            WITH RECURSIVE
+            recent_candidates(id) AS (
+                SELECT s.id FROM {self._schema}.sessions AS s
+                WHERE {candidate_filter}
+                ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC, s.started_at DESC, s.id DESC
+                LIMIT %s
+            ),
+            ancestors(candidate_id, cur_id, depth, path) AS (
+                SELECT id, id, 1, ARRAY[id]::text[] FROM recent_candidates
+                UNION ALL
+                SELECT a.candidate_id, parent.id, a.depth + 1, a.path || parent.id
+                FROM ancestors AS a
+                JOIN {self._schema}.sessions AS child ON child.id = a.cur_id
+                JOIN {self._schema}.sessions AS parent ON {edge}
+                WHERE a.depth < %s AND NOT parent.id = ANY(a.path)
+            ),
+            candidate_roots(root_id) AS (
+                SELECT DISTINCT a.cur_id
+                FROM ancestors AS a
+                JOIN {self._schema}.sessions AS child ON child.id = a.cur_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {self._schema}.sessions AS parent WHERE {edge}
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ancestors AS clipped
+                    WHERE clipped.candidate_id = a.candidate_id AND clipped.depth >= %s
+                )
+            ),
+            chain(root_id, cur_id, depth, path) AS (
+                SELECT root_id, root_id, 1, ARRAY[root_id]::text[] FROM candidate_roots
+                UNION ALL
+                SELECT c.root_id, child.id, c.depth + 1, c.path || child.id
+                FROM chain AS c
+                JOIN {self._schema}.sessions AS parent ON parent.id = c.cur_id
+                JOIN {self._schema}.sessions AS child ON {edge}
+                WHERE c.depth < %s AND NOT child.id = ANY(c.path)
+            ),
+            valid_roots(root_id) AS (
+                SELECT root_id FROM chain GROUP BY root_id
+                HAVING MAX(depth) < %s AND COUNT(DISTINCT cur_id) < %s
+            ),
+            ranked_tips AS (
+                SELECT c.root_id, c.cur_id,
+                       COALESCE((SELECT MAX(m.created_at) FROM {self._schema}.messages AS m WHERE m.session_id = tip.id), tip.last_activity_at, tip.started_at) AS activity,
+                       ROW_NUMBER() OVER (PARTITION BY c.root_id ORDER BY COALESCE((SELECT MAX(m.created_at) FROM {self._schema}.messages AS m WHERE m.session_id = tip.id), tip.last_activity_at, tip.started_at) DESC, tip.id DESC) AS rank_in_root
+                FROM chain AS c
+                JOIN valid_roots AS valid ON valid.root_id = c.root_id
+                JOIN {self._schema}.sessions AS tip ON tip.id = c.cur_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {self._schema}.sessions AS parent
+                    JOIN {self._schema}.sessions AS child ON {edge}
+                    WHERE parent.id = c.cur_id
+                )
+            )
+            SELECT tip.id, tip.source, tip.model, COALESCE(tip.title, root.title) AS title,
+                   root.started_at, tip.ended_at, tip.end_reason, rt.activity AS last_active,
+                   COALESCE((
+                       SELECT m.content FROM {self._schema}.messages AS m
+                       WHERE m.session_id = tip.id AND m.role = 'user' AND m.content IS NOT NULL
+                         AND (m.active OR m.compacted) AND COALESCE(m.display_kind, '') <> 'hidden'
+                       ORDER BY m.created_at, m.id LIMIT 1
+                   ), '') AS preview,
+                   CASE WHEN root.id <> tip.id THEN root.id ELSE NULL END AS _lineage_root_id
+            FROM ranked_tips AS rt
+            JOIN {self._schema}.sessions AS root ON root.id = rt.root_id
+            JOIN {self._schema}.sessions AS tip ON tip.id = rt.cur_id
+            WHERE rt.rank_in_root = 1 AND NOT root.archived AND NOT root.hidden
+              AND NOT (COALESCE(root.model_config, '{{}}'::jsonb) ? '_delegate_from')
+            ORDER BY rt.activity DESC, root.started_at DESC, tip.id DESC
+            LIMIT %s
+        """
+        params.extend([candidate_limit, lineage_limit, lineage_limit, lineage_limit, lineage_limit, lineage_limit, limit])
+        try:
+            with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+                cursor.execute("SELECT set_config('statement_timeout', %s, true)", (f"{max(1, int(timeout_seconds * 1000))}ms",))
+                cursor.execute(query, params)
+                rows = list(cursor.fetchall())
+        except Exception as exc:
+            if getattr(exc, "sqlstate", None) == "57014":
+                raise TimeoutError(f"recent-session browse exceeded {timeout_seconds:g}s deadline") from exc
+            raise
+        for row in rows:
+            row["preview"] = self._decode_content(row["preview"])
+        return rows
 
     def list_session_summaries(
         self, *, source: str | None = None, exclude_sources: tuple[str, ...] = (),
