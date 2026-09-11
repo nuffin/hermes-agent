@@ -26,6 +26,7 @@ _PARENT_SESSION_FOREIGN_KEY_SCHEMA_VERSION = 3
 # contract after releases that wrote the parent key outside the migration ledger.
 _COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION = 4
 _SCHEMA_VERSION = 5
+_VISIBILITY_SCHEMA_VERSION = 6
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
@@ -116,7 +117,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _VISIBILITY_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -125,6 +126,7 @@ class PostgreSQLStateStore:
                     (_PARENT_SESSION_FOREIGN_KEY_SCHEMA_VERSION, self._apply_v3, self._validate_v3),
                     (_COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION, self._apply_v4, self._validate_v4),
                     (_SCHEMA_VERSION, self._apply_v5, self._validate_v5),
+                    (_VISIBILITY_SCHEMA_VERSION, self._apply_v6, self._validate_v6),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -234,6 +236,17 @@ class PostgreSQLStateStore:
         self._required_columns(cursor, "sessions", {"title", "title_source", "hidden"})
         self._require_index(cursor, "sessions_title_unique")
 
+    def _apply_v6(self, cursor: Any) -> None:
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false")
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_visibility_started_at ON {_SCHEMA}.sessions (archived, hidden, started_at DESC)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_pinned_started_at ON {_SCHEMA}.sessions (pinned, started_at DESC) WHERE pinned")
+
+    def _validate_v6(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {"archived", "pinned"})
+        self._require_index(cursor, "sessions_visibility_started_at")
+        self._require_index(cursor, "sessions_pinned_started_at")
+
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
         with self._lock:
@@ -326,15 +339,105 @@ class PostgreSQLStateStore:
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
-                f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, {', '.join(_SESSION_METADATA_COLUMNS)} "
+                f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, archived, pinned, {', '.join(_SESSION_METADATA_COLUMNS)} "
                 f"FROM {_SCHEMA}.sessions WHERE id = %s", (session_id,),
             )
             return cursor.fetchone()
 
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
+        return self._set_lineage_column("hidden", session_id, hidden)
+
+    def _set_lineage_column(self, column: str, session_id: str, value: bool) -> bool:
+        """Apply a visibility flag to the whole compression lineage in one transaction."""
         with self._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(f"UPDATE {_SCHEMA}.sessions SET hidden = %s WHERE id = %s", (hidden, session_id))
+            cursor.execute(
+                f"""WITH RECURSIVE
+                    ancestors(id) AS (
+                        SELECT %s
+                        UNION
+                        SELECT parent.id FROM ancestors a
+                        JOIN {_SCHEMA}.sessions child ON child.id = a.id
+                        JOIN {_SCHEMA}.sessions parent ON parent.id = child.parent_session_id
+                        WHERE parent.end_reason = 'compression'
+                    ),
+                    descendants(id) AS (
+                        SELECT %s
+                        UNION
+                        SELECT child.id FROM descendants d
+                        JOIN {_SCHEMA}.sessions parent ON parent.id = d.id
+                        JOIN {_SCHEMA}.sessions child ON child.parent_session_id = parent.id
+                        WHERE parent.end_reason = 'compression'
+                    ), lineage(id) AS (
+                        SELECT id FROM ancestors UNION SELECT id FROM descendants
+                    )
+                    UPDATE {_SCHEMA}.sessions SET {column} = %s WHERE id IN (SELECT id FROM lineage)""",
+                (session_id, session_id, value),
+            )
             return cursor.rowcount > 0
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        return self._set_lineage_column("archived", session_id, archived)
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT title, hidden FROM {_SCHEMA}.sessions WHERE id = %s FOR UPDATE", (session_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            cursor.execute(
+                f"""WITH RECURSIVE
+                    ancestors(id) AS (SELECT %s UNION SELECT parent.id FROM ancestors a JOIN {_SCHEMA}.sessions child ON child.id = a.id JOIN {_SCHEMA}.sessions parent ON parent.id = child.parent_session_id WHERE parent.end_reason = 'compression'),
+                    descendants(id) AS (SELECT %s UNION SELECT child.id FROM descendants d JOIN {_SCHEMA}.sessions parent ON parent.id = d.id JOIN {_SCHEMA}.sessions child ON child.parent_session_id = parent.id WHERE parent.end_reason = 'compression'),
+                    lineage(id) AS (SELECT id FROM ancestors UNION SELECT id FROM descendants)
+                    UPDATE {_SCHEMA}.sessions SET pinned = %s WHERE id IN (SELECT id FROM lineage)""",
+                (session_id, session_id, pinned),
+            )
+            changed = cursor.rowcount > 0
+            if pinned and not (row["hidden"] and row["title"] == _CANONICAL_BOT_CHAT_TITLE):
+                cursor.execute(
+                    f"""WITH RECURSIVE
+                        ancestors(id) AS (SELECT %s UNION SELECT parent.id FROM ancestors a JOIN {_SCHEMA}.sessions child ON child.id = a.id JOIN {_SCHEMA}.sessions parent ON parent.id = child.parent_session_id WHERE parent.end_reason = 'compression'),
+                        descendants(id) AS (SELECT %s UNION SELECT child.id FROM descendants d JOIN {_SCHEMA}.sessions parent ON parent.id = d.id JOIN {_SCHEMA}.sessions child ON child.parent_session_id = parent.id WHERE parent.end_reason = 'compression'),
+                        lineage(id) AS (SELECT id FROM ancestors UNION SELECT id FROM descendants)
+                        UPDATE {_SCHEMA}.sessions SET hidden = false WHERE id IN (SELECT id FROM lineage)""",
+                    (session_id, session_id),
+                )
+            return changed
+
+    def list_session_summaries(
+        self, *, source: str | None = None, exclude_sources: tuple[str, ...] = (),
+        limit: int = 20, offset: int = 0, include_archived: bool = False,
+        archived_only: bool = False, include_hidden: bool = False,
+        include_pinned: bool = False,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if source is not None:
+            clauses.append("s.source = %s"); params.append(source)
+        if exclude_sources:
+            clauses.append("NOT (s.source = ANY(%s))"); params.append(list(exclude_sources))
+        if archived_only:
+            clauses.append("s.archived")
+        elif not include_archived:
+            clauses.append("NOT s.archived")
+        if not include_hidden:
+            clauses.append("NOT s.hidden")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        projection = (
+            "s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.parent_session_id, s.title, "
+            "s.title_source, s.hidden, s.archived, s.pinned, "
+            "COALESCE(MAX(m.created_at), s.started_at) AS last_active, COUNT(m.id)::integer AS message_count"
+        )
+        grouped = f" FROM {_SCHEMA}.sessions s LEFT JOIN {_SCHEMA}.messages m ON m.session_id = s.id{where} GROUP BY s.id"
+        order = " ORDER BY last_active DESC, s.started_at DESC, s.id DESC"
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT {projection}{grouped}{order} LIMIT %s OFFSET %s", [*params, limit, offset])
+            rows = list(cursor.fetchall())
+            if include_pinned:
+                seen = {row["id"] for row in rows}
+                pinned_where = where + (" AND s.pinned" if where else " WHERE s.pinned")
+                cursor.execute(f"SELECT {projection} FROM {_SCHEMA}.sessions s LEFT JOIN {_SCHEMA}.messages m ON m.session_id = s.id{pinned_where} GROUP BY s.id{order}", params)
+                rows.extend(row for row in cursor.fetchall() if row["id"] not in seen)
+            return rows
 
     def _set_session_title(self, session_id: str, title: str, *, source: str) -> bool:
         cleaned_title = _sanitize_title(title)
@@ -391,7 +494,7 @@ class PostgreSQLStateStore:
 
     def get_session_by_title(self, title: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, {', '.join(_SESSION_METADATA_COLUMNS)} FROM {_SCHEMA}.sessions WHERE title = %s", (title,))
+            cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, archived, pinned, {', '.join(_SESSION_METADATA_COLUMNS)} FROM {_SCHEMA}.sessions WHERE title = %s", (title,))
             return cursor.fetchone()
 
     def resolve_session_by_title(self, title: str) -> str | None:
