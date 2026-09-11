@@ -16,3 +16,17 @@ def test_sqlite_factory_preserves_session_message_and_end_contract(tmp_path):
         assert store.get_session("slice")["end_reason"] == "done"
     finally:
         store.close()
+
+
+def test_sqlite_factory_preserves_session_creation_metadata(tmp_path):
+    store = open_state_store({}, db_path=tmp_path / "state.db")
+    try:
+        store.ensure_session(
+            "metadata", source="test", metadata={"user_id": "user", "chat_id": "chat", "model": "model", "cwd": "/work"},
+        )
+        session = store.get_session("metadata")
+        assert {key: session[key] for key in ("user_id", "chat_id", "model", "cwd")} == {
+            "user_id": "user", "chat_id": "chat", "model": "model", "cwd": "/work",
+        }
+    finally:
+        store.close()
