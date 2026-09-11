@@ -12,13 +12,22 @@ import importlib
 import queue
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from state_store import PostgreSQLStateStoreConfig, StateStoreConfigurationError
 
 _SCHEMA = "hermes_state_store_slice"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_SESSION_METADATA_COLUMNS = (
+    "user_id", "session_key", "chat_id", "chat_type", "thread_id", "display_name", "origin_json",
+    "model", "model_config", "parent_session_id", "cwd", "profile_name", "git_repo_root",
+)
+_SESSION_METADATA_TYPES = {
+    "user_id": "text", "session_key": "text", "chat_id": "text", "chat_type": "text", "thread_id": "text",
+    "display_name": "text", "origin_json": "text", "model": "text", "model_config": "jsonb",
+    "parent_session_id": "text", "cwd": "text", "profile_name": "text", "git_repo_root": "text",
+}
 
 
 class PostgreSQLStateStore:
@@ -54,6 +63,7 @@ class PostgreSQLStateStore:
 
     def _probe_and_migrate(self, connection: Any) -> None:
         with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("hermes_state_store_slice_migration",))
             cursor.execute("SHOW server_version_num")
             version = int(cursor.fetchone()[0])
             if version < 180000:
@@ -67,7 +77,7 @@ class PostgreSQLStateStore:
                 )
             cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}")
             cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
-            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SCHEMA_VERSION,))
+            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (1,))
             if cursor.fetchone() is None:
                 cursor.execute(
                     f"CREATE TABLE {_SCHEMA}.sessions ("
@@ -82,7 +92,28 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE INDEX messages_session_id_id ON {_SCHEMA}.messages (session_id, id)")
                 cursor.execute(
                     f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
+                    (1, time.time()),
+                )
+            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SCHEMA_VERSION,))
+            if cursor.fetchone() is None:
+                for column in _SESSION_METADATA_COLUMNS:
+                    cursor.execute(
+                        f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS {column} {_SESSION_METADATA_TYPES[column]}"
+                    )
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_source_session_key ON {_SCHEMA}.sessions (source, session_key)")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_parent_session_id ON {_SCHEMA}.sessions (parent_session_id)")
+                cursor.execute(
+                    f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
                     (_SCHEMA_VERSION, time.time()),
+                )
+            cursor.execute(
+                "SELECT 1 FROM pg_constraint WHERE conname = %s AND connamespace = %s::regnamespace",
+                ("sessions_parent_session_id_fkey", _SCHEMA),
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey "
+                    f"FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID"
                 )
         connection.commit()
 
@@ -115,12 +146,39 @@ class PostgreSQLStateStore:
                 else:
                     self._idle.put(connection)
 
-    def ensure_session(self, session_id: str, source: str = "unknown") -> str:
+    def ensure_session(
+        self, session_id: str, source: str = "unknown", *, metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        metadata = dict(metadata or {})
+        unknown = set(metadata) - set(_SESSION_METADATA_COLUMNS)
+        if unknown:
+            raise ValueError(f"Unsupported session metadata fields: {', '.join(sorted(unknown))}")
+        metadata_columns = tuple(column for column in _SESSION_METADATA_COLUMNS if column in metadata)
+        columns = ("id", "source", "started_at", *metadata_columns)
+        placeholders = ", ".join("%s" for _ in columns)
+        values = [session_id, source, time.time()]
+        for column in metadata_columns:
+            value = metadata[column]
+            if column == "model_config":
+                value = self._psycopg.types.json.Jsonb(value) if value else None
+            values.append(value)
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
-                f"INSERT INTO {_SCHEMA}.sessions (id, source, started_at) VALUES (%s, %s, %s) "
-                "ON CONFLICT (id) DO NOTHING",
-                (session_id, source, time.time()),
+                f"INSERT INTO {_SCHEMA}.sessions ({', '.join(columns)}) VALUES ({placeholders}) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "model = COALESCE(sessions.model, EXCLUDED.model), "
+                "model_config = COALESCE(sessions.model_config, EXCLUDED.model_config), "
+                "session_key = COALESCE(sessions.session_key, EXCLUDED.session_key), "
+                "chat_id = COALESCE(sessions.chat_id, EXCLUDED.chat_id), "
+                "chat_type = COALESCE(sessions.chat_type, EXCLUDED.chat_type), "
+                "thread_id = COALESCE(sessions.thread_id, EXCLUDED.thread_id), "
+                "parent_session_id = COALESCE(sessions.parent_session_id, EXCLUDED.parent_session_id), "
+                "cwd = COALESCE(sessions.cwd, EXCLUDED.cwd), "
+                "profile_name = COALESCE(sessions.profile_name, EXCLUDED.profile_name), "
+                "git_repo_root = COALESCE(sessions.git_repo_root, EXCLUDED.git_repo_root), "
+                "origin_json = COALESCE(sessions.origin_json, EXCLUDED.origin_json), "
+                "display_name = COALESCE(sessions.display_name, EXCLUDED.display_name)",
+                values,
             )
         return session_id
 
@@ -150,7 +208,10 @@ class PostgreSQLStateStore:
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason FROM {_SCHEMA}.sessions WHERE id = %s", (session_id,))
+            cursor.execute(
+                f"SELECT id, source, started_at, ended_at, end_reason, {', '.join(_SESSION_METADATA_COLUMNS)} "
+                f"FROM {_SCHEMA}.sessions WHERE id = %s", (session_id,),
+            )
             return cursor.fetchone()
 
     def close(self) -> None:
