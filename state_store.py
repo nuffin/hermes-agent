@@ -109,6 +109,10 @@ class StateStore(Protocol):
 
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
 
+    def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None: ...
+
+    def get_system_prompt(self, session_id: str) -> str | None: ...
+
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool: ...
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool: ...
@@ -278,6 +282,13 @@ class SqliteStateStore:
             for key in ("hidden", "archived", "pinned"):
                 row[key] = bool(row.get(key))
         return row
+
+    def set_system_prompt(self, session_id: str, system_prompt: str | None) -> None:
+        self._session_db.update_system_prompt(session_id, system_prompt)
+
+    def get_system_prompt(self, session_id: str) -> str | None:
+        row = self._session_db.get_session(session_id)
+        return None if row is None else row.get("system_prompt")
 
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
         return self._session_db.set_session_hidden(session_id, hidden)
