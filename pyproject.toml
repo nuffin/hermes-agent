@@ -400,6 +400,9 @@ all = [
   "hermes-agent[web]",
   "hermes-agent[youtube]",
 ]
+state-store = [
+    "psycopg[binary]==3.3.3",
+]
 
 [build-system]
 # setuptools.build_meta + our setup.py bdist_wheel guard import wheel during
