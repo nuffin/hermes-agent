@@ -21,6 +21,7 @@ from typing import Any, Collection
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
+from state_store_postgresql_search import compile_postgresql_search_expression
 from token_usage_transport import TokenUsageTransport
 
 _LEGACY_ROOT_SCHEMA = "hermes_state_store_slice"
@@ -56,7 +57,6 @@ _MESSAGE_RECORD_WRITE_COLUMNS = tuple(
     column for column in _MESSAGE_RECORD_COLUMNS if column not in {"active", "compacted", "display_identity"}
 )
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 _SEARCH_RESULT_FIELDS = ("id", "session_id", "role", "snippet", "timestamp", "tool_name", "source", "session_started")
 _TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
@@ -681,21 +681,20 @@ class PostgreSQLStateStore:
             predicates.append("NOT (s.source = ANY(%s))"); params.append(exclude_sources)
         if role_filter:
             predicates.append("m.role = ANY(%s)"); params.append(role_filter)
-        cjk = bool(_CJK_RE.search(query))
-        if cjk:
-            terms = [term for term in query.split() if term]
-            if not terms:
-                return []
+        expression = compile_postgresql_search_expression(query)
+        if expression.is_cjk_literal:
             searchable = "(coalesce(m.content, '') || ' ' || coalesce(m.tool_name, '') || ' ' || coalesce(m.tool_calls::text, ''))"
-            predicates.extend(f"position(%s in {searchable}) > 0" for _ in terms)
-            params.extend(terms)
+            predicates.extend(f"position(%s in {searchable}) > 0" for _ in expression.params)
+            params.extend(expression.params)
             rank, snippet, order = "0.0", "left(coalesce(m.content, m.tool_name, ''), 240)", "m.created_at DESC, m.id DESC"
         else:
-            predicates.append("m.search_document @@ plainto_tsquery('simple', %s)")
-            rank = "ts_rank_cd(m.search_document, plainto_tsquery('simple', %s))"
-            snippet = "ts_headline('simple', coalesce(m.content, m.tool_name, ''), plainto_tsquery('simple', %s), 'StartSel=>>>, StopSel=<<<, MaxWords=40, MinWords=1')"
-            # Placeholders occur in SELECT before filters/WHERE, so preserve SQL order.
-            params = [query, query, *params, query]
+            query_sql, query_params = expression.sql, list(expression.params)
+            predicates.append(f"m.search_document @@ {query_sql}")
+            rank = f"ts_rank_cd(m.search_document, {query_sql})"
+            snippet = f"ts_headline('simple', coalesce(m.content, m.tool_name, ''), {query_sql}, 'StartSel=>>>, StopSel=<<<, MaxWords=40, MinWords=1')"
+            # SELECT placeholders precede filters/WHERE. The expression is static SQL plus
+            # separately-bound literals, including the parser-generated prefix marker.
+            params = [*query_params, *query_params, *params, *query_params]
             order = "m.created_at DESC, m.id DESC" if sort == "newest" else "m.created_at ASC, m.id ASC" if sort == "oldest" else "rank DESC, m.id DESC"
         params.extend([limit, offset])
         sql = (
