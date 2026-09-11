@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, Collection
 
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
@@ -40,6 +40,8 @@ _MODEL_USAGE_SCHEMA_VERSION = 10
 _CONVERSATION_GENERATION_SCHEMA_VERSION = 11
 _MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION = 12
 _GIT_METADATA_GENERATION_SCHEMA_VERSION = 13
+_SEARCH_DOCUMENT_SCHEMA_VERSION = 14
+_SEARCH_INDEX_SCHEMA_VERSION = 15
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
 _USAGE_ROUTE_FIELDS = ("model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url", "billing_mode")
@@ -54,6 +56,8 @@ _MESSAGE_RECORD_WRITE_COLUMNS = tuple(
     column for column in _MESSAGE_RECORD_COLUMNS if column not in {"active", "compacted", "display_identity"}
 )
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+_SEARCH_RESULT_FIELDS = ("id", "session_id", "role", "snippet", "timestamp", "tool_name", "source", "session_started")
 _TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
 _NUMBERED_TITLE_RE = re.compile(r"^(.*?) #(\d+)$")
@@ -147,18 +151,12 @@ class PostgreSQLStateStore:
                 version = int(cursor.fetchone()[0])
                 if version < 180000:
                     raise StateStoreConfigurationError("PostgreSQL State Store requires PostgreSQL 18 or newer")
-                cursor.execute("SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pg_trgm')")
-                extensions = {row[0] for row in cursor.fetchall()}
-                missing = {"vector", "pg_trgm"} - extensions
-                if missing:
-                    raise StateStoreConfigurationError(
-                        f"PostgreSQL State Store requires capabilities: {', '.join(sorted(missing))}"
-                    )
+
                 cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _GIT_METADATA_GENERATION_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _SEARCH_INDEX_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -175,6 +173,8 @@ class PostgreSQLStateStore:
                     (_CONVERSATION_GENERATION_SCHEMA_VERSION, self._apply_v11, self._validate_v11),
                     (_MODEL_CONFIG_LIFECYCLE_SCHEMA_VERSION, self._apply_v12, self._validate_v12),
                     (_GIT_METADATA_GENERATION_SCHEMA_VERSION, self._apply_v13, self._validate_v13),
+                    (_SEARCH_DOCUMENT_SCHEMA_VERSION, self._apply_v14, self._validate_v14),
+                    (_SEARCH_INDEX_SCHEMA_VERSION, self._apply_v15, self._validate_v15),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -447,6 +447,34 @@ class PostgreSQLStateStore:
                 f"PostgreSQL State Store schema drift: {self._schema}.sessions Git metadata columns "
                 "must be git_branch text and git_metadata_generation bigint NOT NULL DEFAULT 0")
 
+    def _apply_v14(self, cursor: Any) -> None:
+        # ``simple`` is built into PostgreSQL.  Do not substitute vector similarity or
+        # require pg_trgm: neither is a lexical full-text contract.
+        cursor.execute(
+            f"ALTER TABLE {self._schema}.messages ADD COLUMN IF NOT EXISTS search_document tsvector "
+            "GENERATED ALWAYS AS (to_tsvector('simple', "
+            "coalesce(content, '') || ' ' || coalesce(tool_name, '') || ' ' || coalesce(tool_calls::text, ''))) STORED"
+        )
+
+    def _validate_v14(self, cursor: Any) -> None:
+        self._required_columns(cursor, "messages", {"search_document"})
+        cursor.execute(
+            "SELECT data_type, is_generated FROM information_schema.columns WHERE table_schema = %s "
+            "AND table_name = 'messages' AND column_name = 'search_document'",
+            (self._schema,),
+        )
+        row = cursor.fetchone()
+        if row is None or row[0] != "tsvector" or row[1] != "ALWAYS":
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {self._schema}.messages.search_document must be a generated tsvector")
+
+    def _apply_v15(self, cursor: Any) -> None:
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS messages_search_document_gin ON {self._schema}.messages USING GIN (search_document)")
+
+    def _validate_v15(self, cursor: Any) -> None:
+        self._validate_v14(cursor)
+        self._require_index(cursor, "messages_search_document_gin")
+
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
         with self._lock:
@@ -619,6 +647,71 @@ class PostgreSQLStateStore:
                 (session_id,),
             )
             return list(cursor.fetchall())
+
+    def search_messages(
+        self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
+        include_inactive: bool = False, fields: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Bounded lexical search, deliberately narrower than SQLite FTS5.
+
+        Latin terms use PostgreSQL's built-in ``simple`` tsvector/tsquery. CJK
+        uses a parameterized canonical-row substring fallback because PostgreSQL
+        ships no CJK tokenizer here. Neither route uses pgvector or pg_trgm.
+        """
+        if not isinstance(query, str) or not query.strip() or limit <= 0 or offset < 0:
+            return []
+        result_fields: tuple[str, ...] | None = None
+        if fields is not None:
+            if isinstance(fields, str):
+                raise TypeError("search fields must be a collection of field names, not a string")
+            unknown = set(fields).difference(_SEARCH_RESULT_FIELDS)
+            if unknown:
+                raise ValueError(f"unsupported PostgreSQL search result field(s): {', '.join(sorted(unknown))}")
+            result_fields = tuple(field for field in _SEARCH_RESULT_FIELDS if field in fields)
+        predicates = ["COALESCE(m.display_kind, '') <> 'hidden'"]
+        params: list[Any] = []
+        if not include_inactive:
+            predicates.append("(m.active OR m.compacted)")
+        if source_filter is not None:
+            if not source_filter:
+                return []
+            predicates.append("s.source = ANY(%s)"); params.append(source_filter)
+        if exclude_sources:
+            predicates.append("NOT (s.source = ANY(%s))"); params.append(exclude_sources)
+        if role_filter:
+            predicates.append("m.role = ANY(%s)"); params.append(role_filter)
+        cjk = bool(_CJK_RE.search(query))
+        if cjk:
+            terms = [term for term in query.split() if term]
+            if not terms:
+                return []
+            searchable = "(coalesce(m.content, '') || ' ' || coalesce(m.tool_name, '') || ' ' || coalesce(m.tool_calls::text, ''))"
+            predicates.extend(f"position(%s in {searchable}) > 0" for _ in terms)
+            params.extend(terms)
+            rank, snippet, order = "0.0", "left(coalesce(m.content, m.tool_name, ''), 240)", "m.created_at DESC, m.id DESC"
+        else:
+            predicates.append("m.search_document @@ plainto_tsquery('simple', %s)")
+            rank = "ts_rank_cd(m.search_document, plainto_tsquery('simple', %s))"
+            snippet = "ts_headline('simple', coalesce(m.content, m.tool_name, ''), plainto_tsquery('simple', %s), 'StartSel=>>>, StopSel=<<<, MaxWords=40, MinWords=1')"
+            # Placeholders occur in SELECT before filters/WHERE, so preserve SQL order.
+            params = [query, query, *params, query]
+            order = "m.created_at DESC, m.id DESC" if sort == "newest" else "m.created_at ASC, m.id ASC" if sort == "oldest" else "rank DESC, m.id DESC"
+        params.extend([limit, offset])
+        sql = (
+            f"SELECT m.id, m.session_id, m.role, {snippet} AS snippet, m.created_at AS timestamp, m.tool_name, "
+            f"s.source, s.started_at AS session_started, {rank} AS rank "
+            f"FROM {self._schema}.messages m JOIN {self._schema}.sessions s ON s.id = m.session_id "
+            f"WHERE {' AND '.join(predicates)} ORDER BY {order} LIMIT %s OFFSET %s"
+        )
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(sql, params)
+            rows = list(cursor.fetchall())
+        for row in rows:
+            row.pop("rank", None)
+        if result_fields is not None:
+            rows = [{field: row[field] for field in result_fields} for row in rows]
+        return rows
 
     @staticmethod
     def _is_explicit_branch(session: Mapping[str, Any]) -> bool:
