@@ -313,7 +313,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert _migration_versions(dsn) == list(range(1, 16))
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -322,9 +322,9 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert {"hash", "prompt"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'messages'")
             message_columns = {row[0] for row in cursor.fetchall()}
-            assert {"tool_calls", "reasoning_details", "display_metadata", "active", "compacted"} <= message_columns
+            assert {"tool_calls", "reasoning_details", "display_metadata", "active", "compacted", "search_document"} <= message_columns
             cursor.execute(f"SELECT indexname FROM pg_indexes WHERE schemaname = '{_SCHEMA}'")
-            assert {"messages_session_id_id", "messages_resume_projection", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
+            assert {"messages_session_id_id", "messages_resume_projection", "messages_search_document_gin", "sessions_source_session_key", "sessions_parent_session_id", "sessions_title_unique", "sessions_visibility_started_at", "sessions_pinned_started_at"} <= {row[0] for row in cursor.fetchall()}
             cursor.execute(f"SELECT conname, convalidated FROM pg_constraint WHERE conrelid = '{_SCHEMA}.sessions'::regclass AND contype = 'f' ORDER BY conname")
             assert cursor.fetchall() == [
                 ("sessions_parent_session_id_fkey", False),
@@ -338,7 +338,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert _migration_versions(dsn) == list(range(1, 16))
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
             cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
@@ -361,7 +361,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert _migration_versions(dsn) == list(range(1, 16))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
@@ -369,7 +369,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert _migration_versions(dsn) == list(range(1, 16))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -381,7 +381,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
             cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert _migration_versions(dsn) == list(range(1, 16))
         with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
             cursor.execute(f"DROP INDEX {_SCHEMA}.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
@@ -641,7 +641,7 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
         postgresql = cast(Any, stores[1])
         with postgresql._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
-            assert [row[0] for row in cursor.fetchall()][-3:] == [11, 12, 13]
+            assert [row[0] for row in cursor.fetchall()][-3:] == [13, 14, 15]
     finally:
         for store in stores:
             store.close()
@@ -812,3 +812,63 @@ def test_postgresql_rejects_injection_looking_schema_before_connecting():
             "postgresql://invalid",
             schema='tenant"; DROP SCHEMA public; --',
         )
+
+
+def test_postgresql_search_contract_is_tenant_local_and_does_not_require_optional_extensions(monkeypatch, tmp_path):
+    """PG18 differential for the deliberately bounded lexical/CJK contract."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    monkeypatch.setenv(_DSN_ENV, dsn)
+    _reset_schema(dsn)
+    sqlite = open_state_store({}, db_path=tmp_path / "state.db")
+    postgresql = open_state_store(_config())
+    try:
+        for store in (sqlite, postgresql):
+            store.ensure_session("search-alpha", source="alpha")
+            store.ensure_session("search-beta", source="beta")
+            store.append_message("search-alpha", role="user", content="lexical needle first")
+            store.append_message("search-alpha", role="assistant", content="lexical needle second")
+            store.append_message("search-beta", role="assistant", content="needle private beta")
+            store.append_message("search-beta", role="user", content="中文记忆断裂 substring")
+
+        for query, kwargs in (("needle", {}), ("needle", {"source_filter": ["alpha"]}),
+                              ("needle", {"role_filter": ["assistant"]}), ("中文记忆", {})):
+            sqlite_rows = sqlite.search_messages(query, fields=("session_id", "role", "source", "snippet"), **kwargs)
+            postgresql_rows = postgresql.search_messages(query, fields=("session_id", "role", "source", "snippet"), **kwargs)
+            assert sorted((row["session_id"], row["role"], row["source"]) for row in postgresql_rows) == sorted(
+                (row["session_id"], row["role"], row["source"]) for row in sqlite_rows
+            )
+            assert all(row["snippet"] for row in postgresql_rows)
+
+        newest = postgresql.search_messages("needle", sort="newest", limit=1, fields=("session_id",))
+        assert newest == [{"session_id": "search-beta"}]
+        assert len(postgresql.search_messages("needle", sort="oldest", limit=1, offset=1)) == 1
+
+        # Generated tsvector maintenance survives canonical update/delete and an index rebuild.
+        with postgresql._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {postgresql._schema}.messages SET content = 'replacement token' WHERE session_id = %s AND role = 'user'", ("search-alpha",))
+            cursor.execute(f"DELETE FROM {postgresql._schema}.messages WHERE session_id = %s AND content LIKE %s", ("search-beta", "needle private%"))
+            cursor.execute(f"REINDEX INDEX {postgresql._schema}.messages_search_document_gin")
+        assert [row["session_id"] for row in postgresql.search_messages("replacement", fields=("session_id",))] == ["search-alpha"]
+        assert all(row["session_id"] != "search-beta" for row in postgresql.search_messages("needle", fields=("session_id",)))
+
+        # Open a new store after removing optional extensions: search remains available because
+        # its only index/tokenizer dependency is built into PostgreSQL itself.
+        postgresql.close()
+        postgresql = None
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("DROP EXTENSION IF EXISTS pg_trgm")
+            cursor.execute("DROP EXTENSION IF EXISTS vector")
+        degraded = open_state_store(_config())
+        try:
+            assert degraded.search_messages("replacement", fields=("session_id",)) == [{"session_id": "search-alpha"}]
+            assert degraded.search_messages("中文记忆", fields=("session_id",)) == [{"session_id": "search-beta"}]
+        finally:
+            degraded.close()
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    finally:
+        sqlite.close()
+        if postgresql is not None:
+            postgresql.close()
+        _reset_schema(dsn)

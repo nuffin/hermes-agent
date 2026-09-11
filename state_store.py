@@ -12,7 +12,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, cast
+from typing import Any, Callable, Collection, Mapping, Protocol, cast
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SUPPORTED_BACKENDS = frozenset({"sqlite", "postgresql"})
@@ -91,6 +91,12 @@ class StateStore(Protocol):
     def get_message_records(self, session_id: str) -> list[dict[str, Any]]: ...
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]: ...
+
+    def search_messages(
+        self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
+        include_inactive: bool = False, fields: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     def get_compression_tip(self, session_id: str) -> str | None: ...
 
@@ -284,6 +290,16 @@ class SqliteStateStore:
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]:
         return self._session_db.get_messages(session_id)
+
+    def search_messages(
+        self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
+        include_inactive: bool = False, fields: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._session_db.search_messages(
+            query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
+            limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
+        )
 
     def get_compression_tip(self, session_id: str) -> str:
         return self._session_db.get_compression_tip(session_id)
