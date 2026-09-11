@@ -43,6 +43,12 @@ Migration is offline and single-authority: quiesce the selected SQLite profile/r
 
 Pre-write rollback switches back only after preserving the PostgreSQL candidate. After PostgreSQL has accepted writes, rollback requires a verified reverse export or restore of a PostgreSQL backup to a separately selected SQLite candidate; changing config alone is prohibited because it would lose post-cutover writes. Existing live databases are out of scope for this branch run.
 
+## DeliveryLedger PostgreSQL adapter (task 3b9561)
+
+A dedicated `PostgreSQLDeliveryLedger` exists for direct adapter conformance tests. It has a separate tenant schema (`hermes_delivery_ledger…`), its own `delivery_schema_migrations` catalog and advisory migration lock, and uses receipt/fence transitions with server-time leases. `adapter_profile` is persisted delivery-target metadata only, never a tenant selector. The factory in `gateway.delivery_ledger_adapter` can open SQLite or PostgreSQL adapters for tests.
+
+This does **not** route live gateway consumers, add runtime configuration, import `state.db`, or authorize cutover. SQLite remains the gateway runtime. A production cutover still requires consumer routing, an audited offline import, operational rollback/export evidence, and full gateway delivery acceptance; a database state transition is not proof a platform sent a message.
+
 ## Implementation phases
 
 1. Configuration, factory, capability probing, and SQLite compatibility (current earliest slice).
