@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -42,10 +43,19 @@ class ResolvedStateStoreConfig:
 
 
 class StateStore(Protocol):
-    """Minimal lifecycle contract; operational methods migrate here in later slices."""
+    """First backend-neutral session/message slice; further SessionDB APIs stay out of scope."""
 
-    def close(self) -> None:
-        """Release backend-owned resources."""
+    def ensure_session(self, session_id: str, source: str = "unknown") -> str: ...
+
+    def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int: ...
+
+    def get_messages(self, session_id: str) -> list[dict[str, Any]]: ...
+
+    def end_session(self, session_id: str, end_reason: str) -> None: ...
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None: ...
+
+    def close(self) -> None: ...
 
 
 def _scoped_secret(name: str) -> str | None:
@@ -101,3 +111,50 @@ def resolve_state_store_config(
         raise StateStoreConfigurationError(
             f"PostgreSQL state store requires secret {settings.dsn_env}; configure it in the active profile secret scope")
     return ResolvedStateStoreConfig(backend="postgresql", postgresql=settings)
+
+
+class SqliteStateStore:
+    """Narrow adapter over the existing SessionDB compatibility facade."""
+
+    def __init__(self, db_path: Path | None = None) -> None:
+        from hermes_state import SessionDB
+
+        self._session_db = SessionDB() if db_path is None else SessionDB(db_path=db_path)
+
+    def ensure_session(self, session_id: str, source: str = "unknown") -> str:
+        return self._session_db.ensure_session(session_id, source=source)
+
+    def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
+        if content is None:
+            return self._session_db.append_message(session_id, role=role)
+        return self._session_db.append_message(session_id, role=role, content=content)
+
+    def get_messages(self, session_id: str) -> list[dict[str, Any]]:
+        return self._session_db.get_messages(session_id)
+
+    def end_session(self, session_id: str, end_reason: str) -> None:
+        self._session_db.end_session(session_id, end_reason)
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        return self._session_db.get_session(session_id)
+
+    def close(self) -> None:
+        self._session_db.close()
+
+
+def open_state_store(
+    config: Mapping[str, Any], *, db_path: Path | None = None,
+    secret_lookup: Callable[[str], str | None] | None = None,
+) -> StateStore:
+    """Open the selected narrow State Store; PostgreSQL never falls back to SQLite."""
+    resolved = resolve_state_store_config(config, secret_lookup=secret_lookup)
+    if resolved.backend == "sqlite":
+        return SqliteStateStore(db_path=db_path)
+    assert resolved.postgresql is not None
+    dsn = (secret_lookup or _scoped_secret)(resolved.postgresql.dsn_env)
+    if not str(dsn or "").strip():
+        raise StateStoreConfigurationError(
+            f"PostgreSQL state store requires secret {resolved.postgresql.dsn_env}; configure it in the active profile secret scope")
+    from state_store_postgresql import PostgreSQLStateStore
+
+    return PostgreSQLStateStore(resolved.postgresql, str(dsn))
