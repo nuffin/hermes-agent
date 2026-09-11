@@ -37,6 +37,8 @@ Critical writes use PostgreSQL transactions with explicit retry classification. 
 
 ## Migration and rollback
 
+The currently implemented session/message slice has a transactionally locked, catalog-validated migration ledger: v1 creates sessions/messages, v2 adds session metadata and indexes, v3 records the parent-session foreign key, v4 is a documented compatibility checkpoint validating the previously unledgered v1–v3 contract, and v5 adds title fields/indexes. Every recorded version is revalidated against PostgreSQL catalogs on open; missing or mismatched objects fail closed rather than being silently trusted. The v4 checkpoint intentionally has no DDL because it only makes the legacy parent-key transition durably auditable. This protects this bounded slice only; it is not a full state.db upgrade or SQLite-to-PostgreSQL import contract.
+
 Migration is offline and single-authority: quiesce the selected SQLite profile/root writer, capture a consistent SQLite backup including WAL, import canonical rows in FK order, restore sequence high-water marks, rebuild derived indexes, verify counts/invariants/search, and only then select PostgreSQL. No dual write is permitted.
 
 Pre-write rollback switches back only after preserving the PostgreSQL candidate. After PostgreSQL has accepted writes, rollback requires a verified reverse export or restore of a PostgreSQL backup to a separately selected SQLite candidate; changing config alone is prohibited because it would lose post-cutover writes. Existing live databases are out of scope for this branch run.

@@ -20,8 +20,14 @@ from state_store import PostgreSQLStateStoreConfig, StateStoreConfigurationError
 
 _SCHEMA = "hermes_state_store_slice"
 _SESSION_METADATA_SCHEMA_VERSION = 2
+_PARENT_SESSION_FOREIGN_KEY_SCHEMA_VERSION = 3
+# Version 4 is a deliberately recorded compatibility checkpoint. It has no DDL
+# because it only establishes a durable, validated ledger boundary for the v1-v3
+# contract after releases that wrote the parent key outside the migration ledger.
+_COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION = 4
 _SCHEMA_VERSION = 5
 _TITLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TITLE_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]")
 _NUMBERED_TITLE_RE = re.compile(r"^(.*?) #(\d+)$")
 _TITLE_SOURCE_RANK = {"derived": 0, "llm": 1, "user": 2}
@@ -41,7 +47,7 @@ _SESSION_METADATA_TYPES = {
 def _sanitize_title(title: str | None) -> str | None:
     if not title:
         return None
-    cleaned = _TITLE_INVISIBLE_RE.sub("", _TITLE_CONTROL_RE.sub("", str(title)))
+    cleaned = _TITLE_INVISIBLE_RE.sub("", _TITLE_CONTROL_RE.sub("", _TITLE_SURROGATE_RE.sub("\ufffd", str(title))))
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return None
@@ -86,73 +92,147 @@ class PostgreSQLStateStore:
         )
 
     def _probe_and_migrate(self, connection: Any) -> None:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("hermes_state_store_slice_migration",))
-            cursor.execute("SHOW server_version_num")
-            version = int(cursor.fetchone()[0])
-            if version < 180000:
-                raise StateStoreConfigurationError("PostgreSQL State Store requires PostgreSQL 18 or newer")
-            cursor.execute("SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pg_trgm')")
-            extensions = {row[0] for row in cursor.fetchall()}
-            missing = {"vector", "pg_trgm"} - extensions
-            if missing:
-                raise StateStoreConfigurationError(
-                    f"PostgreSQL State Store requires capabilities: {', '.join(sorted(missing))}"
-                )
-            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}")
-            cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
-            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (1,))
-            if cursor.fetchone() is None:
-                cursor.execute(
-                    f"CREATE TABLE {_SCHEMA}.sessions ("
-                    "id text PRIMARY KEY, source text NOT NULL, started_at double precision NOT NULL, "
-                    "ended_at double precision, end_reason text)"
-                )
-                cursor.execute(
-                    f"CREATE TABLE {_SCHEMA}.messages ("
-                    "id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, session_id text NOT NULL "
-                    f"REFERENCES {_SCHEMA}.sessions(id), role text NOT NULL, content text, created_at double precision NOT NULL)"
-                )
-                cursor.execute(f"CREATE INDEX messages_session_id_id ON {_SCHEMA}.messages (session_id, id)")
-                cursor.execute(
-                    f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
-                    (1, time.time()),
-                )
-            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SESSION_METADATA_SCHEMA_VERSION,))
-            if cursor.fetchone() is None:
-                for column in _SESSION_METADATA_COLUMNS:
-                    cursor.execute(
-                        f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS {column} {_SESSION_METADATA_TYPES[column]}"
+        """Apply and validate every migration in order in one locked transaction.
+
+        A ledger row is evidence only after its corresponding catalog contract has
+        been validated. This rejects drift instead of silently treating a marker as
+        proof that an older or manually modified schema is usable.
+        """
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("hermes_state_store_slice_migration",))
+                cursor.execute("SHOW server_version_num")
+                version = int(cursor.fetchone()[0])
+                if version < 180000:
+                    raise StateStoreConfigurationError("PostgreSQL State Store requires PostgreSQL 18 or newer")
+                cursor.execute("SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pg_trgm')")
+                extensions = {row[0] for row in cursor.fetchall()}
+                missing = {"vector", "pg_trgm"} - extensions
+                if missing:
+                    raise StateStoreConfigurationError(
+                        f"PostgreSQL State Store requires capabilities: {', '.join(sorted(missing))}"
                     )
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_source_session_key ON {_SCHEMA}.sessions (source, session_key)")
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_parent_session_id ON {_SCHEMA}.sessions (parent_session_id)")
-                cursor.execute(
-                    f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
-                    (_SESSION_METADATA_SCHEMA_VERSION, time.time()),
+                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}")
+                cursor.execute(f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
+                cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
+                applied = {int(row[0]) for row in cursor.fetchall()}
+                unsupported = sorted(version for version in applied if version < 1 or version > _SCHEMA_VERSION)
+                if unsupported:
+                    raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
+                migrations = (
+                    (1, self._apply_v1, self._validate_v1),
+                    (_SESSION_METADATA_SCHEMA_VERSION, self._apply_v2, self._validate_v2),
+                    (_PARENT_SESSION_FOREIGN_KEY_SCHEMA_VERSION, self._apply_v3, self._validate_v3),
+                    (_COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION, self._apply_v4, self._validate_v4),
+                    (_SCHEMA_VERSION, self._apply_v5, self._validate_v5),
                 )
-            cursor.execute(
-                "SELECT 1 FROM pg_constraint WHERE conname = %s AND connamespace = %s::regnamespace",
-                ("sessions_parent_session_id_fkey", _SCHEMA),
+                for migration_version, apply, validate in migrations:
+                    if migration_version not in applied:
+                        apply(cursor)
+                        validate(cursor)
+                        cursor.execute(
+                            f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
+                            (migration_version, time.time()),
+                        )
+                    else:
+                        validate(cursor)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _required_columns(cursor: Any, table: str, columns: set[str]) -> None:
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+            (_SCHEMA, table),
+        )
+        missing = columns - {str(row[0]) for row in cursor.fetchall()}
+        if missing:
+            raise StateStoreConfigurationError(
+                f"PostgreSQL State Store schema drift: {_SCHEMA}.{table} is missing columns {sorted(missing)}"
             )
-            if cursor.fetchone() is None:
-                cursor.execute(
-                    f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey "
-                    f"FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID"
-                )
-            cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations WHERE version = %s", (_SCHEMA_VERSION,))
-            if cursor.fetchone() is None:
-                cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title text")
-                cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title_source text")
-                cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false")
-                cursor.execute(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS sessions_title_unique "
-                    f"ON {_SCHEMA}.sessions (title) WHERE title IS NOT NULL"
-                )
-                cursor.execute(
-                    f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, %s)",
-                    (_SCHEMA_VERSION, time.time()),
-                )
-        connection.commit()
+
+    @staticmethod
+    def _require_index(cursor: Any, name: str) -> None:
+        cursor.execute("SELECT 1 FROM pg_class WHERE relkind = 'i' AND relname = %s AND relnamespace = %s::regnamespace", (name, _SCHEMA))
+        if cursor.fetchone() is None:
+            raise StateStoreConfigurationError(f"PostgreSQL State Store schema drift: missing index {_SCHEMA}.{name}")
+
+    @staticmethod
+    def _require_foreign_key(cursor: Any, name: str, table: str, target: str) -> None:
+        cursor.execute(
+            "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass "
+            "AND contype = 'f' AND confrelid = %s::regclass",
+            (name, f"{_SCHEMA}.{table}", f"{_SCHEMA}.{target}"),
+        )
+        if cursor.fetchone() is None:
+            raise StateStoreConfigurationError(f"PostgreSQL State Store schema drift: missing or invalid foreign key {_SCHEMA}.{name}")
+
+    def _apply_v1(self, cursor: Any) -> None:
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.sessions ("
+            "id text PRIMARY KEY, source text NOT NULL, started_at double precision NOT NULL, "
+            "ended_at double precision, end_reason text)"
+        )
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {_SCHEMA}.messages ("
+            "id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, session_id text NOT NULL "
+            f"REFERENCES {_SCHEMA}.sessions(id), role text NOT NULL, content text, created_at double precision NOT NULL)"
+        )
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS messages_session_id_id ON {_SCHEMA}.messages (session_id, id)")
+
+    def _validate_v1(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {"id", "source", "started_at", "ended_at", "end_reason"})
+        self._required_columns(cursor, "messages", {"id", "session_id", "role", "content", "created_at"})
+        self._require_index(cursor, "messages_session_id_id")
+        self._require_foreign_key(cursor, "messages_session_id_fkey", "messages", "sessions")
+
+    def _apply_v2(self, cursor: Any) -> None:
+        for column in _SESSION_METADATA_COLUMNS:
+            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS {column} {_SESSION_METADATA_TYPES[column]}")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_source_session_key ON {_SCHEMA}.sessions (source, session_key)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS sessions_parent_session_id ON {_SCHEMA}.sessions (parent_session_id)")
+
+    def _validate_v2(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", set(_SESSION_METADATA_COLUMNS))
+        self._require_index(cursor, "sessions_source_session_key")
+        self._require_index(cursor, "sessions_parent_session_id")
+
+    def _apply_v3(self, cursor: Any) -> None:
+        cursor.execute(
+            "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass "
+            "AND contype = 'f' AND confrelid = %s::regclass",
+            ("sessions_parent_session_id_fkey", f"{_SCHEMA}.sessions", f"{_SCHEMA}.sessions"),
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey "
+                f"FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID"
+            )
+
+    def _validate_v3(self, cursor: Any) -> None:
+        self._require_foreign_key(cursor, "sessions_parent_session_id_fkey", "sessions", "sessions")
+
+    def _apply_v4(self, cursor: Any) -> None:
+        # See the module-level constant: this records validation of the legacy,
+        # previously unledgered parent-key transition and intentionally has no DDL.
+        return None
+
+    def _validate_v4(self, cursor: Any) -> None:
+        self._validate_v1(cursor)
+        self._validate_v2(cursor)
+        self._validate_v3(cursor)
+
+    def _apply_v5(self, cursor: Any) -> None:
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title text")
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS title_source text")
+        cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false")
+        cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS sessions_title_unique ON {_SCHEMA}.sessions (title) WHERE title IS NOT NULL")
+
+    def _validate_v5(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {"title", "title_source", "hidden"})
+        self._require_index(cursor, "sessions_title_unique")
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
