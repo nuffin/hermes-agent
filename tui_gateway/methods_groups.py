@@ -250,7 +250,8 @@ def _(rid, params: dict, db_path, _catalog=_local_catalog, _expiry=_grant_expiry
     """Mint one target-issued room/profile grant for a prospective home."""
     from gateway.hosted_room_peer import (
         decode_room_grant, gateway_room_grant_secret, issue_room_grant)
-    from gateway.hosted_rooms import local_authority_gateway_id, reserve_peer_room
+    from gateway.hosted_room_coordination import sqlite_hosted_room_coordination
+    from gateway.hosted_rooms import local_authority_gateway_id
     if not _room_link_run_storage_durable():
         raise ValueError("durable run idempotency storage is required")
     installation_id = local_authority_gateway_id()
@@ -270,7 +271,7 @@ def _(rid, params: dict, db_path, _catalog=_local_catalog, _expiry=_grant_expiry
         target_profile=profile, execution_policy_digest=execution_policy["policy_digest"],
         ttl_seconds=ttl)
     claims = decode_room_grant(grant_secret, token, permission="status")
-    reserve_peer_room(db_path, claims=claims, expires_at=_expiry(claims))
+    sqlite_hosted_room_coordination(db_path).reserve_peer_room(claims=claims, expires_at=_expiry(claims))
     catalog = _catalog(installation_id, profile, execution_policy)
     return _ok(rid, {
         "grant": token, "target_profile": profile, "catalog": catalog,
@@ -281,14 +282,15 @@ def _(rid, params: dict, db_path, _catalog=_local_catalog, _expiry=_grant_expiry
 def _(rid, params: dict, db_path, _expiry=_grant_expiry) -> dict:
     """Revoke one target-issued grant using its exact profile scope."""
     from gateway.hosted_room_peer import decode_room_grant, gateway_room_grant_secret
-    from gateway.hosted_rooms import local_authority_gateway_id, revoke_room_grant_scope
+    from gateway.hosted_room_coordination import sqlite_hosted_room_coordination
+    from gateway.hosted_rooms import local_authority_gateway_id
     profile = _requested_profile(params)
     claims = decode_room_grant(
         gateway_room_grant_secret(), str(params.get("grant") or ""), permission="status")
     if (claims["target_profile"] != profile
             or claims["target_install_id"] != local_authority_gateway_id()):
         raise ValueError("room grant target does not match this profile")
-    revoke_room_grant_scope(db_path, claims=claims, expires_at=_expiry(claims))
+    sqlite_hosted_room_coordination(db_path).revoke_room_grant_scope(claims=claims, expires_at=_expiry(claims))
     return _ok(rid, {"revoked": True})
 
 
