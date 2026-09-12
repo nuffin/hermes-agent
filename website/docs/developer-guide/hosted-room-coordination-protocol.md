@@ -1,6 +1,6 @@
 # Hosted Room Coordination Protocol (extracted SQLite contract)
 
-**Status:** extraction prerequisite; not a PostgreSQL implementation, migration plan, or runtime cutover authorization.
+**Status:** protocol extracted and wired through the production SQLite hosted-room core; not a PostgreSQL implementation, migration plan, runtime backend selection, or cutover authorization.
 
 This protocol names the durable coordination contract currently implemented by the hosted-room SQLite graph. A future backend may conform only by preserving the transactions and failure semantics below as one protocol. The objects are interdependent: no subset of tables is safe to route independently to PostgreSQL.
 
@@ -71,7 +71,7 @@ Each numbered operation below is one serializable backend transaction (or a prov
 
 ## Current SQLite conformance evidence
 
-`tests/gateway/test_hosted_room_coordination_protocol.py` drives current public SQLite hosted-room APIs as the extraction adapter surface. It proves: room creation and ordered event replay; lease expiry/reclaim with stale-fence rejection; remote receipt exact replay/conflict; peer reservation/revocation/expiry; and policy cursor plus watermark monotonicity. It is an executable extraction contract, not PostgreSQL differential proof.
+`tests/gateway/test_hosted_room_coordination_protocol.py` drives `SqliteHostedRoomCoordination`, the production adapter surface used by the hosted-room service/runtime, peer receipt path, and target grant reservation/revocation handlers. It proves: room creation and ordered event replay; lease expiry/reclaim with stale-fence rejection; remote receipt exact replay/conflict; peer reservation/revocation/expiry; and policy cursor plus watermark monotonicity. The adapter delegates each operation to its existing whole SQLite transaction; it does not split a transaction or soften a fence/replay rule. This is executable SQLite conformance evidence, not PostgreSQL differential proof.
 
 Existing source-focused suites additionally cover concurrent append/claim, rollback sequence preservation, driver recovery/cancellation, replica continuity/promotion, and gateway/TUI lifecycle. Run all relevant suites before relying on this protocol for a port.
 
@@ -89,3 +89,7 @@ A future implementation must not begin a partial table migration or runtime rout
 8. A verified consumer migration proving no hosted-room/driver/policy runtime path opens SQLite before any claim of PostgreSQL readiness.
 
 Until then, PostgreSQL readiness is explicitly **not established**.
+
+## Evidence reconciliation
+
+The protocol-extraction evidence previously cited malformed commit `0719773...`. Its identical tree was safely amended and the verified source is `6bc2e58898ecb5e17d2c83c8a7a57a7f33847950` (`Change-Id: I1202528741df518d25e7fb082c7f7a2e`). This correction is evidence-only; it does not assert PostgreSQL readiness.

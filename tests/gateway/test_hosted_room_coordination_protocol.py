@@ -13,7 +13,8 @@ import pytest
 
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms as rooms
-from gateway.hosted_room_policy_checkpoint import HostedRoomPolicyCheckpoint
+from gateway.hosted_room_coordination import HostedRoomCoordination, sqlite_hosted_room_coordination
+
 
 
 class FakeClock:
@@ -28,8 +29,7 @@ class FakeClock:
 
 
 def create_room(db, *, room_id: str = "room-1"):
-    return rooms.create_room(
-        db,
+    return sqlite_hosted_room_coordination(db).create_room(
         room_id=room_id,
         name="Protocol room",
         members=[{"profile": "ops", "handle": "ops"}],
@@ -39,8 +39,7 @@ def create_room(db, *, room_id: str = "room-1"):
 
 
 def append_user_event(db, *, event_id: str, text: str, now: float):
-    return rooms.append_event(
-        db,
+    return sqlite_hosted_room_coordination(db).append_event(
         room_id="room-1",
         event_id=event_id,
         kind="message.user",
@@ -62,13 +61,13 @@ def test_room_event_contract_is_ordered_idempotent_and_fenced(tmp_path):
     assert created["authority_epoch"] == 1
     assert (first["seq"], repeated["seq"], second["seq"]) == (1, 1, 2)
     assert repeated["idempotent"] is True
-    assert [event["event_id"] for event in rooms.read_events(db, room_id="room-1")["events"]] == [
+    store = sqlite_hosted_room_coordination(db)
+    assert [event["event_id"] for event in store.read_events(room_id="room-1")["events"]] == [
         "event-1",
         "event-2",
     ]
 
-    rooms.claim_authority(
-        db,
+    store.claim_authority(
         room_id="room-1",
         expected_gateway_id="gateway-a",
         expected_epoch=1,
@@ -84,8 +83,8 @@ def test_driver_lease_contract_reclaims_after_expiry_and_fences_old_owner(tmp_pa
     db = tmp_path / "state.db"
     create_room(db)
     clock = FakeClock()
-    old = driver.acquire_lease(
-        db,
+    store = sqlite_hosted_room_coordination(db)
+    old = store.acquire_lease(
         room_id="room-1",
         gateway_id="gateway-a",
         authority_epoch=1,
@@ -95,8 +94,7 @@ def test_driver_lease_contract_reclaims_after_expiry_and_fences_old_owner(tmp_pa
     )
 
     clock.advance(5)
-    new = driver.acquire_lease(
-        db,
+    new = store.acquire_lease(
         room_id="room-1",
         gateway_id="gateway-a",
         authority_epoch=1,
@@ -108,9 +106,9 @@ def test_driver_lease_contract_reclaims_after_expiry_and_fences_old_owner(tmp_pa
     assert new.reclaimed is True
     assert new.lease_generation == old.lease_generation + 1
     with pytest.raises(driver.StaleLeaseError):
-        driver.renew_lease(db, old, ttl_seconds=30, clock=clock)
+        store.renew_lease(old, ttl_seconds=30, clock=clock)
     with pytest.raises(driver.StaleLeaseError):
-        driver.release_lease(db, old, clock=clock)
+        store.release_lease(old, clock=clock)
 
 
 def test_remote_receipt_is_exactly_idempotent_not_delivery_proof(tmp_path):
@@ -129,14 +127,15 @@ def test_remote_receipt_is_exactly_idempotent_not_delivery_proof(tmp_path):
         "session_id": "session-1",
     }
 
-    rooms.upsert_remote_run_receipt(db, record=record, now=20)
-    rooms.upsert_remote_run_receipt(db, record=record, now=21)
-    stored = rooms.remote_run_receipt(db, record=record)
+    store = sqlite_hosted_room_coordination(db)
+    store.upsert_remote_run_receipt(record=record, now=20)
+    store.upsert_remote_run_receipt(record=record, now=21)
+    stored = store.remote_run_receipt(record=record)
 
     assert stored is not None
     assert (stored["run_id"], stored["session_id"]) == ("run-1", "session-1")
     with pytest.raises(rooms.HostedRoomError, match="conflicts"):
-        rooms.upsert_remote_run_receipt(db, record={**record, "run_id": "other-run"}, now=22)
+        store.upsert_remote_run_receipt(record={**record, "run_id": "other-run"}, now=22)
 
 
 def test_peer_reservation_revocation_and_expiry_are_fenced(tmp_path):
@@ -152,23 +151,24 @@ def test_peer_reservation_revocation_and_expiry_are_fenced(tmp_path):
         "issued_at": 100,
     }
 
-    rooms.reserve_peer_room(db, claims=claims, expires_at=200, now=100)
-    assert rooms.peer_room_grant_is_current(db, claims=claims, now=101)
-    assert rooms.room_grant_is_revoked(db, claims=claims, now=101) is False
+    store = sqlite_hosted_room_coordination(db)
+    store.reserve_peer_room(claims=claims, expires_at=200, now=100)
+    assert store.peer_room_grant_is_current(claims=claims, now=101)
+    assert store.room_grant_is_revoked(claims=claims, now=101) is False
 
-    rooms.revoke_room_grant_scope(db, claims=claims, expires_at=300, now=110)
-    assert rooms.room_grant_is_revoked(db, claims=claims, now=111) is True
-    assert rooms.peer_room_grant_is_current(db, claims=claims, now=111) is False
-    assert rooms.room_grant_is_revoked(db, claims={**claims, "issued_at": 111}, now=111) is False
-    assert rooms.room_grant_is_revoked(db, claims=claims, now=301) is False
+    store.revoke_room_grant_scope(claims=claims, expires_at=300, now=110)
+    assert store.room_grant_is_revoked(claims=claims, now=111) is True
+    assert store.peer_room_grant_is_current(claims=claims, now=111) is False
+    assert store.room_grant_is_revoked(claims={**claims, "issued_at": 111}, now=111) is False
+    assert store.room_grant_is_revoked(claims=claims, now=301) is False
 
 
 def test_policy_cursor_and_watermark_only_advance_from_committed_log_order(tmp_path):
     db = tmp_path / "state.db"
     create_room(db)
+    store: HostedRoomCoordination = sqlite_hosted_room_coordination(db)
     user = append_user_event(db, event_id="user-1", text="question", now=11)
-    member = rooms.append_event(
-        db,
+    member = store.append_event(
         room_id="room-1",
         event_id="member-1",
         kind="message.member",
@@ -178,8 +178,7 @@ def test_policy_cursor_and_watermark_only_advance_from_committed_log_order(tmp_p
         authority_epoch=1,
         now=12,
     )
-    terminal = rooms.append_event(
-        db,
+    terminal = store.append_event(
         room_id="room-1",
         event_id="settled-1",
         kind="turn.settled",
@@ -197,7 +196,7 @@ def test_policy_cursor_and_watermark_only_advance_from_committed_log_order(tmp_p
         now=13,
     )
 
-    checkpoint = HostedRoomPolicyCheckpoint(db)
+    checkpoint = store.policy_checkpoint()
     snapshot = checkpoint.snapshot(room_id="room-1", latest_seq=terminal["seq"])
     repeated = checkpoint.snapshot(room_id="room-1", latest_seq=terminal["seq"])
 
