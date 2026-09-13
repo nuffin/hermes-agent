@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 import time
@@ -15,6 +16,7 @@ import pytest
 
 from state_store import (
     MessageRecord, StateStoreConfigurationError, contextual_session_search_store, open_state_store,
+    resolve_contextual_session_search_store,
 )
 from hermes_state import SessionDB
 
@@ -814,6 +816,67 @@ def test_postgresql_tenant_acquisition_isolates_root_named_profiles_and_pool_sea
     finally:
         for store in stores:
             store.close()
+
+
+def test_contextual_profile_resolver_mixes_root_sqlite_named_postgresql_and_named_sqlite(monkeypatch, tmp_path):
+    """Explicit target profiles route only to their own backend, tenant, and secret scope."""
+    dsn = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+    root = tmp_path / ".hermes"
+    pg_home = root / "profiles" / "pg-reader"
+    sqlite_home = root / "profiles" / "sqlite-reader"
+    for home in (root, pg_home, sqlite_home):
+        home.mkdir(parents=True, exist_ok=True)
+    (root / "config.yaml").write_text("state_store:\n  backend: sqlite\n", encoding="utf-8")
+    (pg_home / "config.yaml").write_text(
+        "state_store:\n  backend: postgresql\n  postgresql:\n    dsn_env: PROFILE_CONTEXTUAL_DSN\n",
+        encoding="utf-8")
+    (pg_home / ".env").write_text(f"PROFILE_CONTEXTUAL_DSN={dsn}\n", encoding="utf-8")
+    (sqlite_home / "config.yaml").write_text("state_store:\n  backend: sqlite\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    root_db = SessionDB(root / "state.db")
+    sqlite_db = SessionDB(sqlite_home / "state.db")
+    pg_store = None
+    schema = "hermes_state_store_tenant_" + hashlib.sha256(
+        f"{pg_home.resolve()}\0pg-reader".encode("utf-8")).hexdigest()[:32]
+    try:
+        root_db.create_session("root-context", source="integration")
+        root_db.append_message("root-context", role="user", content="rootonlycontext")
+        sqlite_db.create_session("sqlite-context", source="integration")
+        sqlite_db.append_message("sqlite-context", role="user", content="sqliteonlycontext")
+        pg_store = cast(Any, resolve_contextual_session_search_store(profile="pg-reader", read_only=True))
+        pg_store.ensure_session("pg-context", source="integration")
+        pg_store.append_message("pg-context", role="user", content="pgonlycontext")
+        assert pg_store._schema == schema
+        assert pg_store.search_index_status()["available"] is True
+        with pg_store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SET search_path TO public")
+        with pg_store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SHOW search_path")
+            assert cursor.fetchone()[0].split(",")[0].strip(' \"') == schema
+        pg_store.close()
+        pg_store = None
+
+        root_store = resolve_contextual_session_search_store(profile="root", read_only=True)
+        named_pg_store = resolve_contextual_session_search_store(profile="pg-reader", read_only=True)
+        named_sqlite_store = resolve_contextual_session_search_store(profile="sqlite-reader", read_only=True)
+        try:
+            assert root_store.search_messages("rootonlycontext", fields=("session_id",)) == [{"session_id": "root-context"}]
+            assert named_pg_store.search_messages("pgonlycontext", fields=("session_id",)) == [{"session_id": "pg-context"}]
+            assert named_sqlite_store.search_messages("sqliteonlycontext", fields=("session_id",)) == [{"session_id": "sqlite-context"}]
+            assert named_pg_store.search_messages("rootonlycontext", fields=("session_id",)) == []
+            assert named_pg_store.search_messages("sqliteonlycontext", fields=("session_id",)) == []
+            assert not (pg_home / "state.db").exists()
+        finally:
+            root_store.close()
+            named_pg_store.close()
+            named_sqlite_store.close()
+    finally:
+        root_db.close()
+        sqlite_db.close()
+        if pg_store is not None:
+            pg_store.close()
+        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
 def test_postgresql_rejects_injection_looking_schema_before_connecting():

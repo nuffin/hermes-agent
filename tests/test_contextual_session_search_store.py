@@ -96,9 +96,40 @@ def test_profile_resolver_uses_each_profiles_sqlite_config_and_preserves_isolati
     assert "alice-only" in json.dumps(alice_result)
     assert json.loads(session_search(session_id="bob", profile="alice"))["success"] is False
     assert "bob-only" not in json.dumps(alice_result)
+    for root_selector in ("root", "global", "default"):
+        root_store = resolve_contextual_session_search_store(profile=root_selector, read_only=True)
+        try:
+            root_session = root_store.get_session("root")
+            assert root_session is not None and root_session["id"] == "root"
+            assert root_store.get_session("alice") is None
+        finally:
+            root_store.close()
 
 
-def test_profile_resolver_routes_postgresql_through_canonical_tenant_then_fails_closed(tmp_path, monkeypatch):
+def test_explicit_profile_rejects_injected_sqlite_seams_before_target_acquisition(tmp_path, monkeypatch):
+    _root, profiles = _profile_layout(tmp_path, monkeypatch)
+    alice = profiles / "alice"
+    alice.mkdir(parents=True)
+    (alice / "config.yaml").write_text("state_store:\n  backend: sqlite\n", encoding="utf-8")
+    caller_db = SessionDB(tmp_path / "caller.db")
+    factory_called = False
+
+    def factory():
+        nonlocal factory_called
+        factory_called = True
+        return caller_db
+
+    try:
+        with pytest.raises(ValueError, match="explicit contextual target profile"):
+            resolve_contextual_session_search_store(profile="alice", session_db=caller_db)
+        with pytest.raises(ValueError, match="explicit contextual target profile"):
+            resolve_contextual_session_search_store(profile="alice", session_db_factory=factory)
+    finally:
+        caller_db.close()
+    assert factory_called is False
+
+
+def test_profile_resolver_routes_postgresql_through_canonical_tenant_and_health_gate(tmp_path, monkeypatch):
     root, profiles = _profile_layout(tmp_path, monkeypatch)
     pg_home = profiles / "pgtenant"
     pg_home.mkdir(parents=True)
@@ -109,7 +140,17 @@ def test_profile_resolver_routes_postgresql_through_canonical_tenant_then_fails_
     (pg_home / ".env").write_text("PROFILE_PG_DSN=postgresql://fixture-only\n", encoding="utf-8")
     seen = {}
 
-    class _PartialPostgreSQLStore:
+    class _UnhealthyPostgreSQLStore:
+        def get_session(self): pass
+        def get_messages(self): pass
+        def get_messages_around(self): pass
+        def get_anchored_view(self): pass
+        def get_message_storage_state(self): pass
+        def search_messages(self): pass
+        def resolve_session_by_title(self): pass
+        def list_recent_sessions_bounded(self): pass
+        def search_index_status(self): return {"available": False}
+        def rebuild_search_index(self): pass
         def close(self):
             seen["closed"] = True
 
@@ -117,10 +158,10 @@ def test_profile_resolver_routes_postgresql_through_canonical_tenant_then_fails_
         seen["home"] = get_hermes_home().resolve()
         seen["schema"] = state_store.postgresql_tenant_schema()
         seen["secret"] = secret_lookup("PROFILE_PG_DSN")
-        return _PartialPostgreSQLStore()
+        return _UnhealthyPostgreSQLStore()
 
     monkeypatch.setattr(state_store, "open_state_store", fake_open)
-    with pytest.raises(ContextualSessionSearchUnavailable):
+    with pytest.raises(ContextualSessionSearchUnavailable, match="generated-search health"):
         resolve_contextual_session_search_store(profile="pgtenant", read_only=True)
 
     caller_db = SessionDB(tmp_path / "caller.db")
@@ -130,7 +171,7 @@ def test_profile_resolver_routes_postgresql_through_canonical_tenant_then_fails_
         caller_db.close()
 
     assert tool_result["success"] is False
-    assert "does not implement contextual session search" in tool_result["error"]
+    assert "generated-search health" in tool_result["error"]
     assert seen == {
         "home": pg_home.resolve(),
         "schema": postgresql_tenant_schema_for(pg_home),
