@@ -152,6 +152,7 @@ class PostgreSQLCLISessionStore:
     def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0): return self._store.refresh_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds)
     def release_session_turn_lease(self, session_id: str, holder: str): return self._store.release_session_turn_lease(session_id, holder)
     def get_active_message_watermark(self, session_id: str): return self._store.get_active_message_watermark(session_id)
+    def get_compression_publication_receipt(self, request_id: str): return self._store.get_compression_publication_receipt(request_id)
     def publish_compression_child(self, **kwargs: Any): return self._store.publish_compression_child(**kwargs)
 
     def get_session(self, session_id: str): return self._store.get_session(session_id)
