@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -162,19 +163,90 @@ def test_agent_lazy_recall_acquisition_persists_and_resumes_without_sqlite(pg_cl
         assert [row["content"] for row in store.get_messages_as_conversation(session_id)] == [
             "fresh agent turn", "persisted agent answer",
         ]
-        with pytest.raises(PostgreSQLCLISessionCapabilityError, match="does not implement compression or turn lease"):
-            store.append_messages_batch(
-                session_id, [{"role": "user", "content": "must not write"}], turn_lease_holder="active-lease")
-        assert len(store._store.get_message_records(session_id)) == 2
+        assert store.try_acquire_session_turn_lease(session_id, "active-lease")
+        assert store.append_messages_batch(
+            session_id, [{"role": "user", "content": "lease-owned write"}], turn_lease_holder="active-lease") == 1
+        store.release_session_turn_lease(session_id, "active-lease")
+        assert len(store._store.get_message_records(session_id)) == 3
         store.end_session(session_id, "agent_close")
         store.close()
 
         resumed = _open(stores)
         assert resumed.get_session(session_id)["system_prompt"] == prompt
         restored, _display = resumed.get_resume_conversations(session_id)
-        assert [row["content"] for row in restored] == ["fresh agent turn", "persisted agent answer"]
+        assert [row["content"] for row in restored] == ["fresh agent turn", "persisted agent answer", "lease-owned write"]
         resumed.reopen_session(session_id)
         assert resumed.get_session(session_id)["ended_at"] is None
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_public_agent_turn_rotates_selected_postgresql_with_real_compressor(pg_cli_home):
+    """A real public turn reaches ContextCompressor then the PG child publisher."""
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    parent = "20260914_010203_pg_rotation_parent"
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"durable history {index}: " + ("evidence " * 500)}
+        for index in range(60)
+    ]
+    main_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content="final deterministic answer", reasoning_content=None, reasoning=None, tool_calls=None,
+        ), finish_reason="stop")], model="oracle/model", usage=None,
+    )
+    summary_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="deterministic provider summary"), finish_reason="stop")]
+    )
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.context_compressor.call_llm", return_value=summary_response) as fake_provider,
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=parent,
+        )
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = main_response
+        with patch("hermes_cli.config.load_config", return_value=_CONFIG):
+            store = agent._get_session_db_for_recall()
+        stores.append(store)
+        agent._ensure_db_session()
+        store.set_session_title(parent, "PostgreSQL rotation title")
+        store.set_session_title_source(parent, "user")
+        store.patch_session_model_config(parent, {"provider": "deterministic", "oracle": True})
+        agent.compression_in_place = False
+        agent.context_compressor.threshold_tokens = 1
+        agent.context_compressor.note_usage_less_response()
+        agent.max_compression_attempts = 1
+        result = agent.run_conversation("live public input", conversation_history=history)
+
+        child = agent.session_id
+        assert result["completed"] is True
+        assert result["final_response"] == "final deterministic answer"
+        assert fake_provider.call_count >= 1
+        assert child != parent
+        parent_row, child_row = store.get_session(parent), store.get_session(child)
+        assert parent_row["end_reason"] == "compression" and parent_row["ended_at"] is not None
+        assert child_row["parent_session_id"] == parent
+        assert child_row["title"] == "PostgreSQL rotation title"
+        assert child_row["title_source"] == "user"
+        assert child_row["model"] == "oracle/model"
+        assert child_row["system_prompt"] == agent._cached_system_prompt
+        assert store.get_compression_tip(parent) == child
+        assert store.get_conversation_root(child) == parent
+        assert store.get_compression_lineage(child) == [parent, child]
+        assert store.get_active_message_watermark(child) > 0
+        assert store.get_compression_fallback_streak(child) == 0
+        assert store.get_compression_ineffective_count(child) == 0
+        assert store.get_compression_recovery_deadline(child) == 0.0
+        child_messages = store.get_messages_as_conversation(child)
+        assert any(row["content"] == "final deterministic answer" for row in child_messages)
+        assert any("deterministic provider summary" in str(row["content"]) for row in child_messages)
     assert opens == []
     assert not (home / "state.db").exists()
 
