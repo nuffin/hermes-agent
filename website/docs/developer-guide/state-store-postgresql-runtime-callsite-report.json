@@ -1,0 +1,140 @@
+{
+  "evidence_path": "website/docs/developer-guide/state-store-postgresql-phase13-runtime-readiness.md",
+  "missing_capabilities": [],
+  "profile_home": "/unselected",
+  "profile_name": null,
+  "raw_state_db_openers": [
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "acp_adapter/session.py",
+      "symbol": "SessionManager._get_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "cli.py",
+      "symbol": "HermesCLI._init_session_store"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "cron/scheduler.py",
+      "symbol": "_open_cron_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "open_db",
+      "path": "gateway/delivery_ledger.py",
+      "symbol": "_connect"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._open_session_db_for_active_scope._open"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "gateway/run.py",
+      "symbol": "_housekeeping_auto_archive"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "gateway/session_persistence.py",
+      "symbol": "SessionPersistenceMixin._open_session_db_for_active_scope._open"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "hermes_state.py",
+      "symbol": "SessionDB._get_read_conn"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "SessionDB",
+      "path": "hermes_state_registry.py",
+      "symbol": "_open_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "hermes_state_registry.py",
+      "symbol": "get_shared_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "run_agent.py",
+      "symbol": "AIAgent._get_session_db_for_recall"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "SessionDB",
+      "path": "state_store.py",
+      "symbol": "SqliteContextualSessionSearchStore.__init__"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "SessionDB",
+      "path": "state_store.py",
+      "symbol": "SqliteContextualSessionSearchStore.__init__"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "SessionDB",
+      "path": "state_store.py",
+      "symbol": "SqliteStateStore.__init__"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "SessionDB",
+      "path": "state_store.py",
+      "symbol": "SqliteStateStore.__init__"
+    },
+    {
+      "classification": "backend-neutral-contextual-contract",
+      "operation": "open_state_store",
+      "path": "state_store.py",
+      "symbol": "resolve_contextual_session_search_store"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "open_db",
+      "path": "tools/async_delegation.py",
+      "symbol": "_connect"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tools/async_delegation.py",
+      "symbol": "_dispatch_admitted"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tui_gateway/server.py",
+      "symbol": "_get_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tui_gateway/server.py",
+      "symbol": "_open_profile_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tui_gateway/server.py",
+      "symbol": "_profile_db"
+    }
+  ],
+  "ready": true,
+  "selected_backend": "sqlite",
+  "supported_capabilities": [
+    "legacy-sessiondb-runtime"
+  ],
+  "tenant_schema": null
+}
