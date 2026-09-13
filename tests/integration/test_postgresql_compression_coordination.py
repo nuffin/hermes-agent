@@ -1,33 +1,25 @@
 """PG18 differential evidence for non-destructive compression coordination."""
 from __future__ import annotations
 
-import importlib
 import time
 import uuid
 
 from state_store import CompressionCoordinationStore, PostgreSQLStateStoreConfig, open_state_store
 from state_store_postgresql import PostgreSQLStateStore
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 _DSN_ENV = "HERMES_STATE_STORE_TEST_DSN"
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
 _SETTINGS = PostgreSQLStateStoreConfig(dsn_env=_DSN_ENV, connect_timeout_seconds=5, pool_max_size=2)
 
 
-def _psycopg():
-    return importlib.import_module("psycopg")
-
-
-def _drop_created_schema(schema: str) -> None:
-    """Remove only the UUID tenant schema allocated by this test."""
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-
-
-def test_pg18_compression_observation_cooldown_counters_and_leases(monkeypatch, tmp_path):
+def test_pg18_compression_observation_cooldown_counters_and_leases(
+    monkeypatch, tmp_path, postgresql_test_target: OwnedPostgreSQLTestTarget,
+):
     """Match SQLite without opening or changing the shared root tenant schema."""
     monkeypatch.setenv(_DSN_ENV, _DSN)
     sqlite = open_state_store({}, db_path=tmp_path / "state.db")
-    schema = f"hermes_state_store_tenant_{uuid.uuid4().hex}"
+    schema = postgresql_test_target.schema
     postgres = PostgreSQLStateStore(_SETTINGS, _DSN, schema=schema)
     session_id = f"compression-coordination-{uuid.uuid4()}"
     try:
@@ -75,4 +67,3 @@ def test_pg18_compression_observation_cooldown_counters_and_leases(monkeypatch, 
     finally:
         sqlite.close()
         postgres.close()
-        _drop_created_schema(schema)

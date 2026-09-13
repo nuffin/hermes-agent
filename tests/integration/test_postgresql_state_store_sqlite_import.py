@@ -20,6 +20,7 @@ from postgresql_state_store_sqlite_import import (
     source_object_mapping_manifest,
 )
 from state_store import PostgreSQLStateStoreConfig
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
 _CONTAINER = "hermes-agent-postgresql-state-store-dev"
@@ -83,20 +84,16 @@ def _runner(arguments, **kwargs):
 
 
 @pytest.fixture
-def sandbox():
-    schema = f"hermes_state_store_tenant_{uuid.uuid4().hex}"
+def sandbox(postgresql_test_target: OwnedPostgreSQLTestTarget):
+    target = postgresql_test_target
+    schema = target.schema
     settings = PostgreSQLStateStoreConfig(
         dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2
     )
-    importer = SQLitePostgreSQLSandboxImporter(settings, _DSN, schema=schema)
-    try:
-        yield importer, schema, settings
-    finally:
-        with (
-            _psycopg().connect(_DSN, autocommit=True) as connection,
-            connection.cursor() as cursor,
-        ):
-            cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    importer = SQLitePostgreSQLSandboxImporter(
+        settings, _DSN, schema=schema, owned_target=target
+    )
+    yield importer, target, settings
 
 
 @pytest.fixture
@@ -175,10 +172,10 @@ def sqlite_source(tmp_path: Path) -> Path:
     return path
 
 
-def _manifest(schema: str) -> dict:
-    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
+def _manifest(target: OwnedPostgreSQLTestTarget) -> dict:
+    with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(
-            f"SELECT status, source_counts, destination_counts, error FROM {schema}.sqlite_import_manifests"
+            f"SELECT status, source_counts, destination_counts, error FROM \"{target.schema}\".sqlite_import_manifests"
         )
         status, source_counts, destination_counts, error = cursor.fetchone()
         return {
@@ -192,7 +189,8 @@ def _manifest(schema: str) -> dict:
 def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollback(
     sandbox, sqlite_source, tmp_path
 ):
-    importer, schema, settings = sandbox
+    importer, target, settings = sandbox
+    schema = target.schema
     evidence = tmp_path / "import-evidence.json"
     result = importer.import_source(
         sqlite_source, snapshot_root=tmp_path, evidence_path=evidence
@@ -207,19 +205,19 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
         "session_runtime_owners": 1,
         "session_runtime_turns": 1,
     }
-    manifest = _manifest(schema)
+    manifest = _manifest(target)
     assert (
         manifest["status"] == "complete"
         and manifest["source_counts"] == manifest["destination_counts"]
     )
     assert json.loads(evidence.read_text())["status"] == "complete"
-    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
+    with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT id, search_document IS NOT NULL FROM {schema}.messages")
         assert cursor.fetchone() == (41, True)
-        cursor.execute(
-            f"INSERT INTO {schema}.messages (session_id, role, content, created_at) VALUES ('session-a', 'user', 'next', 102)"
-        )
-        assert cursor.fetchone if False else True
+    target.execute(
+        f"INSERT INTO \"{schema}\".messages (session_id, role, content, created_at) VALUES ('session-a', 'user', 'next', 102)"
+    )
+    with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT max(id) FROM {schema}.messages")
         assert cursor.fetchone()[0] > 41
     operations = PostgreSQLSandboxOperations(
@@ -238,14 +236,15 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
 def test_pg18_import_interruption_rolls_back_and_resumes_idempotently(
     sandbox, sqlite_source, tmp_path
 ):
-    importer, schema, _settings = sandbox
+    importer, target, _settings = sandbox
+    schema = target.schema
     with pytest.raises(SQLitePostgreSQLImportError, match="target remains isolated"):
         importer.import_source(
             sqlite_source, snapshot_root=tmp_path, fail_after="messages"
         )
-    failed = _manifest(schema)
+    failed = _manifest(target)
     assert failed["status"] == "failed" and failed["destination_counts"] is None
-    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
+    with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT count(*) FROM {schema}.messages")
         assert cursor.fetchone()[0] == 0
     completed = importer.import_source(sqlite_source, snapshot_root=tmp_path)
@@ -256,7 +255,8 @@ def test_pg18_import_interruption_rolls_back_and_resumes_idempotently(
 def test_pg18_import_rejects_unmapped_source_fts_is_excluded_and_target_drift(
     sandbox, sqlite_source, tmp_path
 ):
-    importer, schema, _settings = sandbox
+    importer, target, _settings = sandbox
+    schema = target.schema
     with sqlite3.connect(sqlite_source) as connection:
         connection.execute(
             "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES ('', 'x', '{}', 1)"
@@ -270,11 +270,7 @@ def test_pg18_import_rejects_unmapped_source_fts_is_excluded_and_target_drift(
         "messages_fts_fixture"
         in result.manifest["source_schema"]["derived_fts_excluded"]
     )
-    with (
-        _psycopg().connect(_DSN, autocommit=True) as connection,
-        connection.cursor() as cursor,
-    ):
-        cursor.execute(f"DELETE FROM {schema}.messages WHERE id=41")
+    target.execute(f"DELETE FROM \"{schema}\".messages WHERE id=41")
     with pytest.raises(SQLitePostgreSQLImportError, match="target drifted"):
         importer.import_source(sqlite_source, snapshot_root=tmp_path)
 
@@ -282,7 +278,7 @@ def test_pg18_import_rejects_unmapped_source_fts_is_excluded_and_target_drift(
 def test_pg18_import_rejects_changed_snapshot_fingerprint_and_captures_wal(
     sandbox, sqlite_source, tmp_path
 ):
-    importer, _schema, _settings = sandbox
+    importer, _target, _settings = sandbox
     with sqlite3.connect(sqlite_source) as connection:
         assert (
             connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
@@ -303,7 +299,8 @@ def test_pg18_import_rejects_changed_snapshot_fingerprint_and_captures_wal(
 def test_pg18_import_orders_parent_sessions_and_rejects_nonisolated_target(
     sandbox, sqlite_source, tmp_path
 ):
-    importer, schema, settings = sandbox
+    importer, target, settings = sandbox
+    schema = target.schema
     with sqlite3.connect(sqlite_source) as connection:
         connection.execute(
             "INSERT INTO sessions (id, source, started_at) VALUES ('parent-session', 'fixture', 99)"
@@ -313,7 +310,7 @@ def test_pg18_import_orders_parent_sessions_and_rejects_nonisolated_target(
         )
     result = importer.import_source(sqlite_source, snapshot_root=tmp_path)
     assert result.object_counts["sessions"] == 2
-    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
+    with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(
             f"SELECT parent_session_id FROM {schema}.sessions WHERE id='session-a'"
         )
@@ -324,10 +321,17 @@ def test_pg18_import_orders_parent_sessions_and_rejects_nonisolated_target(
         )
 
 
+def test_pg18_import_rejects_uuid_schema_without_ownership_capability(sandbox):
+    _importer, target, settings = sandbox
+    with pytest.raises(SQLitePostgreSQLImportError, match="ownership-validated"):
+        SQLitePostgreSQLSandboxImporter(settings, _DSN, schema=target.schema)
+
+
 def test_pg18_import_rejects_unimplemented_columns_source_mismatch_and_populated_target(
     sandbox, sqlite_source, tmp_path
 ):
-    importer, schema, _settings = sandbox
+    importer, target, _settings = sandbox
+    schema = target.schema
     with sqlite3.connect(sqlite_source) as connection:
         connection.execute("UPDATE messages SET display_order=4")
     with pytest.raises(
@@ -339,12 +343,8 @@ def test_pg18_import_rejects_unimplemented_columns_source_mismatch_and_populated
     with pytest.raises(SQLitePostgreSQLImportError, match="target is not a new"):
         # Target becomes non-empty only after the PG catalog is prepared; do that explicitly.
         importer._prepare_target()
-        with (
-            _psycopg().connect(_DSN, autocommit=True) as connection,
-            connection.cursor() as cursor,
-        ):
-            cursor.execute(
-                f"INSERT INTO {schema}.sessions (id, source, started_at) VALUES ('foreign', 'test', 1)"
-            )
+        target.execute(
+            f"INSERT INTO \"{schema}\".sessions (id, source, started_at) VALUES ('foreign', 'test', 1)"
+        )
         importer.import_source(sqlite_source, snapshot_root=tmp_path)
     assert source_object_mapping_manifest()["version"] == 1
