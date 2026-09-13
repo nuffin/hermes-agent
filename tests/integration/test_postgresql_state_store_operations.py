@@ -105,17 +105,21 @@ def test_pg18_doctor_backup_restore_isolated_and_reversible(sandbox, backup_root
     assert backup.manifest["archive"]["sha256"]
     assert json.loads(backup.manifest_path.read_text())["tenant"]["table_counts"] == status["table_counts"]
 
-    preexisting_restores = set(_restored_databases())
-    result = operations.restore_and_verify(backup.backup_directory)
+    restore_target = f"hermes_state_restore_{uuid.uuid4().hex}"
+    result = operations.restore_and_verify(backup.backup_directory, target_database=restore_target)
     assert result["verified"] is True and result["restored_database"] is None
-    default_cleanup = operations.restore_and_verify(backup.backup_directory)
+    default_cleanup_target = f"hermes_state_restore_{uuid.uuid4().hex}"
+    default_cleanup = operations.restore_and_verify(backup.backup_directory, target_database=default_cleanup_target)
     assert default_cleanup["verified"] is True and default_cleanup["restored_database"] is None
-    assert set(_restored_databases()) == preexisting_restores
+    # Parallel UUID-schema suites may be restoring their own disposable
+    # databases.  Assert cleanup of this test's owned targets only.
+    restored = set(_restored_databases())
+    assert restore_target not in restored
+    assert default_cleanup_target not in restored
 
 
 def test_pg18_operations_fail_closed_for_missing_extension_bad_manifest_and_existing_target(sandbox, backup_root: Path):
     operations, store, _delivery, _state_target, _delivery_target = sandbox
-    preexisting_restores = set(_restored_databases())
     store.ensure_session(f"operations-{uuid.uuid4()}", source="operations")
     with pytest.raises(PostgreSQLSandboxOperationsError, match="invariant"):
         operations.doctor(required_extensions=("missing_extension",))
@@ -127,9 +131,12 @@ def test_pg18_operations_fail_closed_for_missing_extension_bad_manifest_and_exis
     manifest = json.loads(backup.manifest_path.read_text())
     manifest["archive"]["sha256"] = "0" * 64
     backup.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    restore_target = f"hermes_state_restore_{uuid.uuid4().hex}"
     with pytest.raises(PostgreSQLSandboxOperationsError, match="manifest"):
-        operations.restore_and_verify(backup.backup_directory)
-    assert set(_restored_databases()) == preexisting_restores
+        operations.restore_and_verify(backup.backup_directory, target_database=restore_target)
+    # Invalid manifests are rejected before the owned target is created;
+    # unrelated parallel tests must not influence this assertion.
+    assert restore_target not in set(_restored_databases())
 
 
 def test_pg18_doctor_rejects_catalog_drift_without_migrating(sandbox):
