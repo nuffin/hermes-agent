@@ -1,7 +1,7 @@
 """Executable isolated PostgreSQL CLI session lifecycle contract."""
 from __future__ import annotations
 
-import importlib
+
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -17,12 +17,8 @@ _CONFIG = {"state_store": {"backend": "postgresql", "postgresql": {
 }}}
 
 
-def _psycopg():
-    return importlib.import_module("psycopg")
-
-
 @pytest.fixture
-def pg_cli_home(tmp_path, monkeypatch):
+def pg_cli_home(tmp_path, monkeypatch, postgresql_test_target):
     home = tmp_path / ".hermes-dev-postgresql-state-store"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -30,6 +26,8 @@ def pg_cli_home(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", _DSN)
+    import state_store
+    monkeypatch.setattr(state_store, "postgresql_tenant_schema", lambda *_args, **_kwargs: postgresql_test_target.schema)
     token = set_hermes_home_override(str(home))
     stores = []
     try:
@@ -37,10 +35,7 @@ def pg_cli_home(tmp_path, monkeypatch):
     finally:
         for store in stores:
             try:
-                schema = store._store._schema
                 store.close()
-                with _psycopg().connect(_DSN, autocommit=True) as conn, conn.cursor() as cursor:
-                    cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
             except Exception:
                 pass
         reset_hermes_home_override(token)

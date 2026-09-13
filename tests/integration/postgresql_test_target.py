@@ -105,6 +105,12 @@ class OwnedPostgreSQLTestTarget:
             cursor.execute(f"DROP SCHEMA {schema} CASCADE")
         self._closed = True
 
+    def reset(self) -> None:
+        """Recreate this exact marked target after marker-validated destruction."""
+        self.drop()
+        self._closed = False
+        self.allocate()
+
 
 @pytest.fixture
 def postgresql_test_target() -> Generator[OwnedPostgreSQLTestTarget, None, None]:
