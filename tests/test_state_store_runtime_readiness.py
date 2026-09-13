@@ -88,6 +88,40 @@ def test_selected_postgresql_profile_fails_before_state_db_open_and_reports_tena
     assert not (profile_home / "state.db").exists()
 
 
+def test_selected_postgresql_async_dispatch_refuses_before_runner_or_state_db_side_effect(tmp_path, monkeypatch):
+    """The delegate_task background path cannot execute or fall back to SQLite under PG.
+
+    The runner is the external-subagent side effect.  Durable dispatch must reject
+    before it reaches the executor when its only complete ledger is unavailable.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation as ad
+
+    home = tmp_path / ".hermes" / "profiles" / "pg-sandbox"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "state_store:\n  backend: postgresql\n  postgresql:\n    dsn_env: HERMES_STATE_STORE_TEST_DSN\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", "postgresql://fixture/only")
+    runner_calls = []
+    token = set_hermes_home_override(str(home))
+    try:
+        with trap_state_db_opens(home) as events:
+            with pytest.raises(PostgreSQLRuntimeActivationError) as caught:
+                ad.dispatch_async_delegation(
+                    goal="must not run", context=None, toolsets=None, role="leaf", model=None,
+                    session_key="", runner=lambda: runner_calls.append("called") or {"status": "completed"},
+                )
+        assert "async-delegation-ledger-routing" in caught.value.report.missing_capabilities
+        assert runner_calls == []
+        assert events == []
+        assert not (home / "state.db").exists()
+    finally:
+        ad._reset_for_tests()
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("module_name", ["gateway.delivery_ledger", "tools.async_delegation"])
 def test_selected_postgresql_blocks_raw_ledger_openers_before_state_db_side_effect(tmp_path, monkeypatch, module_name):
     import importlib
