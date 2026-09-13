@@ -1,7 +1,7 @@
 """PG18 direct evidence for fenced SessionRuntimeOwnership; intentionally no runtime route."""
 from __future__ import annotations
 
-import importlib
+
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from typing import Any
@@ -10,13 +10,11 @@ import pytest
 
 from hermes_state_runtime_ownership import RuntimeOwner
 from state_store import open_state_store
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
-_SCHEMA = "hermes_state_store_slice"
-
-
-def _psycopg():
-    return importlib.import_module("psycopg")
+_SCHEMA = ""
+_TARGET: OwnedPostgreSQLTestTarget | None = None
 
 
 def _config() -> dict[str, object]:
@@ -29,17 +27,20 @@ def _owner(name: str) -> RuntimeOwner:
     return RuntimeOwner(f"installation-{name}", f"host-{name}", f"generation-{name}")
 
 
-def _reset() -> None:
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
-
-
 @pytest.fixture(autouse=True)
-def pg18_schema(monkeypatch):
+def pg18_schema(monkeypatch, postgresql_test_target):
+    global _SCHEMA, _TARGET
+    _SCHEMA, _TARGET = postgresql_test_target.schema, postgresql_test_target
     monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", _DSN)
-    _reset()
+    import state_store
+    monkeypatch.setattr(state_store, "postgresql_tenant_schema", lambda *_args, **_kwargs: _SCHEMA)
     yield
-    _reset()
+    _TARGET = None
+
+
+def _target() -> OwnedPostgreSQLTestTarget:
+    assert _TARGET is not None
+    return _TARGET
 
 
 def _store() -> Any:
@@ -47,9 +48,8 @@ def _store() -> Any:
 
 
 def _expire(store: Any, namespace: str, session_id: str) -> None:
-    with store._connection() as connection, connection.cursor() as cursor:
-        cursor.execute(
-            "UPDATE session_runtime_owners SET expires_at = EXTRACT(EPOCH FROM clock_timestamp()) - 1 "
+    _target().execute(
+            f"UPDATE {_SCHEMA}.session_runtime_owners SET expires_at = EXTRACT(EPOCH FROM clock_timestamp()) - 1 "
             "WHERE namespace=%s AND session_id=%s", (namespace, session_id),
         )
 
@@ -123,9 +123,8 @@ def test_pg18_namespace_isolation_release_fence_and_catalog_rollback():
         assert store.acquire_session_runtime_ownership("same", _owner("d"), ttl_seconds=30, namespace="beta") is None
         # An injected failing transaction rolls back; the adapter's next server-time CAS remains usable.
         with pytest.raises(Exception):
-            with store._connection() as connection, connection.cursor() as cursor:
-                cursor.execute("INSERT INTO session_runtime_turns (namespace, session_id, turn_id, state, owner_fence, created_at, updated_at) "
-                               "VALUES ('alpha', 'same', 'bad', 'invalid', 2, 0, 0)")
+            _target().execute(f"INSERT INTO {_SCHEMA}.session_runtime_turns (namespace, session_id, turn_id, state, owner_fence, created_at, updated_at) "
+                              "VALUES ('alpha', 'same', 'bad', 'invalid', 2, 0, 0)")
         assert store.begin_session_runtime_turn(successor, "after-rollback")
         with store._connection() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT version FROM schema_migrations ORDER BY version")
@@ -136,8 +135,7 @@ def test_pg18_namespace_isolation_release_fence_and_catalog_rollback():
 
 def test_pg18_runtime_catalog_drift_fails_closed():
     store = _store(); store.close()
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DROP INDEX {_SCHEMA}.session_runtime_owners_expires")
+    _target().execute(f"DROP INDEX {_SCHEMA}.session_runtime_owners_expires")
     with pytest.raises(Exception, match="missing index"):
         _store()
 
