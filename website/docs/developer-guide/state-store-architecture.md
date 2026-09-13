@@ -62,5 +62,5 @@ This does **not** route live gateway consumers, add runtime configuration, impor
 1. Configuration, factory, capability probing, and SQLite compatibility (current earliest slice).
 2. Backend-neutral SessionDB operations and complete canonical PostgreSQL schema.
 3. PostgreSQL search and all gateway/hosted-room operational consumers.
-4. Native recovery/doctor/change-feed behavior.
+4. Native recovery/doctor/change-feed behavior. The bounded sandbox-only PostgreSQL doctor/status plus logical schema backup, manifest, and disposable restore verification are implemented; runtime command routing, production recovery, and change-feed behavior remain unported.
 5. Resumable migration, rollback, and real sandbox conformance.
