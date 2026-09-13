@@ -82,12 +82,12 @@ single and batch message persistence, prompt snapshot, end, a new-store resume/r
 lookup, unsupported-call refusal, and the file-open trap. Its deterministic offline-agent
 harness constructs the real `AIAgent` with local mocks only, proving lazy selected-PG
 acquisition, first-turn persistence, prompt/history restoration, end/reopen, and
-- active lease-holder rejection before a write. The v19 coordination slice additionally persists activity labels, cooldown snapshot/restore, anti-thrash counters, and fenced server-clock leases; `tests/integration/test_postgresql_compression_coordination.py` differentially exercises that non-destructive contract against SQLite. Destructive parent/child rotation remains rejected before mutation because atomic publication is not yet ported. It also proves the default SQLite factory path is unchanged.
+- active lease-holder rejection before a write. The v19 coordination slice additionally persists activity labels, cooldown snapshot/restore, anti-thrash counters, and fenced server-clock leases; migration v20 adds the adapter-owned atomic parent/child compression publication receipt. `tests/integration/test_postgresql_compression_rotation_acceptance.py` exercises its fenced/idempotent handoff without SQLite fallback. This does not make the gateway, cron, TUI, ACP, hosted, or async paths PostgreSQL-ready; it also proves the default SQLite factory path is unchanged.
 
 Run the focused gate with:
 
 ```bash
-scripts/run_tests.sh tests/integration/test_postgresql_cli_session_store.py tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
+scripts/run_tests.sh -m integration tests/integration/test_postgresql_cli_session_store.py; scripts/run_tests.sh tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
 ```
 
 ## Remaining work

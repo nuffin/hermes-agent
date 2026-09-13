@@ -190,7 +190,7 @@ class PostgreSQLSandboxOperations:
                 "WHERE expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
             )
             active_leases = int(cursor.fetchone()[0])
-        if migrations != list(range(1, 20)):
+        if migrations != list(range(1, 21)):
             raise PostgreSQLSandboxOperationsError("PostgreSQL tenant migration catalog is unhealthy")
         with connection.cursor() as cursor:
             cursor.execute(

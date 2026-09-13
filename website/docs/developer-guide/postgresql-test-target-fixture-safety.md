@@ -10,8 +10,8 @@ revalidates that marker immediately before destructive teardown.
 - `test_postgresql_compression_rotation_acceptance.py`
   - `rotation_schema` now obtains the schema from `postgresql_test_target`.
   - StateStore receives that schema at construction.
-  - v20 catalog fault injection goes through `OwnedPostgreSQLTestTarget.execute`.
-  - PG v19 acceptance and v20 rejection remain covered by the rotation gate.
+  - v21 catalog fault injection goes through `OwnedPostgreSQLTestTarget.execute`.
+  - PG v19 coordination and v20 atomic-rotation catalog contracts remain covered by the rotation gate.
 - `test_postgresql_state_store_slice.py` (28 tests)
   - Every StateStore factory is routed to a fixture-owned UUID schema; root and named profile acquisitions obtain separately owned UUID targets through the same helper.
   - Fixture reset, historical seed, catalog drift, index rebuild, and data fault injection use marker-validated target operations.
@@ -36,5 +36,5 @@ store-pool `search_path` lifecycle checks.
 
 **Remaining unsafe PostgreSQL integration callsites: 0.**
 
-Production routing and compression rotation behavior are unchanged; the strict rotation
-adapter xfail remains a fail-closed boundary.
+The v20 production adapter is covered by the owned rotation acceptance target. Broader
+selected-PG routing remains fail-closed; no test path opens SQLite as fallback.

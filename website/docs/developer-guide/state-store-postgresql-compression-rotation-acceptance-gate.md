@@ -2,13 +2,15 @@
 
 ## Status
 
-Selected PostgreSQL rotation is **unsupported and fail-closed**.  This slice
-adds an executable PG18 test-only transaction protocol; it does not add a
-production publisher, migration, capability, SQLite fallback, or `state.db`
-opener.  The only strict production `xfail` is immediately after the precise
-absent `publish_compression_child` interface is proved absent.  The selected
-runtime refusal/no-`state.db` trap remains covered by
-`tests/integration/test_postgresql_cli_session_store.py`.
+PostgreSQL now exposes the narrowly-scoped
+`atomic-compression-rotation-v1` adapter: migration v20 creates a durable,
+tenant-local publication receipt and the publisher uses the existing
+server-clock fenced compression lease. It atomically creates the child and
+handoff, closes the parent, and records the receipt; duplicate receipt reads
+are idempotent and no indeterminate request is automatically replayed. It does
+not create a SQLite fallback or open `state.db`. Gateway, cron, TUI, ACP,
+hosted, async-delegation, and normal selected-PG runtime routing remain
+unported and fail closed.
 
 ## SQLite oracle → PG18 executable matrix
 
@@ -55,10 +57,9 @@ Phase 12 is passed only on PostgreSQL 18+ with an owned UUID schema per test:
 
 ## Phase 13 gate
 
-Do not advertise `atomic-compression-rotation-v1` until Phase 7 and Phase 12
-pass against the production adapter in serial and parallel runs.  Until then
-all selected-PG rotation entry points fail with the dedicated capability error
-before mutation; a successful SQLite fallback is a failure.
+`atomic-compression-rotation-v1` is advertised only by the production adapter.
+The broader selected-PG runtime remains unavailable until its other consumers
+have equivalent contracts; a SQLite fallback is always a failure.
 
 ## Commands
 
@@ -66,5 +67,5 @@ before mutation; a successful SQLite fallback is a failure.
 scripts/run_tests.sh tests/agent/test_postgresql_compression_rotation_oracle.py -v --tb=short
 HERMES_TEST_WORKERS=1 scripts/run_tests.sh tests/integration/test_postgresql_compression_rotation_acceptance.py -m integration -v --tb=short
 HERMES_TEST_WORKERS=2 scripts/run_tests.sh tests/integration/test_postgresql_compression_rotation_acceptance.py -m integration -v --tb=short
-HERMES_TEST_WORKERS=1 scripts/run_tests.sh tests/integration/test_postgresql_phase12_fault_harness.py tests/integration/test_postgresql_compression_coordination.py tests/integration/test_postgresql_cli_session_store.py -v --tb=short
+HERMES_TEST_WORKERS=1 scripts/run_tests.sh -m integration tests/integration/test_postgresql_phase12_fault_harness.py tests/integration/test_postgresql_compression_coordination.py tests/integration/test_postgresql_cli_session_store.py -v --tb=short
 ```
