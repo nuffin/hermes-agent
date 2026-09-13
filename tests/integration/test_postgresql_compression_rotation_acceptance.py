@@ -15,6 +15,7 @@ import pytest
 
 from state_store import PostgreSQLStateStoreConfig, StateStoreConfigurationError
 from state_store_postgresql import PostgreSQLStateStore
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 pytestmark = pytest.mark.integration
 
@@ -35,10 +36,6 @@ def _store(schema: str) -> PostgreSQLStateStore:
     return PostgreSQLStateStore(_SETTINGS, _DSN, schema=schema)
 
 
-def _drop_schema(schema: str) -> None:
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-
 
 @pytest.fixture(autouse=True)
 def requires_postgresql_18(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,12 +46,9 @@ def requires_postgresql_18(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def rotation_schema():
-    schema = f"hermes_state_store_tenant_{uuid.uuid4().hex}"
-    try:
-        yield schema
-    finally:
-        _drop_schema(schema)
+def rotation_schema(postgresql_test_target: OwnedPostgreSQLTestTarget):
+    """StateStore receives the allocated schema at construction time."""
+    yield postgresql_test_target.schema
 
 
 def _require_adapter(store: PostgreSQLStateStore) -> Any:
@@ -110,14 +104,15 @@ def test_pg18_rotation_capability_is_not_advertised_or_implied(rotation_schema):
         store.close()
 
 
-def test_pg18_unknown_catalog_version_is_rejected_fail_closed(rotation_schema):
+def test_pg18_unknown_catalog_version_is_rejected_fail_closed(
+    rotation_schema, postgresql_test_target: OwnedPostgreSQLTestTarget,
+):
     """A disposable fixture proves v20 drift is rejected without touching root."""
     store = _store(rotation_schema)
     store.close()
-    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
-        cursor.execute(
-            f"INSERT INTO {rotation_schema}.schema_migrations (version, applied_at) VALUES (20, 0)"
-        )
+    postgresql_test_target.execute(
+        f"INSERT INTO {rotation_schema}.schema_migrations (version, applied_at) VALUES (20, 0)"
+    )
     with pytest.raises(
         StateStoreConfigurationError,
         match=r"Unsupported PostgreSQL State Store schema migration versions: \[20\]",
