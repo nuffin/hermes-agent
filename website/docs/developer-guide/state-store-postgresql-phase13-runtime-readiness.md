@@ -24,7 +24,8 @@ A selected PostgreSQL profile reports its canonical profile home/name and derive
 - profile-derived PostgreSQL tenant schema selection; and
 - CLI fresh/resume acquisition through `cli_session_store.open_cli_session_store()`.
 
-The CLI facade persists a real session row, structured messages, system-prompt
+The CLI facade persists a real session row, single-message and batch structured
+messages (including identity, order, timestamps, and null content), system-prompt
 snapshot, end/reopen transition, and bounded recent-session lookup. It rejects
 unimplemented SessionDB methods with a capability error before any SQLite
 fallback. The legacy SQLite CLI path continues to construct `SessionDB`.
@@ -53,7 +54,7 @@ runtime is PostgreSQL-ready.
 
 `tests/integration/test_postgresql_cli_session_store.py` exercises a fresh
 isolated `HERMES_HOME` against loopback PostgreSQL: session creation, ordered
-message persistence, prompt snapshot, end, a new-store resume/reopen, session
+single and batch message persistence, prompt snapshot, end, a new-store resume/reopen, session
 lookup, unsupported-call refusal, and the file-open trap. It also proves the
 default SQLite factory path is unchanged.
 
