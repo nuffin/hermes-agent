@@ -15,11 +15,16 @@ _FAMILY = (
     "test_postgresql_session_runtime_ownership.py",
     "test_postgresql_delivery_ledger.py",
     "test_postgresql_cli_session_store.py",
+    "test_postgresql_compression_rotation_acceptance.py",
+    "test_postgresql_compression_coordination.py",
+    "test_postgresql_phase12_fault_harness.py",
+    "test_postgresql_state_store_sqlite_import.py",
+    "test_postgresql_state_store_operations.py",
 )
 # Store-pool search_path poisoning is a deliberate lifecycle assertion: the facade
 # must reset it on checkout. Catalog/data reads are also safe; direct DDL/DML is not.
-_SAFE_DIRECT_EXECUTE_EXEMPTIONS = ("SET search_path TO public", "SHOW search_path", "SELECT ")
-_DANGEROUS_SQL = ("CREATE ", "ALTER ", "DROP ", "INSERT ", "UPDATE ", "DELETE ", "REINDEX ", "TRUNCATE ")
+_SAFE_DIRECT_EXECUTE_EXEMPTIONS = ("SET search_path TO public", "SHOW search_path", "SHOW server_version_num", "SELECT ")
+_DANGEROUS_SQL = ("CREATE ", "ALTER ", "DROP ", "INSERT ", "UPDATE ", "DELETE ", "REINDEX ", "TRUNCATE ", "MERGE ", "COPY ", "GRANT ", "REVOKE ", "VACUUM ", "DO ", "CALL ")
 
 
 def _psycopg():

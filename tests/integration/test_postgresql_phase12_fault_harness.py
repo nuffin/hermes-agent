@@ -10,7 +10,7 @@ import multiprocessing
 import queue
 import sqlite3
 import threading
-import uuid
+
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
@@ -24,6 +24,7 @@ from postgresql_state_store_operations import PostgreSQLSandboxOperations, Postg
 from postgresql_state_store_sqlite_import import SQLitePostgreSQLImportError, SQLitePostgreSQLSandboxImporter
 from state_store import MessageRecord, PostgreSQLStateStoreConfig
 from state_store_postgresql import PostgreSQLStateStore
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
 _SETTINGS = PostgreSQLStateStoreConfig(dsn_env="PHASE12_DSN", connect_timeout_seconds=5, pool_max_size=2)
@@ -45,11 +46,6 @@ def _owner(label: str) -> RuntimeOwner:
     return RuntimeOwner(f"phase12-installation-{label}", f"phase12-host-{label}", f"phase12-generation-{label}")
 
 
-def _drop_schemas(*schemas: str) -> None:
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        for schema in schemas:
-            cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-
 
 @pytest.fixture(autouse=True)
 def requires_postgresql_18() -> None:
@@ -60,14 +56,11 @@ def requires_postgresql_18() -> None:
 
 
 @pytest.fixture
-def phase12_schemas():
-    suffix = uuid.uuid4().hex
-    state_schema = f"hermes_state_store_tenant_{suffix}"
-    delivery_schema = f"hermes_delivery_ledger_tenant_{suffix}"
-    try:
-        yield state_schema, delivery_schema
-    finally:
-        _drop_schemas(state_schema, delivery_schema)
+def phase12_targets(
+    postgresql_test_target: OwnedPostgreSQLTestTarget,
+    postgresql_delivery_target: OwnedPostgreSQLTestTarget,
+):
+    return postgresql_test_target, postgresql_delivery_target
 
 
 def _ownership_worker(schema: str, label: str, start: Any, results: Any) -> None:
@@ -143,8 +136,9 @@ def _take(queue_value: Any, *, timeout: float = 15) -> tuple[Any, ...]:
         raise AssertionError("indeterminate: child did not report a durable outcome") from exc
 
 
-def test_pg18_process_ownership_contention_sigkill_takeover_and_no_turn_replay(phase12_schemas):
-    schema, _delivery_schema = phase12_schemas
+def test_pg18_process_ownership_contention_sigkill_takeover_and_no_turn_replay(phase12_targets):
+    state_target, _delivery_target = phase12_targets
+    schema = state_target.schema
     context = multiprocessing.get_context("spawn")
     start, results = context.Event(), context.Queue()
     processes = [context.Process(target=_ownership_worker, args=(schema, label, start, results)) for label in ("a", "b")]
@@ -170,8 +164,10 @@ def test_pg18_process_ownership_contention_sigkill_takeover_and_no_turn_replay(p
 
     supervisor = _state_store(schema)
     try:
-        with supervisor._connection() as connection, connection.cursor() as cursor:
-            cursor.execute("UPDATE session_runtime_owners SET expires_at=EXTRACT(EPOCH FROM clock_timestamp())-1 WHERE namespace=%s AND session_id=%s", ("phase12", "crash-session"))
+        state_target.execute(
+            f"UPDATE \"{schema}\".session_runtime_owners SET expires_at=EXTRACT(EPOCH FROM clock_timestamp())-1 WHERE namespace=%s AND session_id=%s",
+            ("phase12", "crash-session"),
+        )
         successor = supervisor.acquire_session_runtime_ownership("crash-session", _owner("successor"), ttl_seconds=60, namespace="phase12")
         assert successor is not None and successor.fence == first.fence + 1
         with supervisor._connection() as connection, connection.cursor() as cursor:
@@ -185,30 +181,28 @@ def test_pg18_process_ownership_contention_sigkill_takeover_and_no_turn_replay(p
         supervisor.close()
 
 
-def test_pg18_server_fault_rolls_back_message_usage_and_pool_waiter_recovers(phase12_schemas):
-    schema, _delivery_schema = phase12_schemas
+def test_pg18_server_fault_rolls_back_message_usage_and_pool_waiter_recovers(phase12_targets):
+    state_target, _delivery_target = phase12_targets
+    schema = state_target.schema
     store = _state_store(schema, pool_size=1)
     session_id = "atomic-session"
     try:
         store.ensure_session(session_id, source="phase12")
-        with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"""CREATE FUNCTION {schema}.phase12_message_fault() RETURNS trigger LANGUAGE plpgsql AS $$
+        state_target.execute(f"""CREATE FUNCTION \"{schema}\".phase12_message_fault() RETURNS trigger LANGUAGE plpgsql AS $$
                 BEGIN IF NEW.content='fault-message' THEN RAISE EXCEPTION 'phase12 message fault'; END IF; RETURN NEW; END $$""")
-            cursor.execute(f"CREATE TRIGGER phase12_message_fault BEFORE INSERT ON {schema}.messages FOR EACH ROW EXECUTE FUNCTION {schema}.phase12_message_fault()")
+        state_target.execute(f"CREATE TRIGGER phase12_message_fault BEFORE INSERT ON \"{schema}\".messages FOR EACH ROW EXECUTE FUNCTION \"{schema}\".phase12_message_fault()")
         with pytest.raises(Exception, match="phase12 message fault"):
             store.append_message_records(session_id, [MessageRecord(role="user", content="before"), MessageRecord(role="assistant", content="fault-message")])
         assert store.get_messages(session_id) == []
-        with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP TRIGGER phase12_message_fault ON {schema}.messages")
-            cursor.execute(f"CREATE FUNCTION {schema}.phase12_usage_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'phase12 usage fault'; END $$")
-            cursor.execute(f"CREATE TRIGGER phase12_usage_fault BEFORE INSERT ON {schema}.session_model_usage FOR EACH ROW EXECUTE FUNCTION {schema}.phase12_usage_fault()")
+        state_target.execute(f"DROP TRIGGER phase12_message_fault ON \"{schema}\".messages")
+        state_target.execute(f"CREATE FUNCTION \"{schema}\".phase12_usage_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'phase12 usage fault'; END $$")
+        state_target.execute(f"CREATE TRIGGER phase12_usage_fault BEFORE INSERT ON \"{schema}\".session_model_usage FOR EACH ROW EXECUTE FUNCTION \"{schema}\".phase12_usage_fault()")
         with pytest.raises(Exception, match="phase12 usage fault"):
             store.update_token_counts(session_id, input_tokens=7, output_tokens=3, model="phase12", api_call_count=1)
         with store._connection() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT input_tokens, output_tokens, api_call_count FROM sessions WHERE id=%s", (session_id,))
             assert cursor.fetchone() == (0, 0, 0)
-        with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP TRIGGER phase12_usage_fault ON {schema}.session_model_usage")
+        state_target.execute(f"DROP TRIGGER phase12_usage_fault ON \"{schema}\".session_model_usage")
 
         held, release, completed = threading.Event(), threading.Event(), threading.Event()
         def hold_connection() -> None:
@@ -229,8 +223,9 @@ def test_pg18_server_fault_rolls_back_message_usage_and_pool_waiter_recovers(pha
         store.close()
 
 
-def test_pg18_delivery_receipt_fence_search_repair_lock_and_concurrent_namespaces(phase12_schemas):
-    schema, delivery_schema = phase12_schemas
+def test_pg18_delivery_receipt_fence_search_repair_lock_and_concurrent_namespaces(phase12_targets):
+    state_target, delivery_target = phase12_targets
+    schema, delivery_schema = state_target.schema, delivery_target.schema
     context = multiprocessing.get_context("spawn")
     delivery_results = context.Queue()
     delivery = context.Process(target=_delivery_claim_worker, args=(delivery_schema, delivery_results))
@@ -239,8 +234,7 @@ def test_pg18_delivery_receipt_fence_search_repair_lock_and_concurrent_namespace
     assert outcome == "committed" and stale_receipt is not None
     delivery.kill(); delivery.join(15)
     assert delivery.exitcode is not None and delivery.exitcode != 0
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"UPDATE {delivery_schema}.delivery_obligations SET lease_expires_at=EXTRACT(EPOCH FROM clock_timestamp())-1")
+    delivery_target.execute(f"UPDATE \"{delivery_schema}\".delivery_obligations SET lease_expires_at=EXTRACT(EPOCH FROM clock_timestamp())-1")
     successor_ledger = PostgreSQLDeliveryLedger(_DSN, schema=delivery_schema, settings=DeliveryLedgerPostgreSQLConfig(lease_seconds=60))
     try:
         assert not successor_ledger.mark_delivered(stale_receipt)
@@ -261,7 +255,8 @@ def test_pg18_delivery_receipt_fence_search_repair_lock_and_concurrent_namespace
         release_lock.set(); lock_process.join(15); store.close()
     assert lock_process.exitcode == 0
 
-    schemas = [f"hermes_state_store_tenant_{uuid.uuid4().hex}" for _ in range(3)]
+    targets = [OwnedPostgreSQLTestTarget(_DSN).allocate() for _ in range(3)]
+    schemas = [target.schema for target in targets]
     start, results = context.Event(), context.Queue()
     workers = [context.Process(target=_namespace_writer, args=(candidate, label, start, results)) for candidate, label in zip(schemas, ("root", "alice", "bob"))]
     try:
@@ -283,22 +278,26 @@ def test_pg18_delivery_receipt_fence_search_repair_lock_and_concurrent_namespace
     finally:
         for worker in workers:
             if worker.is_alive(): worker.kill(); worker.join(15)
-        _drop_schemas(*schemas)
+        for target in targets:
+            target.drop()
 
 
-def test_pg18_backup_failure_and_interrupted_import_are_isolated(tmp_path: Path, phase12_schemas):
-    schema, _delivery_schema = phase12_schemas
+def test_pg18_backup_failure_and_interrupted_import_are_isolated(tmp_path: Path, phase12_targets):
+    state_target, _delivery_target = phase12_targets
+    schema = state_target.schema
     store = _state_store(schema)
     source = tmp_path / "migration-only-source.db"
     with sqlite3.connect(source) as connection:
         connection.executescript(SCHEMA_SQL)
         connection.execute("INSERT INTO sessions (id, source, started_at) VALUES ('import-session', 'phase12', 1)")
         connection.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('import-session', 'user', 'import payload', 2)")
-    importer = SQLitePostgreSQLSandboxImporter(_SETTINGS, _DSN, schema=schema)
+    importer = SQLitePostgreSQLSandboxImporter(
+        _SETTINGS, _DSN, schema=schema, owned_target=state_target
+    )
     try:
         with pytest.raises(SQLitePostgreSQLImportError, match="target remains isolated"):
             importer.import_source(source, snapshot_root=tmp_path, fail_after="messages")
-        with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
+        with state_target.connect() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT status, destination_counts FROM {schema}.sqlite_import_manifests")
             assert cursor.fetchone() == ("failed", None)
             cursor.execute(f"SELECT count(*) FROM {schema}.messages")

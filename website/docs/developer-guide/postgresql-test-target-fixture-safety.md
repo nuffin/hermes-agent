@@ -26,19 +26,15 @@ revalidates that marker immediately before destructive teardown.
   - A pre-existing shared sentinel schema/catalog record survives StateStore, runtime, and delivery migration construction unchanged.
   - AST inventory rejects direct dangerous `cursor.execute` DDL/DML in the four migrated files. Explicit exemptions are catalog/data reads and the store-pool `SET/SHOW search_path` reset contract.
 
-## Remaining migration inventory (not yet covered by this commit)
+## Static inventory status
 
-The following modules still contain direct destructive PostgreSQL fixture SQL
-and must not be described as fixture-safe until moved behind the central target:
+`test_postgresql_owned_family_safety.py` statically inventories every migrated PostgreSQL
+integration family (state-store, runtime ownership, ledger, CLI, rotation acceptance,
+compression coordination, Phase12 fault harness, SQLite import, and operations). It
+rejects direct dangerous `cursor.execute` DDL/DML and permits only documented reads and
+store-pool `search_path` lifecycle checks.
 
-- `test_postgresql_state_store_slice.py`
-- `test_postgresql_session_runtime_ownership.py`
-- `test_postgresql_delivery_ledger.py`
-- `test_postgresql_cli_session_store.py`
-- `test_postgresql_compression_coordination.py`
-- `test_postgresql_phase12_fault_harness.py`
-- `test_postgresql_state_store_sqlite_import.py`
-- `test_postgresql_state_store_operations.py`
+**Remaining unsafe PostgreSQL integration callsites: 0.**
 
-This is an explicit coverage boundary, not a compatibility fallback. Production
-routing and compression rotation behavior are unchanged.
+Production routing and compression rotation behavior are unchanged; the strict rotation
+adapter xfail remains a fail-closed boundary.

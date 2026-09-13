@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import time
@@ -24,6 +25,7 @@ from state_store import PostgreSQLStateStoreConfig
 
 _MANIFEST_VERSION = 1
 _TARGET_DATABASE_RE = re.compile(r"^hermes_state_restore_[0-9a-f]{32}$")
+_RESTORE_MARKER_TABLE = "__hermes_owned_restore_target"
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 _REQUIRED_TABLES = (
     "schema_migrations", "sessions", "messages", "system_prompts", "session_model_usage",
@@ -92,6 +94,7 @@ class PostgreSQLSandboxOperations:
         self._schema = schema
         self._delivery_schema = delivery_schema
         self._command_runner = command_runner
+        self._restore_target_tokens: dict[str, str] = {}
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - the state-store constructor proves this in integration
@@ -317,6 +320,13 @@ class PostgreSQLSandboxOperations:
         return archive_path, manifest
 
     def _drop_database(self, database: str) -> None:
+        token = self._restore_target_tokens.get(database)
+        if token is None:
+            raise PostgreSQLSandboxOperationsError("PostgreSQL restore teardown lacks an owned target marker")
+        with self._connect(database=database) as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT token FROM public.{_quote_identifier(_RESTORE_MARKER_TABLE)}")
+            if cursor.fetchall() != [(token,)]:
+                raise PostgreSQLSandboxOperationsError("PostgreSQL restore teardown marker changed or is absent")
         with self._connect(database="postgres") as connection:
             connection.autocommit = True
             with connection.cursor() as cursor:
@@ -341,7 +351,20 @@ class PostgreSQLSandboxOperations:
                         raise PostgreSQLSandboxOperationsError("PostgreSQL restore target already exists")
                     cursor.execute(f"CREATE DATABASE {_quote_identifier(database)}")
                     created = True
+            marker_token = secrets.token_urlsafe(32)
+            self._restore_target_tokens[database] = marker_token
             with self._connect(database=database) as target_connection, target_connection.cursor() as cursor:
+                cursor.execute(
+                    f"CREATE TABLE public.{_quote_identifier(_RESTORE_MARKER_TABLE)} "
+                    "(token text PRIMARY KEY, creator_scope text NOT NULL)"
+                )
+                cursor.execute(
+                    f"INSERT INTO public.{_quote_identifier(_RESTORE_MARKER_TABLE)} (token, creator_scope) VALUES (%s, %s)",
+                    (marker_token, f"restore:{database}"),
+                )
+                cursor.execute(f"SELECT token FROM public.{_quote_identifier(_RESTORE_MARKER_TABLE)}")
+                if cursor.fetchall() != [(marker_token,)]:
+                    raise PostgreSQLSandboxOperationsError("PostgreSQL restore target marker could not be validated")
                 for extension in manifest["tenant"]["required_extensions"]:
                     cursor.execute(f"CREATE EXTENSION IF NOT EXISTS {_quote_identifier(str(extension))}")
                 cursor.execute(f"CREATE SCHEMA {_quote_identifier(self._schema)}")
@@ -371,3 +394,4 @@ class PostgreSQLSandboxOperations:
         finally:
             if created and not keep_restored_target:
                 self._drop_database(database)
+            self._restore_target_tokens.pop(database, None)
