@@ -53,6 +53,8 @@ acceptance coverage and are not claims that those runtime consumers are activate
 
 Activation remains blocked outside that bounded CLI/inline-search path by these capabilities:
 
+- gateway session routing, peer identity, transcript persistence/deduplication,
+  rewind, recovery, auto-archive/housekeeping, and shutdown routing;
 - gateway delivery-ledger runtime/recovery routing (except the explicit,
   dependency-injected final-response consumer described below); and
 - async-delegation ledger routing.
@@ -60,6 +62,24 @@ Activation remains blocked outside that bounded CLI/inline-search path by these 
 The error names the missing capabilities and points here. This is deliberately
 not a claim that gateway, cron, TUI, ACP, async-delegation, or hosted-room
 runtime is PostgreSQL-ready.
+
+## Gateway session-routing fail-closed boundary
+
+`GatewayRunner` and `SessionStore` call the selected-backend activation gate
+before transport startup, route generation, session-directory creation, or a
+legacy SessionDB open. A selected PostgreSQL profile therefore raises the
+public `PostgreSQLRuntimeActivationError` with the canonical active profile
+scope and the missing `gateway-session-routing-transcript` contract. The
+error contains capability names and this evidence path, never a DSN.
+
+This is a safety boundary, **not** PostgreSQL gateway support. It intentionally
+does not construct a partial SessionDB adapter. In particular, selected
+PostgreSQL never returns an in-memory/generated gateway route and never writes
+`state.db`, `sessions.json`, JSONL transcript/spool data, or a routing cache as
+a fallback. The legacy SQLite JSON mirror/fallback remains available only when
+SQLite is selected. A root-created SQLite `SessionStore` also rechecks the
+active profile for every routing load/save boundary, so multiplexed selected
+profiles cannot route into the root database or mirror.
 
 ## Bounded injected final-delivery ledger consumer
 
@@ -92,6 +112,10 @@ resolver; it does not activate those unrelated runtime surfaces.
 - a selected named PostgreSQL sandbox profile derives its tenant schema, reports the supported contextual contract, opens no `state.db`, and has no fallback event;
 - the public inline `session_search` path reuses the selected CLI facade and serializes CJK discovery/grammar rejection, anchored scroll, read, browse, health, and explicit rebuild evidence without SQLite;
 - selected-PG `delegate_task(background=true)` reaches the async-dispatch boundary, rejects before its injected runner/external-child side effect, and opens no `state.db`;
+- direct `SessionStore` and normal `GatewayRunner` construction reject a selected
+  PostgreSQL root or named active profile before route generation, transport
+  activity, `state.db`, `sessions.json`, or JSONL output; a root SQLite store
+  is rechecked under an active selected named profile; and
 - default SQLite construction still creates/opens its configured `state.db`; and
 - the checked-in report contains no PostgreSQL DSN.
 

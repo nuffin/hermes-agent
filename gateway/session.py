@@ -766,6 +766,9 @@ class SessionStore(
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
     def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
+        # PostgreSQL has no complete gateway routing/transcript contract; reject
+        # before a constructor can retain an in-memory route for JSON persistence.
+        self._require_legacy_gateway_session_routing_runtime()
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}

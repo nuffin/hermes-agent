@@ -112,6 +112,8 @@ class SessionTranscriptMixin:
         store is NOT skipped: the write is queued and counted like any other failed append, so a
         dead/unopenable state.db escalates and spools instead of dropping turns silently
         (#114266)."""
+        from state_store_runtime_readiness import require_legacy_state_db_runtime
+        require_legacy_state_db_runtime()
         if skip_db:
             return
         with self._get_transcript_drain_lock():
@@ -488,6 +490,8 @@ class SessionTranscriptMixin:
         or there is no DB, False on failure — callers committing a destructive change on top
         (/compress repointing) must check it. ``reject_active_turn_lease`` is for user-initiated
         rewrites that do not own the cross-process turn lease."""
+        from state_store_runtime_readiness import require_legacy_state_db_runtime
+        require_legacy_state_db_runtime()
         db = self._db_for_session_id(session_id)
         if not db:
             return True
@@ -568,6 +572,8 @@ class SessionTranscriptMixin:
         is the gateway ``/retry`` guard: the selected turn must be a composite carrier whose live payload
         is losslessly replayable as text — that replay-policy ``ValueError`` propagates so /retry can
         explain why the carrier is unsafe."""
+        from state_store_runtime_readiness import require_legacy_state_db_runtime
+        require_legacy_state_db_runtime()
         db = self._db_for_session_id(session_id)
         if not db:
             return None
