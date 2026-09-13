@@ -1061,6 +1061,24 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         """Explicitly advertised durable capabilities; never infer from methods."""
         return ("atomic-compression-rotation-v1",)
 
+    def get_compression_publication_receipt(self, request_id: str) -> dict[str, Any] | None:
+        """Return the committed publication for one caller-owned request id.
+
+        This is the only recovery read for an indeterminate publish acknowledgement:
+        an absent row means the caller must not guess whether to replay, while a
+        present row is the durable parent/child fact that may be safely adopted.
+        """
+        if not request_id:
+            raise ValueError("compression publication receipt requires a request id")
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT request_id, parent_session_id, child_session_id, holder, fence, committed_at "
+                f"FROM {self._schema}.compression_rotation_receipts WHERE request_id=%s",
+                (request_id,),
+            )
+            receipt = cursor.fetchone()
+            return None if receipt is None else dict(receipt)
+
     def get_active_message_watermark(self, session_id: str) -> int:
         """Tenant-local high-water mark used to preserve a concurrent parent tail."""
         with self._connection() as connection, connection.cursor() as cursor:
@@ -1089,11 +1107,11 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         record_fields = MessageRecord.__dataclass_fields__
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             now = self._coordination_clock_and_lock(cursor, "compression_locks", parent_session_id)
-            cursor.execute(f"SELECT child_session_id FROM {self._schema}.compression_rotation_receipts WHERE request_id=%s FOR UPDATE", (receipt_id,))
+            cursor.execute(f"SELECT parent_session_id, child_session_id FROM {self._schema}.compression_rotation_receipts WHERE request_id=%s FOR UPDATE", (receipt_id,))
             receipt = cursor.fetchone()
             if receipt is not None:
-                if receipt["child_session_id"] != child_session_id:
-                    raise RuntimeError("compression receipt request id was reused for another child")
+                if receipt["parent_session_id"] != parent_session_id or receipt["child_session_id"] != child_session_id:
+                    raise RuntimeError("compression receipt request id was reused for another publication")
                 return str(receipt["child_session_id"])
             cursor.execute(f"SELECT holder, fence, expires_at FROM {self._schema}.compression_locks WHERE session_id=%s FOR UPDATE", (parent_session_id,))
             lease = cursor.fetchone()

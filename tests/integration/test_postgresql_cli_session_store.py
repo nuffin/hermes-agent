@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,8 @@ _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_t
 _CONFIG = {"state_store": {"backend": "postgresql", "postgresql": {
     "dsn_env": "HERMES_STATE_STORE_TEST_DSN", "connect_timeout_seconds": 5, "pool_max_size": 2,
 }}}
+
+pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
@@ -247,6 +250,163 @@ def test_public_agent_turn_rotates_selected_postgresql_with_real_compressor(pg_c
         child_messages = store.get_messages_as_conversation(child)
         assert any(row["content"] == "final deterministic answer" for row in child_messages)
         assert any("deterministic provider summary" in str(row["content"]) for row in child_messages)
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_public_agent_turn_recovers_lost_publish_ack_from_durable_receipt(pg_cli_home):
+    """A public retry-classification path adopts the one committed PG child."""
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    parent = "20260914_010203_pg_lost_ack_parent"
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"history {index}: " + ("evidence " * 500)}
+        for index in range(60)
+    ]
+    main_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content="lost acknowledgement recovered", reasoning_content=None, reasoning=None, tool_calls=None,
+    ), finish_reason="stop")], model="oracle/model", usage=None)
+    summary_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content="durable receipt summary"), finish_reason="stop")])
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.context_compressor.call_llm", return_value=summary_response),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=parent)
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = main_response
+        with patch("hermes_cli.config.load_config", return_value=_CONFIG):
+            store = agent._get_session_db_for_recall()
+        stores.append(store)
+        agent._ensure_db_session()
+        original_publish = store.publish_compression_child
+        request_ids = []
+        def commit_then_lose_ack(**kwargs):
+            request_ids.append(kwargs["request_id"])
+            original_publish(**kwargs)
+            raise ConnectionError("simulated lost acknowledgement after commit")
+        store.publish_compression_child = commit_then_lose_ack
+        agent.compression_in_place = False
+        agent.context_compressor.threshold_tokens = 1
+        agent.context_compressor.note_usage_less_response()
+        agent.max_compression_attempts = 1
+        result = agent.run_conversation("lost ack public input", conversation_history=history)
+        assert result["completed"] is True and len(request_ids) == 1
+        receipt = store.get_compression_publication_receipt(request_ids[0])
+        assert receipt is not None
+        assert receipt["parent_session_id"] == parent == store.get_session(receipt["child_session_id"])["parent_session_id"]
+        assert agent.session_id == receipt["child_session_id"]
+        with store._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) FROM {store._store._schema}.sessions WHERE parent_session_id=%s", (parent,))
+            assert cursor.fetchone()[0] == 1
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_public_provider_abort_reopens_selected_postgresql_without_receipt_replay(pg_cli_home):
+    """A public provider cancellation leaves the PG parent writable and retryable."""
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    parent = "20260914_010203_pg_provider_abort_parent"
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"abort history {index}: " + ("evidence " * 500)}
+        for index in range(60)
+    ]
+    main_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content="provider abort retry answer", reasoning_content=None, reasoning=None, tool_calls=None,
+    ), finish_reason="stop")], model="oracle/model", usage=None)
+    summary_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content="provider abort retry summary"), finish_reason="stop")])
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.context_compressor.call_llm", side_effect=[AuxiliaryExplicitCancellation(), summary_response]) as provider,
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=parent)
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = main_response
+        with patch("hermes_cli.config.load_config", return_value=_CONFIG):
+            store = agent._get_session_db_for_recall()
+        stores.append(store)
+        agent._ensure_db_session()
+        agent.compression_in_place = False
+        agent.context_compressor.threshold_tokens = 1
+        agent.context_compressor.note_usage_less_response()
+        agent.max_compression_attempts = 1
+        first = agent.run_conversation("abort public input", conversation_history=history)
+        assert first["completed"] is True
+        assert agent.session_id == parent
+        assert store.get_session(parent)["ended_at"] is None
+        assert store.get_compression_tip(parent) == parent
+        assert store.get_compression_publication_receipt("not-a-real-request") is None
+        reopened = _open(stores)
+        assert reopened.get_session(parent)["ended_at"] is None
+        agent._session_db = reopened
+        retry = agent.run_conversation("retry public input", conversation_history=history)
+        assert retry["completed"] is True
+        assert agent.session_id != parent
+        assert store.get_session(parent)["end_reason"] == "compression"
+        assert provider.call_count == 2
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_public_stale_owner_successor_rotates_selected_postgresql(pg_cli_home):
+    """A stale public owner cannot strand the parent; the successor publishes once."""
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    parent = "20260914_010203_pg_stale_owner_parent"
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"stale history {index}: " + ("evidence " * 500)}
+        for index in range(60)
+    ]
+    main_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content="successor answer", reasoning_content=None, reasoning=None, tool_calls=None,
+    ), finish_reason="stop")], model="oracle/model", usage=None)
+    summary_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content="successor server-clock summary"), finish_reason="stop")])
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.context_compressor.call_llm", return_value=summary_response),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=parent)
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = main_response
+        with patch("hermes_cli.config.load_config", return_value=_CONFIG):
+            store = agent._get_session_db_for_recall()
+        stores.append(store)
+        agent._ensure_db_session()
+        assert store.try_acquire_compression_lock(parent, "stale-public-owner", ttl_seconds=0.1)
+        time.sleep(0.2)
+        agent.compression_in_place = False
+        agent.context_compressor.threshold_tokens = 1
+        agent.context_compressor.note_usage_less_response()
+        agent.max_compression_attempts = 1
+        result = agent.run_conversation("successor public input", conversation_history=history)
+        assert result["completed"] is True and agent.session_id != parent
+        child = agent.session_id
+        assert store.get_session(parent)["end_reason"] == "compression"
+        assert store.get_compression_tip(parent) == child
+        assert store.get_conversation_root(child) == parent
+        with store._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT holder, fence FROM {store._store._schema}.compression_rotation_receipts WHERE parent_session_id=%s", (parent,))
+            holder, fence = cursor.fetchone()
+        assert holder != "stale-public-owner" and fence > 1
     assert opens == []
     assert not (home / "state.db").exists()
 
