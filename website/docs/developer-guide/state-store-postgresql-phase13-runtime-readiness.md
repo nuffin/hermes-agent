@@ -50,8 +50,31 @@ runtime is PostgreSQL-ready.
 - AST inventory retains raw unported runtime openers;
 - a legacy SQLite open is trapped with exact caller information; SQLite test isolation may materialize the fixture before the trapped native connect;
 - a selected named PostgreSQL sandbox profile derives its tenant schema, reports missing capabilities, opens no `state.db`, and has no fallback event;
+- selected-PG `delegate_task(background=true)` reaches the async-dispatch boundary, rejects before its injected runner/external-child side effect, and opens no `state.db`;
 - default SQLite construction still creates/opens its configured `state.db`; and
 - the checked-in report contains no PostgreSQL DSN.
+
+## Async-delegation boundary
+
+The current durable `async_delegations` row is not a portable job/execution
+protocol. It records a local daemon runner's routing metadata and completion
+for replay into the originating process's in-memory completion queue. The
+runner closure, future/executor state, interrupt callback, progress monitor,
+process ownership, and queue admission/acknowledgement boundary are
+process-local and cannot be reconstructed from the row. A PostgreSQL table
+that accepts dispatches before it carries that complete protocol would claim
+recovery it cannot provide and could either duplicate or lose an external
+child execution.
+
+Accordingly, `tools.async_delegation._persist_dispatch()` retains the legacy
+SQLite adapter only, and its mandatory selected-backend gate raises
+`PostgreSQLRuntimeActivationError` before directory creation, SQLite open,
+executor submission, or runner invocation. This is direct-test evidence of a
+safe failure, not PostgreSQL async-delegation routing. Porting may proceed only
+with a backend-neutral ledger plus end-to-end fenced claim, cancellation,
+completion, recovery, and completion-queue delivery contracts across every
+caller; until then the selected PostgreSQL sandbox intentionally refuses the
+operation.
 
 `tests/integration/test_postgresql_cli_session_store.py` exercises a fresh
 isolated `HERMES_HOME` against loopback PostgreSQL: session creation, ordered
