@@ -7,6 +7,7 @@ from threading import Barrier
 import pytest
 from gateway import delivery_ledger as sqlite
 from gateway.delivery_ledger_postgresql import DeliveryLedgerPostgreSQLConfig, PostgreSQLDeliveryLedger
+from gateway.delivery_ledger_adapter import open_configured_delivery_ledger
 from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
@@ -80,3 +81,57 @@ def test_retention_prune_and_adapter_profile_is_not_schema(ledger):
     claim=ledger.mark_attempting(_record(ledger)); assert claim and ledger.mark_delivered(claim)
     ledger.prune(); assert ledger.debug_rows()[0]['obligation_id']=='o1'
     assert ledger._schema == target.schema
+
+
+@pytest.mark.asyncio
+async def test_injected_pg_final_consumer_never_opens_state_db_or_sends_without_claim(
+    postgresql_delivery_target: OwnedPostgreSQLTestTarget, monkeypatch, tmp_path,
+):
+    """This is intentionally the sole PG-routed gateway consumer, not gateway activation."""
+    import sqlite3
+    from unittest.mock import AsyncMock
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    class Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False): return True
+        async def disconnect(self): return None
+        async def get_chat_info(self, chat_id): return {}
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True, message_id="m")
+
+    config = {"state_store": {"backend": "postgresql", "postgresql": {
+        "dsn_env": "OWNED_DELIVERY_DSN", "connect_timeout_seconds": 3, "pool_max_size": 2,
+    }}}
+    ledger = open_configured_delivery_ledger(
+        config, secret_lookup=lambda name: postgresql_delivery_target.dsn,
+        schema=postgresql_delivery_target.schema,
+    )
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.SLACK)
+    adapter.delivery_ledger = ledger
+    adapter.send = AsyncMock(wraps=adapter.send)
+    event = MessageEvent(text="ask", message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="channel"), message_id="m1")
+    try:
+        monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: (_ for _ in ()).throw(AssertionError("SQLite opened")))
+        receipt = await adapter._record_delivery_obligation(event, "agent:main:slack:channel:C1", "answer", adapter, False)
+        assert receipt is not None
+        assert await adapter._finalize_delivery_obligation(receipt, SendResult(success=True), event, adapter) is None
+        assert adapter.send.await_count == 0
+        assert not (tmp_path / "state.db").exists()
+        assert ledger.debug_rows()[0]["state"] == "delivered"
+        class DeniedLedger:
+            def record_obligation(self, **kwargs): return object()
+            def mark_attempting(self, receipt): return None
+            def mark_delivered(self, receipt): raise AssertionError("no ack without claim")
+            def mark_failed(self, receipt, error=""): raise AssertionError("no failure without claim")
+            def release_runtime_claim(self, receipt, error=""): return False
+        adapter.delivery_ledger = DeniedLedger()
+        adapter._send_with_retry = AsyncMock()
+        denied, _ = await adapter.send_final_ledgered(event, "agent:main:slack:channel:C1", "denied", {}, reply_to=None)
+        assert denied.error == "delivery_ledger_claim_denied"
+        adapter._send_with_retry.assert_not_awaited()
+    finally:
+        ledger.close()
