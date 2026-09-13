@@ -82,7 +82,7 @@ single and batch message persistence, prompt snapshot, end, a new-store resume/r
 lookup, unsupported-call refusal, and the file-open trap. Its deterministic offline-agent
 harness constructs the real `AIAgent` with local mocks only, proving lazy selected-PG
 acquisition, first-turn persistence, prompt/history restoration, end/reopen, and
-active lease-holder rejection before a write. It also proves the default SQLite factory path is unchanged.
+- active lease-holder rejection before a write. The v19 coordination slice additionally persists activity labels, cooldown snapshot/restore, anti-thrash counters, and fenced server-clock leases; `tests/integration/test_postgresql_compression_coordination.py` differentially exercises that non-destructive contract against SQLite. Destructive parent/child rotation remains rejected before mutation because atomic publication is not yet ported. It also proves the default SQLite factory path is unchanged.
 
 Run the focused gate with:
 

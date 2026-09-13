@@ -146,6 +146,10 @@ def test_agent_lazy_recall_acquisition_persists_and_resumes_without_sqlite(pg_cl
         stores.append(store)
         agent._ensure_db_session()
         assert agent._session_db_created
+        agent._touch_activity("selected-pg fake-agent preflight", force_persist=True)
+        assert store.get_session(session_id)["last_activity_description"] == "selected-pg fake-agent preflight"
+        agent._reset_activity_labels_after_turn()
+        assert store.get_session(session_id)["last_activity_description"] == ""
         prompt = store.get_session(session_id)["system_prompt"]
         assert prompt == agent._cached_system_prompt
 
