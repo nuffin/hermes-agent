@@ -32,13 +32,14 @@ unimplemented SessionDB methods with a capability error before any SQLite
 fallback. The legacy SQLite CLI path continues to construct `SessionDB`.
 
 The adapter-only `atomic-compression-rotation-v1` contract is separately proven
-by the PG18 rotation acceptance harness. The real public `AIAgent` route is
-verified only for deterministic offline compression publication: selected-PG
-lazy acquisition → `run_conversation()` → `ContextCompressor` → fenced
-parent/child publication, with a trapped `state.db` opener. This is narrower
-than the adapter harness; provider failure/recovery, delivery retries, and
-runtime-owner takeover retain their direct-adapter acceptance coverage and are
-not claims that unrelated runtime consumers are activated.
+by the PG18 rotation acceptance harness. The real public `AIAgent` route is verified with deterministic offline providers for
+selected-PG lazy acquisition → `run_conversation()` → `ContextCompressor` →
+fenced parent/child publication, a post-commit lost-acknowledgement receipt
+adoption, provider-cancellation reopen/retry with no receipt replay, and an
+expired-owner server-clock successor rotation. Each public route runs under a
+trapped `state.db` opener. This remains narrower than the adapter harness:
+delivery retries and unrelated runtime-owner consumers retain their direct-adapter
+acceptance coverage and are not claims that those runtime consumers are activated.
 
 Activation remains blocked outside that bounded CLI path by these capabilities:
 
@@ -87,11 +88,14 @@ operation.
 
 `tests/integration/test_postgresql_cli_session_store.py` exercises a fresh
 isolated `HERMES_HOME` against loopback PostgreSQL: session creation, ordered
-single and batch message persistence, prompt snapshot, end, a new-store resume/reopen, session
-lookup, unsupported-call refusal, and the file-open trap. Its deterministic offline-agent
-harness constructs the real `AIAgent` with local mocks only, proving lazy selected-PG
-acquisition, first-turn persistence, prompt/history restoration, end/reopen, and
-- active lease-holder rejection before a write. The v19 coordination slice additionally persists activity labels, cooldown snapshot/restore, anti-thrash counters, and fenced server-clock leases; migration v20 adds the adapter-owned atomic parent/child compression publication receipt. `tests/integration/test_postgresql_compression_rotation_acceptance.py` exercises its fenced/idempotent handoff without SQLite fallback. This does not make the gateway, cron, TUI, ACP, hosted, or async paths PostgreSQL-ready; it also proves the default SQLite factory path is unchanged.
+single and batch message persistence, prompt snapshot, end, a new-store
+resume/reopen, session lookup, unsupported-call refusal, and the file-open
+trap. Its deterministic offline-agent harness constructs the real `AIAgent`
+with local mocks only, proving lazy selected-PG acquisition, first-turn
+persistence, public compression publication, lost-ack durable-receipt adoption,
+provider-abort reopen/retry without replay, stale-owner successor rotation,
+prompt/history restoration, end/reopen, and active lease-holder rejection
+before a write. The v19 coordination slice additionally persists activity labels, cooldown snapshot/restore, anti-thrash counters, and fenced server-clock leases; migration v20 adds the adapter-owned atomic parent/child compression publication receipt. `tests/integration/test_postgresql_compression_rotation_acceptance.py` exercises its fenced/idempotent handoff without SQLite fallback. This does not make the gateway, cron, TUI, ACP, hosted, or async paths PostgreSQL-ready; it also proves the default SQLite factory path is unchanged.
 
 Run the focused gate with:
 
