@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -114,6 +115,61 @@ def test_cli_delete_contract_removes_postgresql_session_without_sqlite(pg_cli_ho
         store.append_messages_batch("delete-pg-cli", [{"role": "user", "content": "remove me"}])
         assert store.delete_session("delete-pg-cli", sessions_dir=home / "sessions")
         assert store.get_session("delete-pg-cli") is None
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_agent_lazy_recall_acquisition_persists_and_resumes_without_sqlite(pg_cli_home):
+    """The real AIAgent lifecycle selects the CLI PG facade, not the SQLite registry."""
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    session_id = "20260914_010203_pg_agent"
+    tool_defs = [{"type": "function", "function": {
+        "name": "local_test", "description": "offline test tool",
+        "parameters": {"type": "object", "properties": {}},
+    }}]
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=tool_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id,
+        )
+        agent.client = MagicMock()
+        with patch("hermes_cli.config.load_config", return_value=_CONFIG):
+            store = agent._get_session_db_for_recall()
+        assert store.__class__.__name__ == "PostgreSQLCLISessionStore"
+        stores.append(store)
+        agent._ensure_db_session()
+        assert agent._session_db_created
+        prompt = store.get_session(session_id)["system_prompt"]
+        assert prompt == agent._cached_system_prompt
+
+        messages = [
+            {"role": "user", "content": "fresh agent turn"},
+            {"role": "assistant", "content": "persisted agent answer", "finish_reason": "stop"},
+        ]
+        assert agent._flush_messages_to_session_db(messages, []) is True
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id)] == [
+            "fresh agent turn", "persisted agent answer",
+        ]
+        with pytest.raises(PostgreSQLCLISessionCapabilityError, match="does not implement compression or turn lease"):
+            store.append_messages_batch(
+                session_id, [{"role": "user", "content": "must not write"}], turn_lease_holder="active-lease")
+        assert len(store._store.get_message_records(session_id)) == 2
+        store.end_session(session_id, "agent_close")
+        store.close()
+
+        resumed = _open(stores)
+        assert resumed.get_session(session_id)["system_prompt"] == prompt
+        restored, _display = resumed.get_resume_conversations(session_id)
+        assert [row["content"] for row in restored] == ["fresh agent turn", "persisted agent answer"]
+        resumed.reopen_session(session_id)
+        assert resumed.get_session(session_id)["ended_at"] is None
     assert opens == []
     assert not (home / "state.db").exists()
 
