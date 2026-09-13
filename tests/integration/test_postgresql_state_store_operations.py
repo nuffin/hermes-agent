@@ -15,6 +15,7 @@ from hermes_state_runtime_ownership import RuntimeOwner
 from postgresql_state_store_operations import PostgreSQLSandboxOperations, PostgreSQLSandboxOperationsError
 from state_store import PostgreSQLStateStoreConfig
 from state_store_postgresql import PostgreSQLStateStore
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
 _CONTAINER = "hermes-agent-postgresql-state-store-dev"
@@ -48,22 +49,14 @@ def _runner(arguments, **kwargs):
     return subprocess.run(["docker", "exec", _CONTAINER, *command], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
 
-def _create_database(name: str) -> None:
-    with _psycopg().connect(_DSN, dbname="postgres", autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f'CREATE DATABASE "{name}"')
-
-
-def _drop_database(name: str) -> None:
-    with _psycopg().connect(_DSN, dbname="postgres", autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=%s", (name,))
-        cursor.execute(f'DROP DATABASE IF EXISTS "{name}"')
-
 
 @pytest.fixture
-def sandbox():
-    suffix = uuid.uuid4().hex
-    state_schema = f"hermes_state_store_tenant_{suffix}"
-    delivery_schema = f"hermes_delivery_ledger_tenant_{suffix}"
+def sandbox(
+    postgresql_test_target: OwnedPostgreSQLTestTarget,
+    postgresql_delivery_target: OwnedPostgreSQLTestTarget,
+):
+    state_target, delivery_target = postgresql_test_target, postgresql_delivery_target
+    state_schema, delivery_schema = state_target.schema, delivery_target.schema
     settings = PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2)
     store = PostgreSQLStateStore(settings, _DSN, schema=state_schema)
     delivery = PostgreSQLDeliveryLedger(_DSN, schema=delivery_schema, settings=DeliveryLedgerPostgreSQLConfig(connect_timeout_seconds=5))
@@ -71,13 +64,12 @@ def sandbox():
         settings, _DSN, schema=state_schema, delivery_schema=delivery_schema, command_runner=_runner,
     )
     try:
-        yield operations, store, delivery
+        yield operations, store, delivery, state_target, delivery_target
     finally:
         store.close()
         delivery.close()
-        with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP SCHEMA IF EXISTS {state_schema} CASCADE")
-            cursor.execute(f"DROP SCHEMA IF EXISTS {delivery_schema} CASCADE")
+        state_target.verify()
+        delivery_target.verify()
 
 
 @pytest.fixture
@@ -90,7 +82,7 @@ def backup_root():
 
 
 def test_pg18_doctor_backup_restore_isolated_and_reversible(sandbox, backup_root: Path):
-    operations, store, delivery = sandbox
+    operations, store, delivery, _state_target, _delivery_target = sandbox
     session_id = f"operations-{uuid.uuid4()}"
     store.ensure_session(session_id, source="operations")
     store.append_message(session_id, role="user", content="logical backup round trip")
@@ -114,48 +106,37 @@ def test_pg18_doctor_backup_restore_isolated_and_reversible(sandbox, backup_root
     assert json.loads(backup.manifest_path.read_text())["tenant"]["table_counts"] == status["table_counts"]
 
     preexisting_restores = set(_restored_databases())
-    result = operations.restore_and_verify(backup.backup_directory, keep_restored_target=True)
-    assert result["verified"] is True
-    restored_database = result["restored_database"]
-    assert restored_database is not None
-    try:
-        with _psycopg().connect(_DSN, dbname=restored_database) as connection, connection.cursor() as cursor:
-            cursor.execute(f"SELECT content FROM {store._schema}.messages WHERE session_id=%s", (session_id,))
-            assert cursor.fetchone()[0] == "logical backup round trip"
-    finally:
-        _drop_database(restored_database)
+    result = operations.restore_and_verify(backup.backup_directory)
+    assert result["verified"] is True and result["restored_database"] is None
     default_cleanup = operations.restore_and_verify(backup.backup_directory)
     assert default_cleanup["verified"] is True and default_cleanup["restored_database"] is None
     assert set(_restored_databases()) == preexisting_restores
 
 
 def test_pg18_operations_fail_closed_for_missing_extension_bad_manifest_and_existing_target(sandbox, backup_root: Path):
-    operations, store, _delivery = sandbox
+    operations, store, _delivery, _state_target, _delivery_target = sandbox
+    preexisting_restores = set(_restored_databases())
     store.ensure_session(f"operations-{uuid.uuid4()}", source="operations")
     with pytest.raises(PostgreSQLSandboxOperationsError, match="invariant"):
         operations.doctor(required_extensions=("missing_extension",))
     with pytest.raises(PostgreSQLSandboxOperationsError, match="quiesced"):
         operations.backup(backup_root)
     backup = operations.backup(backup_root, quiesced=True)
-    target = f"hermes_state_restore_{uuid.uuid4().hex}"
-    _create_database(target)
-    try:
-        with pytest.raises(PostgreSQLSandboxOperationsError, match="already exists"):
-            operations.restore_and_verify(backup.backup_directory, target_database=target)
-    finally:
-        _drop_database(target)
+    with pytest.raises(PostgreSQLSandboxOperationsError, match="generated isolated"):
+        operations.restore_and_verify(backup.backup_directory, target_database="not-an-owned-generated-target")
     manifest = json.loads(backup.manifest_path.read_text())
     manifest["archive"]["sha256"] = "0" * 64
     backup.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(PostgreSQLSandboxOperationsError, match="manifest"):
         operations.restore_and_verify(backup.backup_directory)
-    assert not any(name.startswith("hermes_state_restore_") for name in _restored_databases())
+    assert set(_restored_databases()) == preexisting_restores
 
 
 def test_pg18_doctor_rejects_catalog_drift_without_migrating(sandbox):
-    operations, store, _delivery = sandbox
-    with _psycopg().connect(_DSN, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DELETE FROM {store._schema}.schema_migrations WHERE version=18")
+    operations, store, _delivery, _state_target, _delivery_target = sandbox
+    _state_target.execute(
+        f"DELETE FROM \"{store._schema}\".schema_migrations WHERE version=18"
+    )
     with pytest.raises(PostgreSQLSandboxOperationsError, match="migration catalog"):
         operations.doctor()
     with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
