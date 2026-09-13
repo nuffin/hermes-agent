@@ -19,6 +19,7 @@ from state_store import (
     resolve_contextual_session_search_store,
 )
 from hermes_state import SessionDB
+from tools.session_search_tool import session_search
 from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 
@@ -894,6 +895,10 @@ def test_contextual_profile_resolver_mixes_root_sqlite_named_postgresql_and_name
         try:
             assert root_store.search_messages("rootonlycontext", fields=("session_id",)) == [{"session_id": "root-context"}]
             assert named_pg_store.search_messages("pgonlycontext", fields=("session_id",)) == [{"session_id": "pg-context"}]
+            public_named_pg = json.loads(session_search(query="pgonlycontext", profile="pg-reader"))
+            assert public_named_pg["success"] is True
+            assert [row["session_id"] for row in public_named_pg["results"]] == ["pg-context"]
+            assert public_named_pg["search_index"]["backend"] == "postgresql"
             assert named_sqlite_store.search_messages("sqliteonlycontext", fields=("session_id",)) == [{"session_id": "sqlite-context"}]
             assert named_pg_store.search_messages("rootonlycontext", fields=("session_id",)) == []
             assert named_pg_store.search_messages("sqliteonlycontext", fields=("session_id",)) == []

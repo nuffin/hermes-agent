@@ -23,7 +23,17 @@ A selected PostgreSQL profile reports its canonical profile home/name and derive
 - narrow StateStore records; and
 - profile-derived PostgreSQL tenant schema selection; and
 - CLI fresh/resume acquisition through `cli_session_store.open_cli_session_store()`; and
-- bounded `AIAgent` lazy recall acquisition and append-only persistence through that same facade.
+- bounded `AIAgent` lazy recall acquisition and append-only persistence through that same facade; and
+- the public inline `session_search` consumer when that facade is injected.
+
+The inline consumer reuses the already selected tenant-bound facade; it does not
+open `state.db`, reacquire an ambient DSN, or select a second tenant. Its discovery
+response exposes PostgreSQL generated-search health, and its search/read/scroll/
+browse shapes use the complete contextual contract. Explicit `profile=` searches
+remain resolver-owned read-only acquisitions: root/default and named profiles use
+their own canonical config, secret scope, and trusted tenant derivation. Repair
+(`rebuild_search_index()`) is an explicit store-maintenance operation, not a tool
+request shape.
 
 The CLI facade persists a real session row, single-message and batch structured
 messages (including identity, order, timestamps, and null content), system-prompt
@@ -41,9 +51,8 @@ trapped `state.db` opener. This remains narrower than the adapter harness:
 delivery retries and unrelated runtime-owner consumers retain their direct-adapter
 acceptance coverage and are not claims that those runtime consumers are activated.
 
-Activation remains blocked outside that bounded CLI path by these capabilities:
+Activation remains blocked outside that bounded CLI/inline-search path by these capabilities:
 
-- contextual session search/lineage contract;
 - gateway delivery-ledger runtime/recovery routing (except the explicit,
   dependency-injected final-response consumer described below); and
 - async-delegation ledger routing.
@@ -67,8 +76,10 @@ default when no ledger is injected.
 schema and traps `sqlite3.connect`: final obligation/claim/ack completes with
 no `state.db` open and a fake sender is never invoked by the ledger bracket.
 This is consumer/ledger evidence only. Gateway startup recovery, session
-persistence/routing, cron, TUI/API, ACP, hosted rooms, async delegation, and
-contextual search remain unported and fail closed under selected PostgreSQL.
+persistence/routing, cron, TUI/API, ACP, hosted rooms, and async delegation remain
+unported and fail closed under selected PostgreSQL. Contextual `session_search`
+is limited to the verified CLI/inline consumer and explicit read-only profile
+resolver; it does not activate those unrelated runtime surfaces.
 
 ## Sandbox fixture and proof
 
@@ -78,7 +89,8 @@ contextual search remain unported and fail closed under selected PostgreSQL.
 
 - AST inventory retains raw unported runtime openers;
 - a legacy SQLite open is trapped with exact caller information; SQLite test isolation may materialize the fixture before the trapped native connect;
-- a selected named PostgreSQL sandbox profile derives its tenant schema, reports missing capabilities, opens no `state.db`, and has no fallback event;
+- a selected named PostgreSQL sandbox profile derives its tenant schema, reports the supported contextual contract, opens no `state.db`, and has no fallback event;
+- the public inline `session_search` path reuses the selected CLI facade and serializes CJK discovery/grammar rejection, anchored scroll, read, browse, health, and explicit rebuild evidence without SQLite;
 - selected-PG `delegate_task(background=true)` reaches the async-dispatch boundary, rejects before its injected runner/external-child side effect, and opens no `state.db`;
 - default SQLite construction still creates/opens its configured `state.db`; and
 - the checked-in report contains no PostgreSQL DSN.

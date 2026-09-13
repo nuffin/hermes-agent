@@ -607,6 +607,15 @@ def contextual_session_search_store(session_db=None, *, db_path: Path | None = N
     implementation; returning it here would expose partial histories and break
     lineage/compaction semantics.
     """
+    # AIAgent supplies its selected PostgreSQL CLI facade to the inline public
+    # tool.  Identify it from the backend-owned health payload, then admit the
+    # same complete read-only contract rather than wrapping it as SQLite.
+    if backend == "sqlite" and session_db is not None:
+        search_status = getattr(session_db, "search_index_status", None)
+        if callable(search_status):
+            status = search_status()
+            if isinstance(status, Mapping) and status.get("backend") == "postgresql":
+                backend = "postgresql"
     if backend == "postgresql":
         required = (
             "get_session", "get_messages", "get_messages_around", "get_anchored_view",
@@ -715,6 +724,12 @@ def resolve_contextual_session_search_store(
     target_profile, home = _canonical_contextual_profile(profile)
     if target_profile is not None and (session_db is not None or session_db_factory is not None):
         raise ValueError("an explicit contextual target profile cannot use an injected session database")
+    # The current agent already acquired its selected store through the CLI
+    # factory.  Preserve that tenant/secret decision for the inline tool rather
+    # than resolving configuration a second time; explicit named targets remain
+    # resolver-owned below and cannot inject a caller handle.
+    if target_profile is None and session_db is not None:
+        return contextual_session_search_store(session_db, read_only=read_only)
     config = _profile_state_store_config(home)
     resolved = resolve_state_store_config(
         config,

@@ -166,6 +166,17 @@ class PostgreSQLCLISessionStore:
     def set_session_title(self, session_id: str, title: str): return self._store.set_session_title(session_id, title)
     def get_session_by_title(self, title: str): return self._store.get_session_by_title(title)
     def resolve_session_by_title(self, title: str): return self._store.resolve_session_by_title(title)
+    # The inline public session_search consumer receives this CLI facade from
+    # AIAgent.  These are the complete read-only contextual primitives already
+    # implemented by its selected PostgreSQL store, not SQLite emulation.
+    def get_messages(self, session_id: str): return self._store.get_messages(session_id)
+    def get_messages_around(self, session_id: str, around_message_id: int, *, window: int = 5): return self._store.get_messages_around(session_id, around_message_id, window=window)
+    def get_anchored_view(self, session_id: str, around_message_id: int, *, window: int, bookend: int): return self._store.get_anchored_view(session_id, around_message_id, window=window, bookend=bookend)
+    def get_message_storage_state(self, message_id: int): return self._store.get_message_storage_state(message_id)
+    def search_messages(self, *args: Any, **kwargs: Any): return self._store.search_messages(*args, **kwargs)
+    def list_recent_sessions_bounded(self, *, limit: int, exclude_sources: list[str], timeout_seconds: float): return self._store.list_recent_sessions_bounded(limit=limit, exclude_sources=exclude_sources, timeout_seconds=timeout_seconds)
+    def search_index_status(self): return self._store.search_index_status()
+    def rebuild_search_index(self): return self._store.rebuild_search_index()
     def get_next_title_in_lineage(self, title: str): return self._store.get_next_title_in_lineage(title)
     def update_session_billing_route(self, session_id: str, **kwargs: Any): return self._store.update_session_billing_route(session_id, **kwargs)
     def queue_token_counts(self, session_id: str, **kwargs: Any): return self._store.queue_token_counts(session_id, **kwargs)
