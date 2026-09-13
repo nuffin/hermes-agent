@@ -31,6 +31,15 @@ snapshot, end/reopen transition, and bounded recent-session lookup. It rejects
 unimplemented SessionDB methods with a capability error before any SQLite
 fallback. The legacy SQLite CLI path continues to construct `SessionDB`.
 
+The adapter-only `atomic-compression-rotation-v1` contract is separately proven
+by the PG18 rotation acceptance harness. The real public `AIAgent` route is
+verified only for deterministic offline compression publication: selected-PG
+lazy acquisition → `run_conversation()` → `ContextCompressor` → fenced
+parent/child publication, with a trapped `state.db` opener. This is narrower
+than the adapter harness; provider failure/recovery, delivery retries, and
+runtime-owner takeover retain their direct-adapter acceptance coverage and are
+not claims that unrelated runtime consumers are activated.
+
 Activation remains blocked outside that bounded CLI path by these capabilities:
 
 - contextual session search/lineage contract;
@@ -87,7 +96,7 @@ acquisition, first-turn persistence, prompt/history restoration, end/reopen, and
 Run the focused gate with:
 
 ```bash
-scripts/run_tests.sh -m integration tests/integration/test_postgresql_cli_session_store.py; scripts/run_tests.sh tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
+scripts/run_tests.sh -o "addopts=" tests/integration/test_postgresql_cli_session_store.py; scripts/run_tests.sh tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
 ```
 
 ## Remaining work
