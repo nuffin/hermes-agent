@@ -2,7 +2,7 @@
 
 ## Status and boundary
 
-This document defines an **additive SQLite compatibility foundation**. It is not selected by a live runtime, does not implement PostgreSQL or Redis, and does not authorize hosted-room retries. Existing `session_turn_leases` remains the local runtime path.
+This document defines an **additive SQLite compatibility foundation** and a **direct-test-only PostgreSQL 18 adapter**. Neither is selected by a live runtime, neither authorizes Redis, and neither authorizes hosted-room retries. Existing `session_turn_leases` remains the local runtime path.
 
 A future consumer may route to this protocol only when it carries the exact ownership receipt through admission, transcript publication, finalization, and every external-effect boundary.
 
@@ -31,10 +31,21 @@ SQLite stores compatibility evidence using its transaction and local clock. Post
 
 Browser/CUA, approval waits, and other process-local capabilities are explicitly excluded from handoff. They must fail closed on destination recovery.
 
-## Required PostgreSQL completion plan
+## PostgreSQL 18 direct-test evidence
+
+`PostgreSQLStateStore` exposes the same direct ownership methods through the existing explicit StateStore factory, but no runtime consumer calls them. Migration 18 creates the tenant-local owner/turn catalog under the existing per-tenant migration advisory lock. Ownership operations additionally take a transaction-scoped advisory lock keyed by trusted tenant schema, namespace, and session, then read `clock_timestamp()` on the server before applying the fence-guarded transition.
+
+The PG18 direct suite covers two independent adapter instances contending on an absent row, same-owner restart, abandoned-owner expiry takeover, `running → indeterminate`, stale renew/release/begin/settle rejection, receipt-required explicit settlement, terminal duplicate-payload rejection, namespace isolation, release fence preservation, pooled `search_path` reset, migration/catalog drift rejection, and injected transaction rollback recovery. It deliberately does not alter SQLite behavior.
+
+## Remaining local PostgreSQL sandbox / runtime work
+
+1. Define and implement a backend-neutral consumer that carries the exact receipt through admission, transcript publication, finalization, and every external-effect acknowledgement.
+2. Prove that complete vertical slice in a local PG18 sandbox, including destination startup/recovery and all process-local capability fail-closed paths.
+3. Produce a separately authorized runtime selection, import/rollback, and operational cutover plan. Do not introduce Redis authority, fallback, or hosted-room retry.
+
+## Required runtime completion plan
 
 1. Add a backend-neutral protocol/factory and migrate the SQLite implementation plus one complete consumer vertical slice.
-2. Implement PostgreSQL schema/catalog validation and server-time fenced CAS. Every durable transcript, compaction, finalization, and acknowledgement write must require the receipt.
-3. Add differential SQLite/PG tests for contention, expiry takeover, stale fences, duplicate payload conflicts, crash/SIGKILL turns, namespace isolation, and receipt-backed external-effect resolution.
-4. Add process-local capability rejection and no-retry evidence for browser/CUA and uncertain effects.
-5. Only after those tests and a separately authorized cutover plan may runtime selection be considered. Redis signals, live configuration, and hosted-room work remain outside this protocol.
+2. Require the PostgreSQL receipt on every durable transcript, compaction, finalization, and acknowledgement write in that consumer.
+3. Add end-to-end recovery evidence for all external-effect boundaries and process-local capability rejection.
+4. Only after those tests and a separately authorized cutover plan may runtime selection be considered. Redis signals, live configuration, and hosted-room work remain outside this protocol.
