@@ -83,6 +83,8 @@ def test_selected_postgresql_profile_fails_before_state_db_open_and_reports_tena
     assert report.profile_name == "pg-sandbox"
     assert report.tenant_schema and report.tenant_schema.startswith("hermes_state_store_tenant_")
     assert "cli-fresh-resume-session-contract" in report.supported_capabilities
+    assert "contextual-session-search-contract" in report.supported_capabilities
+    assert "contextual-session-search-contract" not in report.missing_capabilities
     assert report.raw_state_db_openers
     assert events == []
     assert not (profile_home / "state.db").exists()

@@ -215,9 +215,9 @@ def inspect_runtime_activation(
         supported_capabilities=(
             "narrow-state-store", "profile-derived-tenant-schema",
             "cli-fresh-resume-session-contract",
+            "contextual-session-search-contract",
         ),
         missing_capabilities=(
-            "contextual-session-search-contract",
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
         ),
