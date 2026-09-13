@@ -52,6 +52,42 @@ class PostgreSQLCLISessionStore:
 
     ensure_session = create_session
 
+    def append_message(
+        self, session_id: str, role: str, content: Any = None, tool_name: str | None = None,
+        tool_calls: Any = None, tool_call_id: str | None = None, token_count: int | None = None,
+        finish_reason: str | None = None, reasoning: str | None = None,
+        reasoning_content: str | None = None, reasoning_details: Any = None,
+        codex_reasoning_items: Any = None, codex_message_items: Any = None,
+        platform_message_id: str | None = None, observed: bool = False,
+        effect_disposition: str | None = None, _compressed_summary: bool = False,
+        timestamp: Any = None, api_content: str | None = None,
+        display_kind: str | None = None, display_metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> int:
+        """Persist the SessionDB-compatible single-message CLI surface.
+
+        The facade accepts only fields representable by ``MessageRecord``.  In
+        particular, SQLite-specific write-lock controls are rejected before a
+        database write rather than being silently ignored or falling back.
+        """
+        if kwargs:
+            raise PostgreSQLCLISessionCapabilityError(
+                "PostgreSQL CLI persistence does not support single-message controls: "
+                + ", ".join(sorted(kwargs)))
+        return self._store.append_message_record(session_id, MessageRecord(
+            role=role, content=content, tool_name=tool_name, tool_calls=tool_calls,
+            tool_call_id=tool_call_id, token_count=token_count,
+            finish_reason=finish_reason, reasoning=reasoning,
+            reasoning_content=reasoning_content, reasoning_details=reasoning_details,
+            codex_reasoning_items=codex_reasoning_items,
+            codex_message_items=codex_message_items,
+            platform_message_id=platform_message_id, observed=observed,
+            effect_disposition=effect_disposition,
+            _compressed_summary=_compressed_summary, timestamp=timestamp,
+            api_content=api_content, display_kind=display_kind,
+            display_metadata=display_metadata,
+        ))
+
     def append_messages_batch(self, session_id: str, messages: list[Mapping[str, Any]], **kwargs: Any) -> int:
         unsupported = set(kwargs) - {"chunk_rows"}
         if unsupported:
