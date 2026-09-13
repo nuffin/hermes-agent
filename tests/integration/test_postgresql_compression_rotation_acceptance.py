@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from state_store import PostgreSQLStateStoreConfig
+from state_store import PostgreSQLStateStoreConfig, StateStoreConfigurationError
 from state_store_postgresql import PostgreSQLStateStore
 
 pytestmark = pytest.mark.integration
@@ -108,6 +108,21 @@ def test_pg18_rotation_capability_is_not_advertised_or_implied(rotation_schema):
         assert _CAPABILITY not in getattr(store, "capabilities", ())
     finally:
         store.close()
+
+
+def test_pg18_unknown_catalog_version_is_rejected_fail_closed(rotation_schema):
+    """A disposable fixture proves v20 drift is rejected without touching root."""
+    store = _store(rotation_schema)
+    store.close()
+    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {rotation_schema}.schema_migrations (version, applied_at) VALUES (20, 0)"
+        )
+    with pytest.raises(
+        StateStoreConfigurationError,
+        match=r"Unsupported PostgreSQL State Store schema migration versions: \[20\]",
+    ):
+        _store(rotation_schema)
 
 
 @pytest.mark.parametrize("phase", _PHASES)
