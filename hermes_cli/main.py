@@ -1263,9 +1263,10 @@ def _session_db():
     callers fall through to their ``return None``."""
     db = None
     try:
-        from hermes_state import SessionDB
+        from cli_session_store import open_cli_session_store
+        from hermes_cli.config import load_config
 
-        db = SessionDB(read_only=True)
+        db = open_cli_session_store(load_config(), read_only=True)
     except Exception:
         pass
     try:
@@ -1445,9 +1446,7 @@ def _create_titled_session(title: str) -> Optional[str]:
         from hermes_state_registry import acquire
 
         new_session_id = mint_session_id()
-        # The CLI acquires the registry handle for this same path moments later; share it
-        # instead of minting a second writer for one INSERT (close() releases the refcount).
-        db = acquire()
+        db = open_cli_session_store(load_config())
         db.create_session(new_session_id, source="cli")
         db.set_session_title(new_session_id, title)
         return new_session_id

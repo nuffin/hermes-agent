@@ -1,0 +1,116 @@
+"""Executable isolated PostgreSQL CLI session lifecycle contract."""
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+
+import pytest
+
+from cli_session_store import PostgreSQLCLISessionCapabilityError, open_cli_session_store
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from state_store_runtime_readiness import trap_state_db_opens
+
+_DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
+_CONFIG = {"state_store": {"backend": "postgresql", "postgresql": {
+    "dsn_env": "HERMES_STATE_STORE_TEST_DSN", "connect_timeout_seconds": 5, "pool_max_size": 2,
+}}}
+
+
+def _psycopg():
+    return importlib.import_module("psycopg")
+
+
+@pytest.fixture
+def pg_cli_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes-dev-postgresql-state-store"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "state_store:\n  backend: postgresql\n  postgresql:\n    dsn_env: HERMES_STATE_STORE_TEST_DSN\n    connect_timeout_seconds: 5\n    pool_max_size: 2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", _DSN)
+    token = set_hermes_home_override(str(home))
+    stores = []
+    try:
+        yield home, stores
+    finally:
+        for store in stores:
+            try:
+                schema = store._store._schema
+                store.close()
+                with _psycopg().connect(_DSN, autocommit=True) as conn, conn.cursor() as cursor:
+                    cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            except Exception:
+                pass
+        reset_hermes_home_override(token)
+
+
+def _open(stores):
+    store = open_cli_session_store(_CONFIG)
+    stores.append(store)
+    return store
+
+
+def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_home, monkeypatch):
+    home, stores = pg_cli_home
+    session_id = "20260914_010203_pgcli"
+    with trap_state_db_opens(home) as opens:
+        # Exercise HermesCLI's real early acquisition seam, without a provider or TUI.
+        import cli
+        shell = cli.HermesCLI.__new__(cli.HermesCLI)
+        monkeypatch.setattr(cli, "CLI_CONFIG", _CONFIG)
+        shell._init_session_store()
+        fresh = shell._session_db
+        assert fresh is not None
+        stores.append(fresh)
+        fresh.create_session(session_id, "cli", model="test-model", model_config={"provider": "local"},
+                             system_prompt="stable system prompt", cwd="/tmp", profile_name="pg-cli-test")
+        assert fresh.append_messages_batch(session_id, [
+            {"role": "user", "content": "remember postgresql resume"},
+            {"role": "assistant", "content": "persisted answer", "finish_reason": "stop"},
+        ]) == 2
+        fresh.end_session(session_id, "cli_close")
+        assert fresh.get_session(session_id)["ended_at"] is not None
+        fresh.close()
+
+        resumed = _open(stores)
+        assert resumed.get_session(session_id)["system_prompt"] == "stable system prompt"
+        restored, display = resumed.get_resume_conversations(session_id)
+        assert [row["content"] for row in restored] == ["remember postgresql resume", "persisted answer"]
+        assert [row["content"] for row in display] == ["remember postgresql resume", "persisted answer"]
+        resumed.reopen_session(session_id)
+        assert resumed.get_session(session_id)["ended_at"] is None
+        assert resumed.search_sessions(source="cli")[0]["id"] == session_id
+        resumed.set_session_title(session_id, "PG resume title")
+        assert resumed.resolve_session_by_title("PG resume title") == session_id
+        assert resumed.search_sessions(source="cli", workspace_key="/tmp")[0]["id"] == session_id
+        with pytest.raises(PostgreSQLCLISessionCapabilityError, match="no SQLite fallback"):
+            resumed.archive_and_compact(session_id)
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_cli_delete_contract_removes_postgresql_session_without_sqlite(pg_cli_home):
+    home, stores = pg_cli_home
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session("delete-pg-cli", "cli")
+        store.append_messages_batch("delete-pg-cli", [{"role": "user", "content": "remove me"}])
+        assert store.delete_session("delete-pg-cli", sessions_dir=home / "sessions")
+        assert store.get_session("delete-pg-cli") is None
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_default_sqlite_factory_path_remains_legacy(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+    store = open_cli_session_store({})
+    try:
+        assert store.db_path == home / "state.db"
+        assert (home / "state.db").exists()
+    finally:
+        store.close()

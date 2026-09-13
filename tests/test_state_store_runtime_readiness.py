@@ -33,7 +33,7 @@ def test_static_inventory_reports_every_approved_runtime_raw_opener():
     inventory = static_raw_state_db_inventory()
     unported = {(item.path, item.symbol, item.operation) for item in inventory if item.classification == "unported-legacy-runtime"}
 
-    assert ("cli.py", "HermesCLI._init_session_store", "acquire") in unported
+    assert ("cli.py", "HermesCLI._init_session_store", "SessionDB") not in unported
     assert ("gateway/delivery_ledger.py", "_connect", "open_db") in unported
     assert ("tools/async_delegation.py", "_connect", "open_db") in unported
     assert ("tui_gateway/server.py", "_get_db", "acquire") in unported
@@ -82,7 +82,7 @@ def test_selected_postgresql_profile_fails_before_state_db_open_and_reports_tena
     assert report.profile_home == str(profile_home.resolve())
     assert report.profile_name == "pg-sandbox"
     assert report.tenant_schema and report.tenant_schema.startswith("hermes_state_store_tenant_")
-    assert "full-sessiondb-runtime-contract" in report.missing_capabilities
+    assert "cli-fresh-resume-session-contract" in report.supported_capabilities
     assert report.raw_state_db_openers
     assert events == []
     assert not (profile_home / "state.db").exists()

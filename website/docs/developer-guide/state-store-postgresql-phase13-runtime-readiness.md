@@ -18,19 +18,26 @@ python -c 'from pathlib import Path; from state_store_runtime_readiness import w
 
 ## Selected-backend capability report
 
-A selected PostgreSQL profile reports its canonical profile home/name and derived tenant schema without retaining a DSN or opening a database. The supported slice is only:
+A selected PostgreSQL profile reports its canonical profile home/name and derived tenant schema without retaining a DSN or opening a database. The supported slice is:
 
 - narrow StateStore records; and
-- profile-derived PostgreSQL tenant schema selection.
+- profile-derived PostgreSQL tenant schema selection; and
+- CLI fresh/resume acquisition through `cli_session_store.open_cli_session_store()`.
 
-Activation remains blocked by these capabilities:
+The CLI facade persists a real session row, structured messages, system-prompt
+snapshot, end/reopen transition, and bounded recent-session lookup. It rejects
+unimplemented SessionDB methods with a capability error before any SQLite
+fallback. The legacy SQLite CLI path continues to construct `SessionDB`.
 
-- complete SessionDB runtime contract;
+Activation remains blocked outside that bounded CLI path by these capabilities:
+
 - contextual session search/lineage contract;
 - gateway delivery-ledger routing; and
 - async-delegation ledger routing.
 
-The error names the missing capabilities and points here. This is deliberately a pre-side-effect refusal, not a claim that an interactive, gateway, cron, TUI, or ACP runtime is PostgreSQL-ready.
+The error names the missing capabilities and points here. This is deliberately
+not a claim that gateway, cron, TUI, ACP, async-delegation, or hosted-room
+runtime is PostgreSQL-ready.
 
 ## Sandbox fixture and proof
 
@@ -44,12 +51,22 @@ The error names the missing capabilities and points here. This is deliberately a
 - default SQLite construction still creates/opens its configured `state.db`; and
 - the checked-in report contains no PostgreSQL DSN.
 
+`tests/integration/test_postgresql_cli_session_store.py` exercises a fresh
+isolated `HERMES_HOME` against loopback PostgreSQL: session creation, ordered
+message persistence, prompt snapshot, end, a new-store resume/reopen, session
+lookup, unsupported-call refusal, and the file-open trap. It also proves the
+default SQLite factory path is unchanged.
+
 Run the focused gate with:
 
 ```bash
-scripts/run_tests.sh tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
+scripts/run_tests.sh tests/integration/test_postgresql_cli_session_store.py tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
 ```
 
 ## Remaining work
 
-Do not set the isolated wrapper's profile to PostgreSQL for normal agent startup until every unported entry in the machine-readable inventory has an approved backend-neutral routing contract and equivalent lifecycle, ownership, delivery, contextual-search, and recovery behavior. SQLite remains the migration source/reference only; it is not a selected-PG fallback.
+Do not route gateway, cron, TUI, ACP, async-delegation, or hosted-room startup
+to PostgreSQL until every listed runtime consumer has an approved
+backend-neutral contract and equivalent lifecycle, ownership, delivery,
+contextual-search, and recovery behavior. SQLite remains the migration
+source/reference only; it is not a selected-PG fallback.
