@@ -120,6 +120,24 @@ class PostgreSQLCLISessionStore:
     def get_resume_conversations(self, session_id: str):
         return self._store.get_resume_conversations(session_id)
 
+    # Observation and cooldown coordination are durable PostgreSQL operations.
+    # Deliberate compression publication remains unavailable through this facade
+    # until its parent/child transaction is ported as one contract.
+    def touch_session_activity(self, session_id: str, ts: float | None = None, **kwargs: Any) -> None:
+        return self._store.touch_session_activity(session_id, ts, **kwargs)
+    def clear_session_activity_labels(self, session_id: str) -> None:
+        return self._store.clear_session_activity_labels(session_id)
+    def get_compression_failure_cooldown(self, session_id: str):
+        return self._store.get_compression_failure_cooldown(session_id)
+    def record_compression_failure_cooldown(self, session_id: str, cooldown_until: float, error: str | None = None) -> None:
+        return self._store.record_compression_failure_cooldown(session_id, cooldown_until, error)
+    def clear_compression_failure_cooldown(self, session_id: str) -> None:
+        return self._store.clear_compression_failure_cooldown(session_id)
+    def get_compression_failure_cooldown_row(self, session_id: str):
+        return self._store.get_compression_failure_cooldown_row(session_id)
+    def restore_compression_failure_cooldown_row(self, session_id: str, snapshot: Mapping[str, Any]) -> None:
+        return self._store.restore_compression_failure_cooldown_row(session_id, snapshot)
+
     def get_session(self, session_id: str): return self._store.get_session(session_id)
     def get_compression_tip(self, session_id: str): return self._store.get_compression_tip(session_id)
     def get_conversation_root(self, session_id: str): return self._store.get_conversation_root(session_id)

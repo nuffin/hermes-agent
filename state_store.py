@@ -13,7 +13,7 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Mapping, Protocol, cast
+from typing import Any, Callable, Collection, Mapping, Protocol, cast, runtime_checkable
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SUPPORTED_BACKENDS = frozenset({"sqlite", "postgresql"})
@@ -106,6 +106,34 @@ class ContextualSessionSearchStore(Protocol):
 
 class ContextualSessionSearchUnavailable(RuntimeError):
     """The selected backend has not implemented the complete recall contract."""
+
+
+@runtime_checkable
+class CompressionCoordinationStore(Protocol):
+    """Durable observation, cooldown, counter, and lease primitives.
+
+    This intentionally excludes parent/child compression publication.  A backend
+    may expose this API without claiming that destructive rotation is available.
+    """
+    def touch_session_activity(self, session_id: str, ts: float | None = None, **kwargs: Any) -> None: ...
+    def clear_session_activity_labels(self, session_id: str) -> None: ...
+    def get_compression_failure_cooldown(self, session_id: str) -> dict[str, Any] | None: ...
+    def record_compression_failure_cooldown(self, session_id: str, cooldown_until: float, error: str | None = None) -> None: ...
+    def clear_compression_failure_cooldown(self, session_id: str) -> None: ...
+    def get_compression_failure_cooldown_row(self, session_id: str) -> dict[str, Any]: ...
+    def restore_compression_failure_cooldown_row(self, session_id: str, snapshot: Mapping[str, Any]) -> None: ...
+    def get_compression_fallback_streak(self, session_id: str) -> int: ...
+    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None: ...
+    def get_compression_ineffective_count(self, session_id: str) -> int: ...
+    def set_compression_ineffective_count(self, session_id: str, count: int) -> None: ...
+    def get_compression_recovery_deadline(self, session_id: str) -> float: ...
+    def set_compression_recovery_deadline(self, session_id: str, deadline: float) -> None: ...
+    def try_acquire_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool: ...
+    def refresh_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool: ...
+    def release_compression_lock(self, session_id: str, holder: str) -> None: ...
+    def try_acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, **kwargs: Any) -> bool: ...
+    def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0) -> bool: ...
+    def release_session_turn_lease(self, session_id: str, holder: str) -> None: ...
 
 
 class StateStore(Protocol):
@@ -363,6 +391,28 @@ class SqliteStateStore:
 
     def latest_conversation_boundary(self, session_key: str, source: str) -> int | None:
         return self._session_db.latest_conversation_boundary(session_key, source)
+
+    # The current SQLite path remains the reference implementation of this
+    # backend-neutral non-destructive coordination contract.
+    def touch_session_activity(self, session_id: str, ts: float | None = None, **kwargs: Any) -> None: return self._session_db.touch_session_activity(session_id, ts, **kwargs)
+    def clear_session_activity_labels(self, session_id: str) -> None: return self._session_db.clear_session_activity_labels(session_id)
+    def get_compression_failure_cooldown(self, session_id: str): return self._session_db.get_compression_failure_cooldown(session_id)
+    def record_compression_failure_cooldown(self, session_id: str, cooldown_until: float, error: str | None = None) -> None: return self._session_db.record_compression_failure_cooldown(session_id, cooldown_until, error)
+    def clear_compression_failure_cooldown(self, session_id: str) -> None: return self._session_db.clear_compression_failure_cooldown(session_id)
+    def get_compression_failure_cooldown_row(self, session_id: str): return self._session_db.get_compression_failure_cooldown_row(session_id)
+    def restore_compression_failure_cooldown_row(self, session_id: str, snapshot: Mapping[str, Any]) -> None: return self._session_db.restore_compression_failure_cooldown_row(session_id, dict(snapshot))
+    def get_compression_fallback_streak(self, session_id: str) -> int: return self._session_db.get_compression_fallback_streak(session_id)
+    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None: return self._session_db.set_compression_fallback_streak(session_id, streak)
+    def get_compression_ineffective_count(self, session_id: str) -> int: return self._session_db.get_compression_ineffective_count(session_id)
+    def set_compression_ineffective_count(self, session_id: str, count: int) -> None: return self._session_db.set_compression_ineffective_count(session_id, count)
+    def get_compression_recovery_deadline(self, session_id: str) -> float: return self._session_db.get_compression_recovery_deadline(session_id)
+    def set_compression_recovery_deadline(self, session_id: str, deadline: float) -> None: return self._session_db.set_compression_recovery_deadline(session_id, deadline)
+    def try_acquire_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool: return self._session_db.try_acquire_compression_lock(session_id, holder, ttl_seconds)
+    def refresh_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool: return self._session_db.refresh_compression_lock(session_id, holder, ttl_seconds)
+    def release_compression_lock(self, session_id: str, holder: str) -> None: return self._session_db.release_compression_lock(session_id, holder)
+    def try_acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, **kwargs: Any) -> bool: return self._session_db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds, **kwargs)
+    def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0) -> bool: return self._session_db.refresh_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds)
+    def release_session_turn_lease(self, session_id: str, holder: str) -> None: return self._session_db.release_session_turn_lease(session_id, holder)
 
     def queue_token_counts(self, session_id: str, **kwargs: Any) -> None:
         self._session_db.queue_token_counts(session_id, **kwargs)

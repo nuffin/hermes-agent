@@ -20,6 +20,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any, Collection
 
 from hermes_cli.timefmt import coerce_epoch
+from agent.session_activity import bound_activity_description, normalize_activity_provenance
 from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
 from hermes_state_runtime_ownership import RuntimeOwner, RuntimeOwnershipReceipt, SessionRuntimeOwnershipMixin, TurnState
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
@@ -48,6 +49,7 @@ _SEARCH_INDEX_SCHEMA_VERSION = 15
 _BOUNDED_BROWSE_SCHEMA_VERSION = 16
 _SEARCH_HEALTH_SCHEMA_VERSION = 17
 _SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION = 18
+_COMPRESSION_COORDINATION_SCHEMA_VERSION = 19
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -164,7 +166,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _COMPRESSION_COORDINATION_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -186,6 +188,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_BOUNDED_BROWSE_SCHEMA_VERSION, self._apply_v16, self._validate_v16),
                     (_SEARCH_HEALTH_SCHEMA_VERSION, self._apply_v17, self._validate_v17),
                     (_SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION, self._apply_v18, self._validate_v18),
+                    (_COMPRESSION_COORDINATION_SCHEMA_VERSION, self._apply_v19, self._validate_v19),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -558,6 +561,51 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         })
         self._require_index(cursor, "session_runtime_owners_expires")
         self._require_index(cursor, "session_runtime_turns_state")
+
+    def _apply_v19(self, cursor: Any) -> None:
+        """Persist the non-destructive compression coordination state.
+
+        This migration deliberately does *not* advertise compression rotation:
+        a lease/cooldown without atomic parent/child publication would make a
+        lineage fork easier to create, not safer.  These rows support durable
+        observation and a future all-or-nothing publication transaction only.
+        """
+        session_columns = {
+            "last_activity_description": "text NOT NULL DEFAULT ''",
+            "last_activity_provenance": "text NOT NULL DEFAULT 'unknown'",
+            "compression_failure_cooldown_until": "double precision",
+            "compression_failure_error": "text",
+            "compression_fallback_streak": "bigint NOT NULL DEFAULT 0",
+            "compression_ineffective_count": "bigint NOT NULL DEFAULT 0",
+            "compression_recovery_deadline": "double precision",
+        }
+        for column, type_name in session_columns.items():
+            cursor.execute(f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS {column} {type_name}")
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.compression_locks ("
+            f"session_id text PRIMARY KEY REFERENCES {self._schema}.sessions(id) ON DELETE CASCADE, "
+            "holder text NOT NULL, fence bigint NOT NULL CHECK (fence > 0), "
+            "expires_at double precision NOT NULL, updated_at double precision NOT NULL)"
+        )
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.session_turn_leases ("
+            "conversation_id text PRIMARY KEY, holder text NOT NULL, "
+            "fence bigint NOT NULL CHECK (fence > 0), expires_at double precision NOT NULL, "
+            "updated_at double precision NOT NULL)"
+        )
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS compression_locks_expires ON {self._schema}.compression_locks (expires_at)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS session_turn_leases_expires ON {self._schema}.session_turn_leases (expires_at)")
+
+    def _validate_v19(self, cursor: Any) -> None:
+        self._required_columns(cursor, "sessions", {
+            "last_activity_at", "last_activity_description", "last_activity_provenance",
+            "compression_failure_cooldown_until", "compression_failure_error",
+            "compression_fallback_streak", "compression_ineffective_count", "compression_recovery_deadline",
+        })
+        self._required_columns(cursor, "compression_locks", {"session_id", "holder", "fence", "expires_at", "updated_at"})
+        self._required_columns(cursor, "session_turn_leases", {"conversation_id", "holder", "fence", "expires_at", "updated_at"})
+        self._require_index(cursor, "compression_locks_expires")
+        self._require_index(cursor, "session_turn_leases_expires")
 
     @staticmethod
     def _runtime_namespace(namespace: str | None) -> str:
@@ -978,6 +1026,214 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (created_at, session_id),
                 )
         return len(records)
+
+    @staticmethod
+    def _coordination_ttl(ttl_seconds: float) -> float:
+        ttl = float(ttl_seconds)
+        if not math.isfinite(ttl):
+            raise ValueError("compression coordination ttl_seconds must be finite")
+        return max(0.1, ttl)
+
+    def _coordination_clock_and_lock(self, cursor: Any, kind: str, key: str) -> float:
+        """Serialize an extant or absent lease key and use PostgreSQL's clock.
+
+        Row locks alone cannot protect a missing lease row.  The transaction
+        advisory lock is scoped by the trusted tenant schema so two profiles
+        never coordinate accidentally.
+        """
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{self._schema}:{kind}:{key}",))
+        cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
+        return float(cursor.fetchone()[0])
+
+    def touch_session_activity(self, session_id: str, ts: float | None = None, *, description: str | None = None,
+                               provenance: Any = None) -> None:
+        """Monotonically publish the current activity observation and its labels."""
+        if not session_id:
+            return
+        when = float(ts if ts is not None else time.time())
+        label = bound_activity_description(description)
+        source = normalize_activity_provenance(provenance).value
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET "
+                "last_activity_at = GREATEST(COALESCE(last_activity_at, started_at), %s), "
+                "last_activity_description = CASE WHEN last_activity_at IS NULL OR last_activity_at <= %s THEN %s ELSE last_activity_description END, "
+                "last_activity_provenance = CASE WHEN last_activity_at IS NULL OR last_activity_at <= %s THEN %s ELSE last_activity_provenance END "
+                "WHERE id = %s",
+                (when, when, label, when, source, session_id),
+            )
+
+    def clear_session_activity_labels(self, session_id: str) -> None:
+        """Clear only transient labels; keep the durable last-activity clock."""
+        if not session_id:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET last_activity_description='', last_activity_provenance='unknown' "
+                "WHERE id=%s AND (last_activity_description <> '' OR last_activity_provenance <> 'unknown')",
+                (session_id,),
+            )
+
+    def record_compression_failure_cooldown(self, session_id: str, cooldown_until: float, error: str | None = None) -> None:
+        """Merge-max a durable retry deadline; a later short failure cannot reopen it."""
+        if not session_id:
+            return
+        deadline = float(cooldown_until)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET compression_failure_cooldown_until=GREATEST("
+                "COALESCE(compression_failure_cooldown_until, '-Infinity'::float8), %s), "
+                "compression_failure_error=%s WHERE id=%s",
+                (deadline, error, session_id),
+            )
+
+    def get_compression_failure_cooldown(self, session_id: str) -> dict[str, Any] | None:
+        if not session_id:
+            return None
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT compression_failure_cooldown_until, compression_failure_error, "
+                "EXTRACT(EPOCH FROM clock_timestamp()) FROM " + f"{self._schema}.sessions WHERE id=%s",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+        if row is None or row[0] is None or float(row[0]) <= float(row[2]):
+            return None
+        return {"cooldown_until": float(row[0]), "remaining_seconds": float(row[0]) - float(row[2]), "error": row[1]}
+
+    def get_compression_failure_cooldown_row(self, session_id: str) -> dict[str, Any]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT compression_failure_cooldown_until, compression_failure_error FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+            row = cursor.fetchone()
+        return {"session_exists": row is not None, "cooldown_until": None if row is None else row[0], "error": None if row is None else row[1]}
+
+    def restore_compression_failure_cooldown_row(self, session_id: str, snapshot: Mapping[str, Any]) -> None:
+        if not snapshot.get("session_exists", False):
+            if self.get_compression_failure_cooldown_row(session_id)["session_exists"]:
+                raise RuntimeError("cannot restore absent compression cooldown row: session now exists")
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET compression_failure_cooldown_until=%s, compression_failure_error=%s WHERE id=%s", (snapshot.get("cooldown_until"), snapshot.get("error"), session_id))
+            if cursor.rowcount != 1:
+                return
+        if self.get_compression_failure_cooldown_row(session_id) != {"session_exists": True, "cooldown_until": snapshot.get("cooldown_until"), "error": snapshot.get("error")}:
+            raise RuntimeError("compression cooldown rollback verification failed")
+
+    def clear_compression_failure_cooldown(self, session_id: str) -> None:
+        if not session_id:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET compression_failure_cooldown_until=NULL, compression_failure_error=NULL WHERE id=%s", (session_id,))
+
+    def _compression_counter(self, session_id: str, column: str, *, decimal: bool = False) -> int | float:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT {column} FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+            row = cursor.fetchone()
+        value = 0.0 if row is None or row[0] is None else float(row[0])
+        return max(0.0, value) if decimal else max(0, int(value))
+
+    def _set_compression_counter(self, session_id: str, column: str, value: int | float, *, decimal: bool = False) -> None:
+        if not session_id:
+            return
+        normalized = max(0.0, float(value or 0)) if decimal else max(0, int(value or 0))
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET {column}=%s WHERE id=%s", (normalized or None if decimal else normalized, session_id))
+
+    def get_compression_fallback_streak(self, session_id: str) -> int: return int(self._compression_counter(session_id, "compression_fallback_streak"))
+    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None: self._set_compression_counter(session_id, "compression_fallback_streak", streak)
+    def get_compression_ineffective_count(self, session_id: str) -> int: return int(self._compression_counter(session_id, "compression_ineffective_count"))
+    def set_compression_ineffective_count(self, session_id: str, count: int) -> None: self._set_compression_counter(session_id, "compression_ineffective_count", count)
+    def get_compression_recovery_deadline(self, session_id: str) -> float: return float(self._compression_counter(session_id, "compression_recovery_deadline", decimal=True))
+    def set_compression_recovery_deadline(self, session_id: str, deadline: float) -> None: self._set_compression_counter(session_id, "compression_recovery_deadline", deadline, decimal=True)
+
+    def _try_coordination_lease(self, cursor: Any, *, table: str, key_column: str, key: str,
+                                holder: str, ttl_seconds: float) -> bool:
+        if not key or not holder:
+            return False
+        now = self._coordination_clock_and_lock(cursor, table, key)
+        cursor.execute(f"SELECT holder, fence, expires_at FROM {self._schema}.{table} WHERE {key_column}=%s FOR UPDATE", (key,))
+        row = cursor.fetchone()
+        expires_at = now + self._coordination_ttl(ttl_seconds)
+        if row is None:
+            cursor.execute(f"INSERT INTO {self._schema}.{table} ({key_column}, holder, fence, expires_at, updated_at) VALUES (%s, %s, 1, %s, %s)", (key, holder, expires_at, now))
+            return True
+        current_holder, fence, old_expiry = str(row[0]), int(row[1]), float(row[2])
+        if current_holder != holder and old_expiry > now:
+            return False
+        next_fence = fence if current_holder == holder else fence + 1
+        cursor.execute(f"UPDATE {self._schema}.{table} SET holder=%s, fence=%s, expires_at=%s, updated_at=%s WHERE {key_column}=%s AND fence=%s", (holder, next_fence, expires_at, now, key, fence))
+        return cursor.rowcount == 1
+
+    def _compression_turn_lease_key_on_cursor(self, cursor: Any, session_id: str) -> str:
+        """Resolve a compression lineage root in the same lease transaction."""
+        current, seen = session_id, {session_id}
+        while current:
+            cursor.execute(f"SELECT parent_session_id, end_reason, model_config FROM {self._schema}.sessions WHERE id=%s", (current,))
+            row = cursor.fetchone()
+            if row is None or row[0] is None:
+                return current
+            parent_id, _reason, config = str(row[0]), row[1], row[2]
+            if parent_id in seen:
+                return current
+            cursor.execute(f"SELECT end_reason FROM {self._schema}.sessions WHERE id=%s", (parent_id,))
+            parent = cursor.fetchone()
+            if parent is None or parent[0] != "compression" or self._is_explicit_branch({"model_config": config}):
+                return current
+            seen.add(parent_id)
+            current = parent_id
+        return session_id
+
+    def try_acquire_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            return self._try_coordination_lease(cursor, table="compression_locks", key_column="session_id", key=session_id, holder=holder, ttl_seconds=ttl_seconds)
+
+    def refresh_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+        if not session_id or not holder:
+            return False
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._coordination_clock_and_lock(cursor, "compression_locks", session_id)
+            cursor.execute(f"UPDATE {self._schema}.compression_locks SET expires_at=%s, updated_at=%s WHERE session_id=%s AND holder=%s", (now + self._coordination_ttl(ttl_seconds), now, session_id, holder))
+            return cursor.rowcount == 1
+
+    def release_compression_lock(self, session_id: str, holder: str) -> None:
+        if not session_id or not holder:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            self._coordination_clock_and_lock(cursor, "compression_locks", session_id)
+            cursor.execute(f"DELETE FROM {self._schema}.compression_locks WHERE session_id=%s AND holder=%s", (session_id, holder))
+
+    def get_compression_lock_holder(self, session_id: str) -> str | None:
+        if not session_id:
+            return None
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._coordination_clock_and_lock(cursor, "compression_locks", session_id)
+            cursor.execute(f"SELECT holder FROM {self._schema}.compression_locks WHERE session_id=%s AND expires_at > %s", (session_id, now))
+            row = cursor.fetchone()
+        return None if row is None else str(row[0])
+
+    def try_acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, **_ignored: Any) -> bool:
+        if not session_id or not holder:
+            return False
+        with self._connection() as connection, connection.cursor() as cursor:
+            key = self._compression_turn_lease_key_on_cursor(cursor, session_id)
+            return self._try_coordination_lease(cursor, table="session_turn_leases", key_column="conversation_id", key=key, holder=holder, ttl_seconds=ttl_seconds)
+
+    def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0) -> bool:
+        if not session_id or not holder:
+            return False
+        with self._connection() as connection, connection.cursor() as cursor:
+            key = self._compression_turn_lease_key_on_cursor(cursor, session_id)
+            now = self._coordination_clock_and_lock(cursor, "session_turn_leases", key)
+            cursor.execute(f"UPDATE {self._schema}.session_turn_leases SET expires_at=%s, updated_at=%s WHERE conversation_id=%s AND holder=%s", (now + self._coordination_ttl(ttl_seconds), now, key, holder))
+            return cursor.rowcount == 1
+
+    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
+        if not session_id or not holder:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            key = self._compression_turn_lease_key_on_cursor(cursor, session_id)
+            self._coordination_clock_and_lock(cursor, "session_turn_leases", key)
+            cursor.execute(f"DELETE FROM {self._schema}.session_turn_leases WHERE conversation_id=%s AND holder=%s", (key, holder))
 
     @staticmethod
     def _decode_content(content: Any) -> Any:
@@ -1539,7 +1795,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
                 f"SELECT s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.title, s.title_source, s.hidden, s.archived, s.pinned, "
-                f"s.system_prompt_hash, s.git_branch, s.git_metadata_generation, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
+                f"s.system_prompt_hash, s.git_branch, s.git_metadata_generation, s.last_activity_at, s.last_activity_description, s.last_activity_provenance, "
+                f"s.compression_failure_cooldown_until, s.compression_failure_error, s.compression_fallback_streak, s.compression_ineffective_count, s.compression_recovery_deadline, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
                 f"FROM {self._schema}.sessions s LEFT JOIN {self._schema}.system_prompts p ON p.hash = s.system_prompt_hash WHERE s.id = %s", (session_id,),
             )
             return cursor.fetchone()
