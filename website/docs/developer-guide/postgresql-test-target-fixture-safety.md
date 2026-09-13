@@ -20,8 +20,9 @@ revalidates that marker immediately before destructive teardown.
   - Runtime ownership stores are constructed against the owned schema; expiry, invalid-row rollback, and index-drift injection use the target helper.
 - `test_postgresql_delivery_ledger.py` (6 tests)
   - The ledger uses `postgresql_delivery_target`; dedicated migration/catalog and index-drift coverage use its marker-validated target.
-- `test_postgresql_cli_session_store.py` (3 PostgreSQL lifecycle tests; 1 legacy SQLite control)
+- `test_postgresql_cli_session_store.py` (8 PostgreSQL lifecycle/public-consumer tests; 1 legacy SQLite control)
   - CLI and AIAgent lifecycle factories receive the owned schema at construction; direct post-close schema deletion is removed.
+  - The inline public `session_search` request/response path exercises CJK/grammar, discovery health, anchored scroll, read, browse, and explicit tenant-local rebuild under the `state.db` trap.
 - `test_postgresql_owned_family_safety.py` (2 tests)
   - A pre-existing shared sentinel schema/catalog record survives StateStore, runtime, and delivery migration construction unchanged.
   - AST inventory rejects direct dangerous `cursor.execute` DDL/DML in the four migrated files. Explicit exemptions are catalog/data reads and the store-pool `SET/SHOW search_path` reset contract.
