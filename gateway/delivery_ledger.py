@@ -202,11 +202,17 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    path = _db_path()
+    # The PostgreSQL StateStore slice does not yet own delivery obligations.
+    # Refuse before connecting so selecting PostgreSQL cannot create this
+    # legacy SQLite ledger as an implicit fallback.
+    from state_store_runtime_readiness import require_legacy_state_db_runtime
+    require_legacy_state_db_runtime(home=path.parent)
     from hermes_cli.sqlite_util import open_db
 
     # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
     # and the 10 s busy timeout it always had.
-    return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
+    return open_db(path, db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
                    row_factory=None, initialize=_initialize_schema)
 
 
