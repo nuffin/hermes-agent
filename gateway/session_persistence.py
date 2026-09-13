@@ -40,6 +40,18 @@ def _is_live_system_guard(exc: BaseException) -> bool:
 class SessionPersistenceMixin:
     """SessionStore storage plumbing: SessionDB handle resolution and routing-index load/save."""
 
+    @staticmethod
+    def _require_legacy_gateway_session_routing_runtime() -> None:
+        """Reject selected PostgreSQL before gateway routing creates a legacy artifact.
+
+        PostgreSQL lacks the coupled route, peer, transcript, dedupe, rewind,
+        recovery, and shutdown contracts. Activation must not become a
+        sessions.json or JSONL fallback.
+        """
+        from state_store_runtime_readiness import require_legacy_state_db_runtime
+
+        require_legacy_state_db_runtime()
+
     def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None):
         """SessionDB for the active profile scope. ``db_path`` pins the store; otherwise
         ``_default_db_path()`` follows the context-local HERMES_HOME (resolved per call so
@@ -49,6 +61,7 @@ class SessionPersistenceMixin:
         Resolving here rather than once in ``__init__`` is the whole fix for #88532: it lets the scoping
         that the multiplexed inbound path already performs actually reach session storage.
         """
+        self._require_legacy_gateway_session_routing_runtime()
         from hermes_state import _default_db_path
         from hermes_state_registry import acquire
 
@@ -270,6 +283,7 @@ class SessionPersistenceMixin:
         sessions.json is the legacy import path for pre-migration installs (its entries are folded in for
         keys the DB doesn't have, then persisted to the DB on the next _save).
         """
+        self._require_legacy_gateway_session_routing_runtime()
         if self._loaded:
             self._reconcile_recovered_routing_locked()
             return
@@ -435,6 +449,7 @@ class SessionPersistenceMixin:
 
     def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
         """Serialize all whole-index writers through one durable write lock."""
+        self._require_legacy_gateway_session_routing_runtime()
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
                 return
@@ -492,6 +507,7 @@ class SessionPersistenceMixin:
         already persisted (the reverse case lives in ``_persist_routing_data``). No DB or a failed
         upsert falls back to the full rewrite. ``entry_data`` persists a candidate BEFORE it is
         published to the live entry (failure-atomic transitions); the fallback carries it too."""
+        self._require_legacy_gateway_session_routing_runtime()
         guard = contextlib.nullcontext() if lock_held else self._lock
         with guard:
             entry = self._entries.get(session_key)

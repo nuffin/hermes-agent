@@ -218,6 +218,7 @@ def inspect_runtime_activation(
             "contextual-session-search-contract",
         ),
         missing_capabilities=(
+            "gateway-session-routing-transcript",
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
         ),
