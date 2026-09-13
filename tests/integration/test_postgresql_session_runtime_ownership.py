@@ -128,7 +128,11 @@ def test_pg18_namespace_isolation_release_fence_and_catalog_rollback():
         assert store.begin_session_runtime_turn(successor, "after-rollback")
         with store._connection() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT version FROM schema_migrations ORDER BY version")
-            assert [int(row[0]) for row in cursor.fetchall()][-1] == 19
+            # The selected-PG compression facade adds the v20 atomic
+            # parent/child publication receipt migration.  Keep this direct
+            # ownership test coupled to the current catalog, not the v19
+            # precursor that introduced the ownership tables.
+            assert [int(row[0]) for row in cursor.fetchall()][-1] == 20
     finally:
         store.close()
 
