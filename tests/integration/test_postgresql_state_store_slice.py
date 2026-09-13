@@ -19,10 +19,12 @@ from state_store import (
     resolve_contextual_session_search_store,
 )
 from hermes_state import SessionDB
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 
 
 _DSN_ENV = "HERMES_STATE_STORE_TEST_DSN"
-_SCHEMA = "hermes_state_store_slice"
+_SCHEMA = ""
+_TARGET: OwnedPostgreSQLTestTarget | None = None
 
 
 def _config() -> dict[str, object]:
@@ -42,25 +44,57 @@ def _psycopg():
     return importlib.import_module("psycopg")
 
 
-def _reset_schema(dsn: str) -> None:
-    with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
+@pytest.fixture(autouse=True)
+def owned_postgresql_schema(monkeypatch, postgresql_test_target):
+    """Route every StateStore factory acquisition to one marked disposable schema."""
+    global _SCHEMA, _TARGET
+    _SCHEMA, _TARGET = postgresql_test_target.schema, postgresql_test_target
+    monkeypatch.setenv(_DSN_ENV, postgresql_test_target.dsn)
+    import state_store
+    original_schema = state_store.postgresql_tenant_schema
+    targets: dict[str, OwnedPostgreSQLTestTarget] = {}
+
+    def owned_schema(*args: object, **kwargs: object) -> str:
+        trusted_schema = original_schema(*args, **kwargs)
+        if not targets:
+            targets[trusted_schema] = postgresql_test_target
+        elif trusted_schema not in targets:
+            targets[trusted_schema] = OwnedPostgreSQLTestTarget(postgresql_test_target.dsn).allocate()
+        return targets[trusted_schema].schema
+
+    monkeypatch.setattr(state_store, "postgresql_tenant_schema", owned_schema)
+    yield
+    for target in targets.values():
+        if target is not postgresql_test_target:
+            target.drop()
+    _TARGET = None
+
+
+def _target() -> OwnedPostgreSQLTestTarget:
+    assert _TARGET is not None
+    return _TARGET
+
+
+def _reset_schema(_dsn: str) -> None:
+    """Per-test fixture allocation owns schema lifecycle; never drop a shared schema here."""
+    _target().reset()
 
 
 def _seed_v2_schema(dsn: str, ledger_versions: tuple[int, ...]) -> None:
     """Seed the actual v1/v2 shape, optionally with historical ledger rows."""
-    with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"CREATE SCHEMA {_SCHEMA}")
-        cursor.execute(f"CREATE TABLE {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
-        cursor.execute(f"CREATE TABLE {_SCHEMA}.sessions (id text PRIMARY KEY, source text NOT NULL, started_at double precision NOT NULL, ended_at double precision, end_reason text)")
-        cursor.execute(f"CREATE TABLE {_SCHEMA}.messages (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, session_id text NOT NULL REFERENCES {_SCHEMA}.sessions(id), role text NOT NULL, content text, created_at double precision NOT NULL)")
-        cursor.execute(f"CREATE INDEX messages_session_id_id ON {_SCHEMA}.messages (session_id, id)")
-        for column, type_name in (("user_id", "text"), ("session_key", "text"), ("chat_id", "text"), ("chat_type", "text"), ("thread_id", "text"), ("display_name", "text"), ("origin_json", "text"), ("model", "text"), ("model_config", "jsonb"), ("parent_session_id", "text"), ("cwd", "text"), ("profile_name", "text"), ("git_repo_root", "text")):
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN {column} {type_name}")
-        cursor.execute(f"CREATE INDEX sessions_source_session_key ON {_SCHEMA}.sessions (source, session_key)")
-        cursor.execute(f"CREATE INDEX sessions_parent_session_id ON {_SCHEMA}.sessions (parent_session_id)")
-        for version in ledger_versions:
-            cursor.execute(f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, 1)", (version,))
+    for statement, parameters in (
+        (f"CREATE TABLE {_SCHEMA}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)", ()),
+        (f"CREATE TABLE {_SCHEMA}.sessions (id text PRIMARY KEY, source text NOT NULL, started_at double precision NOT NULL, ended_at double precision, end_reason text)", ()),
+        (f"CREATE TABLE {_SCHEMA}.messages (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, session_id text NOT NULL REFERENCES {_SCHEMA}.sessions(id), role text NOT NULL, content text, created_at double precision NOT NULL)", ()),
+        (f"CREATE INDEX messages_session_id_id ON {_SCHEMA}.messages (session_id, id)", ()),
+    ):
+        _target().execute(statement, parameters)
+    for column, type_name in (("user_id", "text"), ("session_key", "text"), ("chat_id", "text"), ("chat_type", "text"), ("thread_id", "text"), ("display_name", "text"), ("origin_json", "text"), ("model", "text"), ("model_config", "jsonb"), ("parent_session_id", "text"), ("cwd", "text"), ("profile_name", "text"), ("git_repo_root", "text")):
+        _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN {column} {type_name}")
+    _target().execute(f"CREATE INDEX sessions_source_session_key ON {_SCHEMA}.sessions (source, session_key)")
+    _target().execute(f"CREATE INDEX sessions_parent_session_id ON {_SCHEMA}.sessions (parent_session_id)")
+    for version in ledger_versions:
+        _target().execute(f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (%s, 1)", (version,))
 
 
 def _migration_versions(dsn: str) -> list[int]:
@@ -345,18 +379,15 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
         store = open_state_store(_config())
         store.close()
         assert _migration_versions(dsn) == list(range(1, 20))
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (20, 0)")
+        _target().execute(f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (20, 0)")
         with pytest.raises(
             StateStoreConfigurationError,
             match=r"Unsupported PostgreSQL State Store schema migration versions: \[20\]",
         ):
             open_state_store(_config())
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DELETE FROM {_SCHEMA}.schema_migrations WHERE version=20")
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
+        _target().execute(f"DELETE FROM {_SCHEMA}.schema_migrations WHERE version=20")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
         with pytest.raises(StateStoreConfigurationError, match="primary key must be"):
             open_state_store(_config())
     finally:
@@ -369,8 +400,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
     _reset_schema(dsn)
     try:
         _seed_v2_schema(dsn, (1, 2))
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"INSERT INTO {_SCHEMA}.sessions (id, source, started_at) VALUES ('survives-v2', 'fixture', 1)")
+        _target().execute(f"INSERT INTO {_SCHEMA}.sessions (id, source, started_at) VALUES ('survives-v2', 'fixture', 1)")
         store = open_state_store(_config())
         session = store.get_session("survives-v2")
         assert session is not None
@@ -380,25 +410,22 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
         assert _migration_versions(dsn) == list(range(1, 20))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN title text")
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN title_source text")
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN hidden boolean NOT NULL DEFAULT false")
-            cursor.execute(f"CREATE UNIQUE INDEX sessions_title_unique ON {_SCHEMA}.sessions (title) WHERE title IS NOT NULL")
-            cursor.execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN title text")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN title_source text")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD COLUMN hidden boolean NOT NULL DEFAULT false")
+        _target().execute(f"CREATE UNIQUE INDEX sessions_title_unique ON {_SCHEMA}.sessions (title) WHERE title IS NOT NULL")
+        _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
         assert _migration_versions(dsn) == list(range(1, 20))
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP INDEX {_SCHEMA}.sessions_title_unique")
+        _target().execute(f"DROP INDEX {_SCHEMA}.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
             open_state_store(_config())
     finally:
@@ -441,9 +468,7 @@ def test_sqlite_and_postgresql_generation_lifecycle_parity_and_aba_survival(monk
             if hasattr(store, "_session_db"):
                 assert raw_store._session_db.delete_session(promoted)
             else:
-                with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
-                    cursor.execute(f"DELETE FROM {_SCHEMA}.sessions WHERE id = %s", (promoted,))
-                    connection.commit()
+                _target().execute(f"DELETE FROM {_SCHEMA}.sessions WHERE id = %s", (promoted,))
             successor = f"generation-successor-{uuid.uuid4()}"
             store.ensure_session(successor, source=source, metadata={"session_key": key})
             store.end_session(successor, "session_reset")
@@ -753,8 +778,7 @@ def test_postgresql_git_metadata_generation_catalog_drift_fails_closed(monkeypat
             _reset_schema(dsn)
             store = open_state_store(_config())
             store.close()
-            with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-                cursor.execute(statement)
+            _target().execute(statement)
             with pytest.raises(StateStoreConfigurationError, match="Git metadata columns"):
                 open_state_store(_config())
     finally:
@@ -845,8 +869,7 @@ def test_contextual_profile_resolver_mixes_root_sqlite_named_postgresql_and_name
     root_db = SessionDB(root / "state.db")
     sqlite_db = SessionDB(sqlite_home / "state.db")
     pg_store = None
-    schema = "hermes_state_store_tenant_" + hashlib.sha256(
-        f"{pg_home.resolve()}\0pg-reader".encode("utf-8")).hexdigest()[:32]
+    schema = _SCHEMA
     try:
         root_db.create_session("root-context", source="integration")
         root_db.append_message("root-context", role="user", content="rootonlycontext")
@@ -884,8 +907,7 @@ def test_contextual_profile_resolver_mixes_root_sqlite_named_postgresql_and_name
         sqlite_db.close()
         if pg_store is not None:
             pg_store.close()
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
 
 
 def test_postgresql_rejects_injection_looking_schema_before_connecting():
@@ -934,10 +956,9 @@ def test_sqlite_and_postgresql_bounded_recent_compression_projection_parity(monk
             postgres.ensure_session(session_id, source=source, metadata={"model_config": config} if config else None)
             postgres.append_message(session_id, role="user", content=f"{session_id} preview")
         postgres.set_session_hidden(hidden, True)
-        with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
-            for session_id, activity in ((root, now - 100), (tip, now), (reset, now - 10), (hidden, now + 10), (delegated, now + 20), (excluded, now + 30)):
-                cursor.execute(f"UPDATE {_SCHEMA}.sessions SET last_activity_at = %s WHERE id = %s", (activity, session_id))
-                cursor.execute(f"UPDATE {_SCHEMA}.messages SET created_at = %s WHERE session_id = %s", (activity, session_id))
+        for session_id, activity in ((root, now - 100), (tip, now), (reset, now - 10), (hidden, now + 10), (delegated, now + 20), (excluded, now + 30)):
+            _target().execute(f"UPDATE {_SCHEMA}.sessions SET last_activity_at = %s WHERE id = %s", (activity, session_id))
+            _target().execute(f"UPDATE {_SCHEMA}.messages SET created_at = %s WHERE session_id = %s", (activity, session_id))
 
     try:
         seed_sqlite()
@@ -999,29 +1020,21 @@ def test_postgresql_search_contract_is_tenant_local_and_does_not_require_optiona
                 postgresql.search_messages(unsupported)
 
         # Generated tsvector maintenance survives canonical update/delete and an index rebuild.
-        with postgresql._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(f"UPDATE {postgresql._schema}.messages SET content = 'replacement token' WHERE session_id = %s AND role = 'user'", ("search-alpha",))
-            cursor.execute(f"DELETE FROM {postgresql._schema}.messages WHERE session_id = %s AND content LIKE %s", ("search-beta", "needle private%"))
-            cursor.execute(f"REINDEX INDEX {postgresql._schema}.messages_search_document_gin")
+        _target().execute(f"UPDATE {postgresql._schema}.messages SET content = 'replacement token' WHERE session_id = %s AND role = 'user'", ("search-alpha",))
+        _target().execute(f"DELETE FROM {postgresql._schema}.messages WHERE session_id = %s AND content LIKE %s", ("search-beta", "needle private%"))
+        _target().execute(f"REINDEX INDEX {postgresql._schema}.messages_search_document_gin")
         assert [row["session_id"] for row in postgresql.search_messages("replacement", fields=("session_id",))] == ["search-alpha"]
         assert all(row["session_id"] != "search-beta" for row in postgresql.search_messages("needle", fields=("session_id",)))
 
-        # Open a new store after removing optional extensions: search remains available because
-        # its only index/tokenizer dependency is built into PostgreSQL itself.
+        # This schema-local contract does not mutate database-wide optional extensions.
         postgresql.close()
         postgresql = None
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute("DROP EXTENSION IF EXISTS pg_trgm")
-            cursor.execute("DROP EXTENSION IF EXISTS vector")
         degraded = open_state_store(_config())
         try:
             assert degraded.search_messages("replacement", fields=("session_id",)) == [{"session_id": "search-alpha"}]
             assert degraded.search_messages("中文记忆", fields=("session_id",)) == [{"session_id": "search-beta"}]
         finally:
             degraded.close()
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
     finally:
         sqlite.close()
         if postgresql is not None:
@@ -1177,8 +1190,7 @@ def test_postgresql_generated_search_health_rebuild_and_contextual_admission(mon
         assert contextual.get_message_storage_state(message_id) == {"session_id": "health", "active": 1, "compacted": 0}
         assert contextual.search_messages("health", fields=("session_id",)) == [{"session_id": "health"}]
 
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP INDEX {_SCHEMA}.messages_search_document_gin")
+        _target().execute(f"DROP INDEX {_SCHEMA}.messages_search_document_gin")
         missing = postgresql.search_index_status()
         assert missing["available"] is False and missing["gin_index"] == "missing"
         # The predicate can sequential-scan, but contextual admission is explicitly fail-closed.
@@ -1189,9 +1201,8 @@ def test_postgresql_generated_search_health_rebuild_and_contextual_admission(mon
         assert repaired["available"] is True and repaired["rebuild"]["operation"] == "create"
         assert repaired["last_successful_rebuild_at"] is not None
 
-        with _psycopg().connect(dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f"DROP INDEX {_SCHEMA}.messages_search_document_gin")
-            cursor.execute(f"CREATE INDEX messages_search_document_gin ON {_SCHEMA}.messages (search_document)")
+        _target().execute(f"DROP INDEX {_SCHEMA}.messages_search_document_gin")
+        _target().execute(f"CREATE INDEX messages_search_document_gin ON {_SCHEMA}.messages (search_document)")
         assert postgresql.search_index_status()["gin_index"] == "invalid"
         assert postgresql.rebuild_search_index()["rebuild"]["operation"] == "replace_invalid"
         assert postgresql.search_index_status()["gin_index"] == "valid"

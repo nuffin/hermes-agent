@@ -12,6 +12,19 @@ revalidates that marker immediately before destructive teardown.
   - StateStore receives that schema at construction.
   - v20 catalog fault injection goes through `OwnedPostgreSQLTestTarget.execute`.
   - PG v19 acceptance and v20 rejection remain covered by the rotation gate.
+- `test_postgresql_state_store_slice.py` (28 tests)
+  - Every StateStore factory is routed to a fixture-owned UUID schema; root and named profile acquisitions obtain separately owned UUID targets through the same helper.
+  - Fixture reset, historical seed, catalog drift, index rebuild, and data fault injection use marker-validated target operations.
+  - Database-wide optional-extension mutation was removed from this family; it never changes shared named-volume state.
+- `test_postgresql_session_runtime_ownership.py` (5 tests)
+  - Runtime ownership stores are constructed against the owned schema; expiry, invalid-row rollback, and index-drift injection use the target helper.
+- `test_postgresql_delivery_ledger.py` (6 tests)
+  - The ledger uses `postgresql_delivery_target`; dedicated migration/catalog and index-drift coverage use its marker-validated target.
+- `test_postgresql_cli_session_store.py` (3 PostgreSQL lifecycle tests; 1 legacy SQLite control)
+  - CLI and AIAgent lifecycle factories receive the owned schema at construction; direct post-close schema deletion is removed.
+- `test_postgresql_owned_family_safety.py` (2 tests)
+  - A pre-existing shared sentinel schema/catalog record survives StateStore, runtime, and delivery migration construction unchanged.
+  - AST inventory rejects direct dangerous `cursor.execute` DDL/DML in the four migrated files. Explicit exemptions are catalog/data reads and the store-pool `SET/SHOW search_path` reset contract.
 
 ## Remaining migration inventory (not yet covered by this commit)
 
