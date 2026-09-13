@@ -13,12 +13,6 @@
     {
       "classification": "unported-legacy-runtime",
       "operation": "acquire",
-      "path": "cli.py",
-      "symbol": "HermesCLI._init_session_store"
-    },
-    {
-      "classification": "unported-legacy-runtime",
-      "operation": "acquire",
       "path": "cron/scheduler.py",
       "symbol": "_open_cron_session_db"
     },
