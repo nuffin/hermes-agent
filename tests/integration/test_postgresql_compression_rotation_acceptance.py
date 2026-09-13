@@ -202,20 +202,44 @@ def test_pg18_sigkill_during_real_transaction_is_rolled_back_without_replay(harn
     _assert_exact_oracle_snapshot(audit(_DSN, schema, parent))
 
 
-def test_pg18_production_rotation_interface_remains_precisely_fail_closed(harness):
+def test_pg18_production_rotation_interface_publishes_fenced_handoff(harness):
     schema, _parent = harness
     store = _store(schema)
     try:
-        assert _CAPABILITY not in getattr(store, "capabilities", ())
-        with pytest.raises(AttributeError):
-            getattr(store, "publish_compression_child")
-        pytest.xfail("atomic-compression-rotation-v1 production adapter is deliberately unsupported; selected PG fails before mutation")
+        parent, child, holder = "production-parent", "production-child", "production-owner"
+        store.ensure_session(parent, "telegram", metadata={
+            "model": "oracle/model", "model_config": {"max_tokens": None},
+            "session_key": "telegram:production", "chat_id": "chat", "profile_name": "tenant-a",
+        })
+        store.set_system_prompt(parent, "exact cached prompt")
+        assert store.try_acquire_compression_lock(parent, holder)
+        assert _CAPABILITY in store.capabilities
+        assert store.publish_compression_child(
+            parent_session_id=parent, child_session_id=child, source="telegram",
+            messages=[
+                {"role": "assistant", "content": "[CONTEXT COMPACTION] deterministic summary"},
+                {"role": "user", "content": "deterministic live tail"},
+            ], model="oracle/model", model_config={"max_tokens": None},
+            system_prompt="exact cached prompt", compression_lock_holder=holder,
+            require_compression_lease=True, require_lease_refresh=True,
+            request_id="production-rotation-request",
+        ) == child
+        assert store.publish_compression_child(
+            parent_session_id=parent, child_session_id=child, source="telegram",
+            messages=[{"role": "assistant", "content": "must not duplicate"}],
+            compression_lock_holder=holder, request_id="production-rotation-request",
+        ) == child
+        assert store.get_session(parent)["end_reason"] == "compression"
+        assert store.get_session(child)["parent_session_id"] == parent
+        assert [(row["role"], row["content"]) for row in store.get_message_records(child)] == [
+            ("assistant", "[CONTEXT COMPACTION] deterministic summary"), ("user", "deterministic live tail"),
+        ]
     finally:
         store.close()
 
 
 def test_pg18_unknown_catalog_version_is_rejected_fail_closed(postgresql_test_target: OwnedPostgreSQLTestTarget):
     store = _store(postgresql_test_target.schema); store.close()
-    postgresql_test_target.execute(f"INSERT INTO {postgresql_test_target.schema}.schema_migrations (version, applied_at) VALUES (20, 0)")
-    with pytest.raises(StateStoreConfigurationError, match=r"Unsupported PostgreSQL State Store schema migration versions: \[20\]"):
+    postgresql_test_target.execute(f"INSERT INTO {postgresql_test_target.schema}.schema_migrations (version, applied_at) VALUES (21, 0)")
+    with pytest.raises(StateStoreConfigurationError, match=r"Unsupported PostgreSQL State Store schema migration versions: \[21\]"):
         _store(postgresql_test_target.schema)
