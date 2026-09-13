@@ -536,6 +536,12 @@ class SessionDB(
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
+        # PostgreSQL currently implements a deliberately narrow StateStore
+        # slice, not SessionDB's complete runtime contract.  Refuse before
+        # mkdir/connect/schema work so a selected backend cannot fall through
+        # to this legacy SQLite implementation.
+        from state_store_runtime_readiness import require_legacy_state_db_runtime
+        require_legacy_state_db_runtime(home=get_hermes_home())
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
         # Keep only the opening call site, never a frame (which pins caller locals).
