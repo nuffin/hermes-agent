@@ -319,7 +319,12 @@ class SQLitePostgreSQLSandboxImporter:
     """Resumable importer for a newly isolated PostgreSQL StateStore schema only."""
 
     def __init__(
-        self, settings: PostgreSQLStateStoreConfig, dsn: str, *, schema: str
+        self,
+        settings: PostgreSQLStateStoreConfig,
+        dsn: str,
+        *,
+        schema: str,
+        owned_target: Any | None = None,
     ) -> None:
         if not _ISOLATED_SCHEMA_RE.fullmatch(schema):
             raise SQLitePostgreSQLImportError(
@@ -328,6 +333,17 @@ class SQLitePostgreSQLSandboxImporter:
         self._settings = settings
         self._dsn = dsn
         self._schema = schema
+        self._owned_target = owned_target
+        if (
+            owned_target is None
+            or getattr(owned_target, "dsn", None) != dsn
+            or getattr(owned_target, "schema", None) != schema
+            or not callable(getattr(owned_target, "verify", None))
+        ):
+            raise SQLitePostgreSQLImportError(
+                "SQLite import requires an ownership-validated target matching its explicit PostgreSQL routing"
+            )
+        assert owned_target is not None
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover
@@ -338,6 +354,8 @@ class SQLitePostgreSQLSandboxImporter:
         self._jsonb = Jsonb
 
     def _connect(self) -> Any:
+        assert self._owned_target is not None
+        self._owned_target.verify()
         return self._psycopg.connect(
             self._dsn, connect_timeout=self._settings.connect_timeout_seconds
         )
