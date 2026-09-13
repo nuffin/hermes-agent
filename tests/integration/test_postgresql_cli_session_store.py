@@ -101,8 +101,14 @@ def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_ho
         resumed.set_session_title(session_id, "PG resume title")
         assert resumed.resolve_session_by_title("PG resume title") == session_id
         assert resumed.search_sessions(source="cli", workspace_key="/tmp")[0]["id"] == session_id
+        before_rotation = {
+            "session": dict(resumed.get_session(session_id)),
+            "messages": list(resumed._store.get_message_records(session_id)),
+        }
         with pytest.raises(PostgreSQLCLISessionCapabilityError, match="no SQLite fallback"):
             resumed.archive_and_compact(session_id)
+        assert resumed.get_session(session_id) == before_rotation["session"]
+        assert resumed._store.get_message_records(session_id) == before_rotation["messages"]
     assert opens == []
     assert not (home / "state.db").exists()
 
