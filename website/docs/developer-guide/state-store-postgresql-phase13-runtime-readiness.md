@@ -171,6 +171,7 @@ resolver; it does not activate those unrelated runtime surfaces.
   PostgreSQL root or named active profile before route generation, transport
   activity, `state.db`, `sessions.json`, or JSONL output; a root SQLite store
   is rechecked under an active selected named profile; and
+- selected-PG `delegate_task(background=true)` reaches the async-dispatch boundary, rejects before its injected runner/external-child side effect, and opens no `state.db`;
 - default SQLite construction still creates/opens its configured `state.db`; and
 - the checked-in report contains no PostgreSQL DSN.
 
