@@ -32,7 +32,7 @@ PostgreSQL direct `search_messages()` returns the canonical ordered candidate fi
 
 ## Profile-aware routing prerequisite
 
-Contextual resolution now derives every root/default/named profile's backend from that profile's own `config.yaml`, not from the caller's profile metadata or a hard-coded `<profile>/state.db` path. The resolver reads the canonical profile directory directly, uses a context-local `HERMES_HOME` override only while acquiring PostgreSQL, and builds secrets from the same profile's `.env`; it never mutates process-global `HERMES_HOME` or borrows ambient secrets. SQLite retains its default and registry-backed behavior, with named-profile opens read-only.
+Contextual resolution now derives every root/default/named profile's backend from that profile's own `config.yaml`, not from the caller's profile metadata or a hard-coded `<profile>/state.db` path. `root`, `global`, and `default` explicitly canonicalize to the installation-root profile; a named target is registry-validated. An explicit target rejects injected database/factory seams, so an application cross-profile read cannot accidentally reuse the caller's SQLite store. The resolver reads the canonical profile directory directly, uses a context-local `HERMES_HOME` override only while acquiring PostgreSQL, and builds secrets from the same profile's `.env`; it never mutates process-global `HERMES_HOME` or borrows ambient secrets. SQLite retains its default and registry-backed behavior, with named-profile opens read-only. Cross-profile reads are intentional application routing, not a PostgreSQL permission grant or RLS boundary.
 
 For a configured PostgreSQL profile, the resolver enters the existing canonical-home tenant acquisition path and admits the store only after the full contextual-method and generated-search-health gate passes. It does not open that profile's SQLite database, does not select a schema from user input, and does not fall back across backend boundaries. Invalid backend configuration and injection-shaped profile names also fail before any SQLite fallback.
 
@@ -45,6 +45,10 @@ A valid PostgreSQL public cutover slice must introduce and differentially test t
 ## Exact remaining gaps / cutover boundary
 
 Not implemented or claimed: FTS5 BM25/tokenizer/CJK/trigram equivalence; SQLite corruption-detach/canonical-LIKE fallback/deferred-rebuild parity; migration/import/export; RLS authorization; production deployment; runtime/config cutover; or production readiness. The public PostgreSQL contextual route is limited to a configured tenant with a valid generated-document/GIN health gate; repair is local explicit maintenance, not a deployment recovery plan.
+
+## Shared-room root/global routing foundation
+
+Hosted-room coordination resolves only through the canonical installation root/global namespace (`shared-state.db`), independent of any selected execution profile. Profile identifiers remain application-level room-member routing data and never become SQL selectors. The SQLite coordination protocol remains the only available adapter; a PostgreSQL hosted-room adapter, backend selection, and runtime cutover are still pending a complete protocol implementation and verification.
 
 ## Delivery-obligation ledger cutover prerequisite
 
