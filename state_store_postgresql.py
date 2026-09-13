@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import importlib
 import json
+import math
 import queue
 import re
 import threading
@@ -20,6 +21,7 @@ from typing import Any, Collection
 
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
+from hermes_state_runtime_ownership import RuntimeOwner, RuntimeOwnershipReceipt, SessionRuntimeOwnershipMixin, TurnState
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
 from state_store_postgresql_search import compile_postgresql_search_expression
 from token_usage_transport import TokenUsageTransport
@@ -45,6 +47,7 @@ _SEARCH_DOCUMENT_SCHEMA_VERSION = 14
 _SEARCH_INDEX_SCHEMA_VERSION = 15
 _BOUNDED_BROWSE_SCHEMA_VERSION = 16
 _SEARCH_HEALTH_SCHEMA_VERSION = 17
+_SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION = 18
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -96,7 +99,7 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-class PostgreSQLStateStore:
+class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     """Thread-safe bounded psycopg connection pool for session/message persistence."""
 
     def __init__(self, settings: PostgreSQLStateStoreConfig, dsn: str, *, schema: str) -> None:
@@ -161,7 +164,7 @@ class PostgreSQLStateStore:
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SEARCH_HEALTH_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -182,6 +185,7 @@ class PostgreSQLStateStore:
                     (_SEARCH_INDEX_SCHEMA_VERSION, self._apply_v15, self._validate_v15),
                     (_BOUNDED_BROWSE_SCHEMA_VERSION, self._apply_v16, self._validate_v16),
                     (_SEARCH_HEALTH_SCHEMA_VERSION, self._apply_v17, self._validate_v17),
+                    (_SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION, self._apply_v18, self._validate_v18),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -518,6 +522,200 @@ class PostgreSQLStateStore:
     def _validate_v17(self, cursor: Any) -> None:
         self._validate_v15(cursor)
         self._required_columns(cursor, "search_index_maintenance", {"singleton", "last_success_at", "last_error"})
+
+    def _apply_v18(self, cursor: Any) -> None:
+        """Add the no-route, fenced runtime handoff evidence tables.
+
+        These tables intentionally have no foreign keys to prunable sessions and
+        no relationship to the StateStore migration ledger beyond this tenant's
+        catalog validation.  They are direct-test-only until a consumer can carry
+        the receipt through every effect boundary.
+        """
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.session_runtime_owners ("
+            "namespace text NOT NULL DEFAULT '', session_id text NOT NULL, "
+            "installation_id text NOT NULL, host text NOT NULL, process_generation text NOT NULL, "
+            "fence bigint NOT NULL CHECK (fence > 0), expires_at double precision NOT NULL, "
+            "updated_at double precision NOT NULL, PRIMARY KEY (namespace, session_id))"
+        )
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.session_runtime_turns ("
+            "namespace text NOT NULL DEFAULT '', session_id text NOT NULL, turn_id text NOT NULL, "
+            "state text NOT NULL CHECK (state IN ('running', 'indeterminate', 'settled')), "
+            "owner_fence bigint NOT NULL CHECK (owner_fence > 0), receipt_json jsonb, "
+            "created_at double precision NOT NULL, updated_at double precision NOT NULL, "
+            "PRIMARY KEY (namespace, session_id, turn_id))"
+        )
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS session_runtime_owners_expires ON {self._schema}.session_runtime_owners (expires_at)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS session_runtime_turns_state ON {self._schema}.session_runtime_turns (namespace, session_id, state)")
+
+    def _validate_v18(self, cursor: Any) -> None:
+        self._required_columns(cursor, "session_runtime_owners", {
+            "namespace", "session_id", "installation_id", "host", "process_generation", "fence", "expires_at", "updated_at",
+        })
+        self._required_columns(cursor, "session_runtime_turns", {
+            "namespace", "session_id", "turn_id", "state", "owner_fence", "receipt_json", "created_at", "updated_at",
+        })
+        self._require_index(cursor, "session_runtime_owners_expires")
+        self._require_index(cursor, "session_runtime_turns_state")
+
+    @staticmethod
+    def _runtime_namespace(namespace: str | None) -> str:
+        return (namespace or "").strip()
+
+    @staticmethod
+    def _runtime_ttl_seconds(ttl_seconds: float) -> float:
+        ttl = float(ttl_seconds)
+        if not math.isfinite(ttl):
+            raise ValueError("runtime ownership ttl_seconds must be finite")
+        return max(0.1, ttl)
+
+    def _ownership_lock_and_clock(self, cursor: Any, namespace: str, session_id: str) -> float:
+        """Serialize one owner key, including absent-row claims, then read server time."""
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"{self._schema}:runtime-owner:{namespace}:{session_id}",),
+        )
+        cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
+        row = cursor.fetchone()
+        return float(next(iter(row.values())) if isinstance(row, Mapping) else row[0])
+
+    @staticmethod
+    def _receipt_matches(row: Mapping[Any, Any], receipt: RuntimeOwnershipReceipt, now: float) -> bool:
+        owner = receipt.owner
+        return (
+            int(row["fence"]) == receipt.fence and float(row["expires_at"]) > now
+            and row["installation_id"] == owner.installation_id and row["host"] == owner.host
+            and row["process_generation"] == owner.process_generation
+        )
+
+    def acquire_session_runtime_ownership(
+        self, session_id: str, owner: RuntimeOwner, *, ttl_seconds: float = 300.0, namespace: str | None = None,
+    ) -> RuntimeOwnershipReceipt | None:
+        if not session_id:
+            return None
+        installation_id, host, process_generation = self._runtime_owner_columns(owner)
+        namespace = self._runtime_namespace(namespace)
+        ttl = self._runtime_ttl_seconds(ttl_seconds)
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._ownership_lock_and_clock(cursor, namespace, session_id)
+            expires_at = now + ttl
+            cursor.execute(
+                "SELECT installation_id, host, process_generation, fence, expires_at "
+                "FROM session_runtime_owners WHERE namespace=%s AND session_id=%s FOR UPDATE",
+                (namespace, session_id),
+            )
+            raw_row = cursor.fetchone()
+            row = None if raw_row is None else dict(zip(
+                ("installation_id", "host", "process_generation", "fence", "expires_at"), raw_row))
+            if row is None:
+                fence = 1
+                cursor.execute(
+                    "INSERT INTO session_runtime_owners (namespace, session_id, installation_id, host, process_generation, fence, expires_at, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (namespace, session_id, installation_id, host, process_generation, fence, expires_at, now),
+                )
+            elif (row["installation_id"], row["host"], row["process_generation"]) == (installation_id, host, process_generation):
+                fence = int(row["fence"])
+                cursor.execute(
+                    "UPDATE session_runtime_owners SET expires_at=%s, updated_at=%s WHERE namespace=%s AND session_id=%s AND fence=%s",
+                    (expires_at, now, namespace, session_id, fence),
+                )
+            elif float(row["expires_at"]) > now:
+                return None
+            else:
+                fence = int(row["fence"]) + 1
+                cursor.execute(
+                    "UPDATE session_runtime_owners SET installation_id=%s, host=%s, process_generation=%s, fence=%s, expires_at=%s, updated_at=%s "
+                    "WHERE namespace=%s AND session_id=%s AND fence=%s",
+                    (installation_id, host, process_generation, fence, expires_at, now, namespace, session_id, int(row["fence"])),
+                )
+                cursor.execute(
+                    "UPDATE session_runtime_turns SET state='indeterminate', updated_at=%s "
+                    "WHERE namespace=%s AND session_id=%s AND state='running' AND owner_fence < %s",
+                    (now, namespace, session_id, fence),
+                )
+        return RuntimeOwnershipReceipt(namespace, session_id, owner, fence, expires_at)
+
+    def renew_session_runtime_ownership(self, receipt: RuntimeOwnershipReceipt, *, ttl_seconds: float = 300.0) -> RuntimeOwnershipReceipt | None:
+        installation_id, host, process_generation = self._runtime_owner_columns(receipt.owner)
+        ttl = self._runtime_ttl_seconds(ttl_seconds)
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._ownership_lock_and_clock(cursor, receipt.namespace, receipt.session_id)
+            expires_at = now + ttl
+            cursor.execute(
+                "UPDATE session_runtime_owners SET expires_at=%s, updated_at=%s WHERE namespace=%s AND session_id=%s "
+                "AND installation_id=%s AND host=%s AND process_generation=%s AND fence=%s AND expires_at > %s",
+                (expires_at, now, receipt.namespace, receipt.session_id, installation_id, host, process_generation, receipt.fence, now),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return RuntimeOwnershipReceipt(receipt.namespace, receipt.session_id, receipt.owner, receipt.fence, expires_at)
+
+    def release_session_runtime_ownership(self, receipt: RuntimeOwnershipReceipt) -> bool:
+        installation_id, host, process_generation = self._runtime_owner_columns(receipt.owner)
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._ownership_lock_and_clock(cursor, receipt.namespace, receipt.session_id)
+            # Keep the row as a durable fence tombstone; a later owner can never reuse a fence.
+            cursor.execute(
+                "UPDATE session_runtime_owners SET expires_at=%s, updated_at=%s WHERE namespace=%s AND session_id=%s "
+                "AND installation_id=%s AND host=%s AND process_generation=%s AND fence=%s",
+                (now, now, receipt.namespace, receipt.session_id, installation_id, host, process_generation, receipt.fence),
+            )
+            return cursor.rowcount == 1
+
+    def begin_session_runtime_turn(self, receipt: RuntimeOwnershipReceipt, turn_id: str) -> bool:
+        if not turn_id:
+            return False
+        self._runtime_owner_columns(receipt.owner)
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._ownership_lock_and_clock(cursor, receipt.namespace, receipt.session_id)
+            cursor.execute("SELECT installation_id, host, process_generation, fence, expires_at FROM session_runtime_owners "
+                           "WHERE namespace=%s AND session_id=%s FOR UPDATE", (receipt.namespace, receipt.session_id))
+            raw_owner = cursor.fetchone()
+            owner = None if raw_owner is None else dict(zip(
+                ("installation_id", "host", "process_generation", "fence", "expires_at"), raw_owner))
+            if owner is None or not self._receipt_matches(owner, receipt, now):
+                return False
+            cursor.execute("SELECT state, owner_fence FROM session_runtime_turns WHERE namespace=%s AND session_id=%s AND turn_id=%s FOR UPDATE",
+                           (receipt.namespace, receipt.session_id, turn_id))
+            raw_row = cursor.fetchone()
+            row = None if raw_row is None else dict(zip(("state", "owner_fence"), raw_row))
+            if row is not None:
+                return row["state"] == "running" and int(row["owner_fence"]) == receipt.fence
+            cursor.execute(
+                "INSERT INTO session_runtime_turns (namespace, session_id, turn_id, state, owner_fence, receipt_json, created_at, updated_at) "
+                "VALUES (%s, %s, %s, 'running', %s, NULL, %s, %s)",
+                (receipt.namespace, receipt.session_id, turn_id, receipt.fence, now, now),
+            )
+            return True
+
+    def resolve_session_runtime_turn(self, receipt: RuntimeOwnershipReceipt, turn_id: str, *, state: TurnState, receipt_data: dict | None = None) -> bool:
+        if state not in {"settled", "indeterminate"} or not turn_id:
+            return False
+        if state == "settled" and receipt_data is None:
+            raise ValueError("settled turn requires a verified receipt")
+        self._runtime_owner_columns(receipt.owner)
+        with self._connection() as connection, connection.cursor() as cursor:
+            now = self._ownership_lock_and_clock(cursor, receipt.namespace, receipt.session_id)
+            cursor.execute("SELECT installation_id, host, process_generation, fence, expires_at FROM session_runtime_owners "
+                           "WHERE namespace=%s AND session_id=%s FOR UPDATE", (receipt.namespace, receipt.session_id))
+            raw_owner = cursor.fetchone()
+            owner = None if raw_owner is None else dict(zip(
+                ("installation_id", "host", "process_generation", "fence", "expires_at"), raw_owner))
+            if owner is None or not self._receipt_matches(owner, receipt, now):
+                return False
+            cursor.execute("SELECT state, receipt_json FROM session_runtime_turns WHERE namespace=%s AND session_id=%s AND turn_id=%s FOR UPDATE",
+                           (receipt.namespace, receipt.session_id, turn_id))
+            raw_row = cursor.fetchone()
+            row = None if raw_row is None else dict(zip(("state", "receipt_json"), raw_row))
+            if row is None or row["state"] == "settled":
+                return False
+            payload = json.dumps(receipt_data, sort_keys=True) if receipt_data is not None else None
+            cursor.execute("UPDATE session_runtime_turns SET state=%s, receipt_json=%s::jsonb, updated_at=%s "
+                           "WHERE namespace=%s AND session_id=%s AND turn_id=%s AND state IN ('running', 'indeterminate')",
+                           (state, payload, now, receipt.namespace, receipt.session_id, turn_id))
+            return cursor.rowcount == 1
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
