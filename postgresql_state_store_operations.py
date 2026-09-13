@@ -28,6 +28,7 @@ _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 _REQUIRED_TABLES = (
     "schema_migrations", "sessions", "messages", "system_prompts", "session_model_usage",
     "conversation_generations", "session_runtime_owners", "session_runtime_turns",
+    "compression_locks", "session_turn_leases",
 )
 
 
@@ -186,7 +187,7 @@ class PostgreSQLSandboxOperations:
                 "WHERE expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
             )
             active_leases = int(cursor.fetchone()[0])
-        if migrations != list(range(1, 19)):
+        if migrations != list(range(1, 20)):
             raise PostgreSQLSandboxOperationsError("PostgreSQL tenant migration catalog is unhealthy")
         with connection.cursor() as cursor:
             cursor.execute(
