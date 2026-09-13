@@ -50,6 +50,7 @@ _BOUNDED_BROWSE_SCHEMA_VERSION = 16
 _SEARCH_HEALTH_SCHEMA_VERSION = 17
 _SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION = 18
 _COMPRESSION_COORDINATION_SCHEMA_VERSION = 19
+_COMPRESSION_ROTATION_SCHEMA_VERSION = 20
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -166,7 +167,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _COMPRESSION_COORDINATION_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _COMPRESSION_ROTATION_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -189,6 +190,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_SEARCH_HEALTH_SCHEMA_VERSION, self._apply_v17, self._validate_v17),
                     (_SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION, self._apply_v18, self._validate_v18),
                     (_COMPRESSION_COORDINATION_SCHEMA_VERSION, self._apply_v19, self._validate_v19),
+                    (_COMPRESSION_ROTATION_SCHEMA_VERSION, self._apply_v20, self._validate_v20),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -606,6 +608,33 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._required_columns(cursor, "session_turn_leases", {"conversation_id", "holder", "fence", "expires_at", "updated_at"})
         self._require_index(cursor, "compression_locks_expires")
         self._require_index(cursor, "session_turn_leases_expires")
+
+    def _apply_v20(self, cursor: Any) -> None:
+        """Ledger every atomic compression publication before exposing rotation.
+
+        The receipt is deliberately tenant-local and records the holder/fence that
+        committed it.  A lost acknowledgement can therefore be classified by a
+        later read; callers never need to replay an indeterminate request.
+        """
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.compression_rotation_receipts ("
+            "request_id text PRIMARY KEY, parent_session_id text NOT NULL "
+            f"REFERENCES {self._schema}.sessions(id), child_session_id text NOT NULL "
+            f"REFERENCES {self._schema}.sessions(id), holder text NOT NULL, fence bigint NOT NULL CHECK (fence > 0), "
+            "committed_at double precision NOT NULL)"
+        )
+        cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS compression_rotation_receipts_child_unique ON {self._schema}.compression_rotation_receipts (child_session_id)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS compression_rotation_receipts_parent ON {self._schema}.compression_rotation_receipts (parent_session_id, committed_at)")
+
+    def _validate_v20(self, cursor: Any) -> None:
+        self._validate_v19(cursor)
+        self._required_columns(cursor, "compression_rotation_receipts", {
+            "request_id", "parent_session_id", "child_session_id", "holder", "fence", "committed_at",
+        })
+        self._require_index(cursor, "compression_rotation_receipts_child_unique")
+        self._require_index(cursor, "compression_rotation_receipts_parent")
+        self._require_foreign_key(cursor, "compression_rotation_receipts_parent_session_id_fkey", "compression_rotation_receipts", "sessions")
+        self._require_foreign_key(cursor, "compression_rotation_receipts_child_session_id_fkey", "compression_rotation_receipts", "sessions")
 
     @staticmethod
     def _runtime_namespace(namespace: str | None) -> str:
@@ -1027,6 +1056,86 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 )
         return len(records)
 
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        """Explicitly advertised durable capabilities; never infer from methods."""
+        return ("atomic-compression-rotation-v1",)
+
+    def get_active_message_watermark(self, session_id: str) -> int:
+        """Tenant-local high-water mark used to preserve a concurrent parent tail."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COALESCE(MAX(id), 0) FROM {self._schema}.messages WHERE session_id=%s AND active", (session_id,))
+            return int(cursor.fetchone()[0])
+
+    def publish_compression_child(
+        self, *, parent_session_id: str, child_session_id: str, source: str,
+        messages: list[dict[str, Any]], model: str | None = None, model_config: dict[str, Any] | None = None,
+        system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None,
+        compression_lock_holder: str | None = None, require_compression_lease: bool = True,
+        require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
+        watermark: int | None = None, watermark_ceiling: int | None = None,
+        request_id: str | None = None,
+    ) -> str:
+        """Commit one fenced parent→child handoff or leave no partial mutation.
+
+        Receipt lookup happens under the same parent advisory lock as lease
+        validation.  A caller may safely inspect a returned receipt after a lost
+        acknowledgement, but this method deliberately never retries an unknown
+        request on its own.
+        """
+        if not parent_session_id or not child_session_id or not messages:
+            raise ValueError("compression publication requires parent, child, and non-empty handoff")
+        receipt_id = request_id or child_session_id
+        record_fields = MessageRecord.__dataclass_fields__
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            now = self._coordination_clock_and_lock(cursor, "compression_locks", parent_session_id)
+            cursor.execute(f"SELECT child_session_id FROM {self._schema}.compression_rotation_receipts WHERE request_id=%s FOR UPDATE", (receipt_id,))
+            receipt = cursor.fetchone()
+            if receipt is not None:
+                if receipt["child_session_id"] != child_session_id:
+                    raise RuntimeError("compression receipt request id was reused for another child")
+                return str(receipt["child_session_id"])
+            cursor.execute(f"SELECT holder, fence, expires_at FROM {self._schema}.compression_locks WHERE session_id=%s FOR UPDATE", (parent_session_id,))
+            lease = cursor.fetchone()
+            if require_compression_lease:
+                if not compression_lock_holder or lease is None or lease["holder"] != compression_lock_holder:
+                    raise RuntimeError(f"Compression lease lost before publication: {parent_session_id}")
+                if require_lease_refresh:
+                    cursor.execute(f"UPDATE {self._schema}.compression_locks SET expires_at=%s, updated_at=%s WHERE session_id=%s AND holder=%s AND fence=%s", (now + self._coordination_ttl(lease_ttl_seconds), now, parent_session_id, compression_lock_holder, lease["fence"]))
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(f"Compression lease refresh lost before publication: {parent_session_id}")
+                elif float(lease["expires_at"]) <= now:
+                    raise RuntimeError(f"Compression lease expired before publication: {parent_session_id}")
+            fence = int(lease["fence"]) if lease is not None else 1
+            cursor.execute(f"SELECT * FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (parent_session_id,))
+            parent = cursor.fetchone()
+            if parent is None:
+                raise RuntimeError(f"Compression parent not found: {parent_session_id}")
+            if parent["ended_at"] is not None:
+                raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
+            # ``sessions`` keeps only the prompt hash; callers publish the live
+            # cached prompt.  A missing prompt remains intentionally absent.
+            prompt = system_prompt
+            prompt_hash = None if prompt is None else hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            if prompt_hash is not None:
+                cursor.execute(f"INSERT INTO {self._schema}.system_prompts (hash, prompt) VALUES (%s, %s) ON CONFLICT (hash) DO NOTHING", (prompt_hash, prompt))
+            # The title index is intentionally unique. Move the title with the
+            # lineage boundary rather than duplicating it on the closed parent.
+            cursor.execute(f"UPDATE {self._schema}.sessions SET ended_at=%s, end_reason='compression', title=NULL, title_source=NULL WHERE id=%s AND ended_at IS NULL", (now, parent_session_id))
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Compression parent changed during publication: {parent_session_id}")
+            columns = ("id", "source", "started_at", "model", "model_config", "system_prompt_hash", "parent_session_id", "cwd", "git_branch", "git_repo_root", "profile_name", "user_id", "session_key", "chat_id", "chat_type", "thread_id", "display_name", "origin_json", "title", "title_source", "hidden", "archived", "pinned", "last_activity_at")
+            values = (child_session_id, source or parent["source"], now, model or parent["model"], self._psycopg.types.json.Jsonb(model_config) if model_config else parent["model_config"], prompt_hash, parent_session_id, cwd or parent["cwd"], parent["git_branch"], parent["git_repo_root"], profile_name or parent["profile_name"], parent["user_id"], parent["session_key"], parent["chat_id"], parent["chat_type"], parent["thread_id"], parent["display_name"], parent["origin_json"], parent["title"], parent["title_source"], parent["hidden"], parent["archived"], parent["pinned"], now)
+            cursor.execute(f"INSERT INTO {self._schema}.sessions ({', '.join(columns)}) VALUES ({', '.join('%s' for _ in columns)})", values)
+            for message in messages:
+                record = MessageRecord(**{name: message[name] for name in record_fields if name in message})
+                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(21))})", self._record_params(child_session_id, record))
+            if watermark is not None:
+                upper = int(watermark_ceiling) if watermark_ceiling is not None else 9223372036854775807
+                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_COLUMNS)}) SELECT %s, role, content, created_at, {', '.join(_MESSAGE_RECORD_COLUMNS)} FROM {self._schema}.messages WHERE session_id=%s AND active AND id > %s AND id <= %s ORDER BY id", (child_session_id, parent_session_id, int(watermark), upper))
+            cursor.execute(f"INSERT INTO {self._schema}.compression_rotation_receipts (request_id, parent_session_id, child_session_id, holder, fence, committed_at) VALUES (%s, %s, %s, %s, %s, %s)", (receipt_id, parent_session_id, child_session_id, compression_lock_holder or "unleased", fence, now))
+        return child_session_id
+
     @staticmethod
     def _coordination_ttl(ttl_seconds: float) -> float:
         ttl = float(ttl_seconds)
@@ -1042,8 +1151,9 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         never coordinate accidentally.
         """
         cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{self._schema}:{kind}:{key}",))
-        cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
-        return float(cursor.fetchone()[0])
+        cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp()) AS server_now")
+        row = cursor.fetchone()
+        return float(row["server_now"] if isinstance(row, Mapping) else row[0])
 
     def touch_session_activity(self, session_id: str, ts: float | None = None, *, description: str | None = None,
                                provenance: Any = None) -> None:
