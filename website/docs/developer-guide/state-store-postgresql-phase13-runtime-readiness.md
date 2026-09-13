@@ -44,12 +44,31 @@ acceptance coverage and are not claims that those runtime consumers are activate
 Activation remains blocked outside that bounded CLI path by these capabilities:
 
 - contextual session search/lineage contract;
-- gateway delivery-ledger routing; and
+- gateway delivery-ledger runtime/recovery routing (except the explicit,
+  dependency-injected final-response consumer described below); and
 - async-delegation ledger routing.
 
 The error names the missing capabilities and points here. This is deliberately
 not a claim that gateway, cron, TUI, ACP, async-delegation, or hosted-room
 runtime is PostgreSQL-ready.
+
+## Bounded injected final-delivery ledger consumer
+
+`BasePlatformAdapter.send_final_ledgered()` is the sole gateway consumer that
+may receive a PostgreSQL ledger, and only when a caller explicitly constructs
+`open_configured_delivery_ledger()` and injects it as `adapter.delivery_ledger`.
+The five-method port is restricted to obligation, fenced claim, delivered,
+failed, and unsent-claim release transitions; no raw connection is available to
+the consumer. PostgreSQL configuration alone does not inject it, start a
+gateway, route sessions, or select a recovery sweep. SQLite remains the
+default when no ledger is injected.
+
+`tests/integration/test_postgresql_delivery_ledger.py` uses an owned PG18 UUID
+schema and traps `sqlite3.connect`: final obligation/claim/ack completes with
+no `state.db` open and a fake sender is never invoked by the ledger bracket.
+This is consumer/ledger evidence only. Gateway startup recovery, session
+persistence/routing, cron, TUI/API, ACP, hosted rooms, async delegation, and
+contextual search remain unported and fail closed under selected PostgreSQL.
 
 ## Sandbox fixture and proof
 
