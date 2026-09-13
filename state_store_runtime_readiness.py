@@ -212,9 +212,11 @@ def inspect_runtime_activation(
     return RuntimeActivationReport(
         selected_backend="postgresql", profile_home=str(canonical_home), profile_name=profile_name,
         tenant_schema=tenant_schema,
-        supported_capabilities=("narrow-state-store", "profile-derived-tenant-schema"),
+        supported_capabilities=(
+            "narrow-state-store", "profile-derived-tenant-schema",
+            "cli-fresh-resume-session-contract",
+        ),
         missing_capabilities=(
-            "full-sessiondb-runtime-contract",
             "contextual-session-search-contract",
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
