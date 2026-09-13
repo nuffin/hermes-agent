@@ -599,19 +599,31 @@ def _contextual_profile_home(home: Path):
         reset_hermes_home_override(token)
 
 
-def _profile_contextual_home(profile: str | None) -> Path:
-    """Return a canonical existing profile home without accepting caller paths."""
+def _canonical_contextual_profile(profile: str | None) -> tuple[str | None, Path]:
+    """Return the canonical target identity and home without accepting caller paths.
+
+    ``None`` is the caller's already-bound local profile.  A supplied selector
+    is explicit application routing: ``root``/``global`` and ``default`` all
+    name the installation-root profile, while named profiles are registry
+    entries.  The selector is never a PostgreSQL identifier or permission.
+    """
     if profile is None:
         from hermes_constants import get_hermes_home
 
-        return get_hermes_home().expanduser().resolve(strict=True)
+        return None, get_hermes_home().expanduser().resolve(strict=True)
     from hermes_cli import profiles as profiles_mod
 
-    canonical_profile = profiles_mod.normalize_profile_name(profile)
+    requested = str(profile).strip()
+    canonical_profile = "default" if requested.casefold() in {"root", "global"} else profiles_mod.normalize_profile_name(requested)
     profiles_mod.validate_profile_name(canonical_profile)
     if not profiles_mod.profile_exists(canonical_profile):
         raise ValueError(f"profile '{canonical_profile}' does not exist")
-    return profiles_mod.get_profile_dir(canonical_profile).expanduser().resolve(strict=True)
+    return canonical_profile, profiles_mod.get_profile_dir(canonical_profile).expanduser().resolve(strict=True)
+
+
+def _profile_contextual_home(profile: str | None) -> Path:
+    """Compatibility helper returning only the canonical contextual home."""
+    return _canonical_contextual_profile(profile)[1]
 
 
 def _profile_state_store_config(home: Path) -> Mapping[str, Any]:
@@ -646,10 +658,13 @@ def resolve_contextual_session_search_store(
     A named profile is identified only through the profile registry; neither a
     caller-supplied database path nor a caller-supplied PostgreSQL schema is
     accepted.  PostgreSQL is acquired under that canonical home so its tenant
-    selection remains the trusted ``postgresql_tenant_schema`` path, then fails
-    closed because it has not implemented contextual recall.
+    selection remains the trusted ``postgresql_tenant_schema`` path, then is
+    admitted only when its complete contextual and generated-search contracts
+    are healthy.
     """
-    home = _profile_contextual_home(profile)
+    target_profile, home = _canonical_contextual_profile(profile)
+    if target_profile is not None and (session_db is not None or session_db_factory is not None):
+        raise ValueError("an explicit contextual target profile cannot use an injected session database")
     config = _profile_state_store_config(home)
     resolved = resolve_state_store_config(
         config,
