@@ -65,10 +65,26 @@ def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_ho
         stores.append(fresh)
         fresh.create_session(session_id, "cli", model="test-model", model_config={"provider": "local"},
                              system_prompt="stable system prompt", cwd="/tmp", profile_name="pg-cli-test")
+        single_id = fresh.append_message(
+            session_id, "user", {"text": "remember postgresql resume"},
+            platform_message_id="single-identity", timestamp=1_789_000_000,
+            display_metadata={"origin": "single"},
+        )
+        assert single_id > 0
         assert fresh.append_messages_batch(session_id, [
-            {"role": "user", "content": "remember postgresql resume"},
             {"role": "assistant", "content": "persisted answer", "finish_reason": "stop"},
+            {"role": "tool", "content": None, "tool_call_id": "null-content"},
         ]) == 2
+        records = fresh._store.get_message_records(session_id)
+        assert [(row["content"], row["platform_message_id"], row["tool_call_id"])
+                for row in records] == [
+            ({"text": "remember postgresql resume"}, "single-identity", None),
+            ("persisted answer", None, None),
+            (None, None, "null-content"),
+        ]
+        with pytest.raises(PostgreSQLCLISessionCapabilityError, match="single-message controls"):
+            fresh.append_message(session_id, "user", "must not write", compression_lock_holder="sqlite-only")
+        assert len(fresh._store.get_message_records(session_id)) == 3
         fresh.end_session(session_id, "cli_close")
         assert fresh.get_session(session_id)["ended_at"] is not None
         fresh.close()
@@ -76,8 +92,8 @@ def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_ho
         resumed = _open(stores)
         assert resumed.get_session(session_id)["system_prompt"] == "stable system prompt"
         restored, display = resumed.get_resume_conversations(session_id)
-        assert [row["content"] for row in restored] == ["remember postgresql resume", "persisted answer"]
-        assert [row["content"] for row in display] == ["remember postgresql resume", "persisted answer"]
+        assert [row["content"] for row in restored] == [{"text": "remember postgresql resume"}, "persisted answer", None]
+        assert [row["content"] for row in display] == [{"text": "remember postgresql resume"}, "persisted answer", None]
         resumed.reopen_session(session_id)
         assert resumed.get_session(session_id)["ended_at"] is None
         assert resumed.search_sessions(source="cli")[0]["id"] == session_id
