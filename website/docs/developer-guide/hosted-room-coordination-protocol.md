@@ -6,6 +6,8 @@ This protocol names the durable coordination contract currently implemented by t
 
 ## Scope and non-goals
 
+The target uses one PostgreSQL instance. Hosted-room coordination is root/global shared state and may intentionally span profile namespaces; this is not a mandatory profile ACL model. It does not share browser/YOLO/CUA approval authority: one-time approvals remain process-local and fail closed.
+
 The protocol owns durable coordination state for a hosted room and its peer, driver, replica, and policy-projection workflows. It does **not** own:
 
 - process-local work such as asyncio locks, active model calls, in-memory retry timers, or an adapter connection;
@@ -16,12 +18,12 @@ A committed database update proves only its own durable fact. In particular, a q
 
 ## Stable identities and fence values
 
-Every future backend operation MUST receive a trusted tenant and stable identity rather than derive ownership from a PID or client-provided profile string.
+Every future backend operation MUST receive a trusted namespace-routing context and stable identity rather than derive ownership from a PID or client-provided profile string. This distinguishes trusted selector construction from product authorization: Hermes profiles are logical namespaces, and an explicit user-directed cross-profile read is allowed.
 
 | Type | Required fields | Purpose |
 |---|---|---|
-| `TenantId` | root/profile namespace resolved by trusted runtime context | Isolation boundary; not optional metadata. |
-| `RoomId` | tenant-local opaque ID | Durable room identity, permanently reserved after retention expiry. |
+| `NamespaceId` | root/profile namespace resolved by trusted runtime context, or root/global shared-coordination namespace | Routing and accidental-mixing boundary; not a profile ACL or entitlement. |
+| `RoomId` | root/global shared-coordination opaque ID | Durable room identity, permanently reserved after retention expiry. |
 | `AuthorityFence` | `room_id`, `gateway_id`, monotonic `authority_epoch` | Fences event admission, driver actions, replica promotion, and peer reservations. |
 | `OwnerId` | installation ID, host identity, process-generation UUID | Identifies a live worker incarnation; PID alone is invalid across hosts/restarts. |
 | `LeaseFence` | `AuthorityFence`, `OwnerId`, monotonic `lease_generation`, expiry | Authorizes driver transitions only while current and unexpired. |
@@ -43,7 +45,7 @@ The backend obtains expiry from its transaction-time clock or a documented clock
 | Replica | `hosted_room_replicas`, `hosted_room_replica_events` | Contiguous replica history and authority lineage for promotion/demotion. |
 | Policy projection | `hosted_room_policy_cursors`, `hosted_room_policy_threads`, `hosted_room_policy_events`, `hosted_room_policy_watermarks`, `hosted_room_policy_publications`, `hosted_room_policy_transcript`, `hosted_room_policy_transcript_state` | Bounded, rebuildable projection of the source log; it never replaces the source log. |
 
-All durable objects are tenant-owned. A PostgreSQL schema must enforce tenant predicates/keys in every primary key, foreign key, unique constraint, query, lock key, migration record, and administrative path.
+Session/profile content remains in its resolved profile namespace by default; resolvers may intentionally open a target profile namespace for an explicit user-directed cross-profile read. Hosted-room coordination is root/global shared state because a room may intentionally span profiles. A PostgreSQL implementation must carry its derived namespace key through every query, lock key, migration record, and administrative path to prevent accidental mixing or SQL-selector injection; that routing discipline is not mandatory RLS, database-role, or per-schema ACL enforcement.
 
 ## Required operations and atomicity
 
@@ -79,13 +81,13 @@ Existing source-focused suites additionally cover concurrent append/claim, rollb
 
 A future implementation must not begin a partial table migration or runtime route until all of the following have a concrete design and executable evidence:
 
-1. Trusted root/profile `TenantId` resolver, propagated through every consumer and enforced by row-level/data-model constraints; explicit cross-tenant isolation tests.
-2. Dedicated per-tenant migration ledger distinct from business tables, with resumable object-level verification and immutable source snapshot identity.
+1. Trusted root/profile namespace resolver, propagated through every consumer; tests for default local routing, explicit cross-profile target reads, root/global shared-room routing, selector-injection rejection, and accidental-mixing prevention. RLS/database-role ACL is optional operator hardening, not a prerequisite.
+2. Dedicated per-namespace migration ledger distinct from business tables, with resumable object-level verification and immutable source snapshot identity.
 3. Declared transaction isolation and retry policy, including serialization/deadlock classification and no retry of irreversible side effects.
-4. Row/advisory-lock design keyed by tenant + room, plus transactional fence-token guards on every authority/lease/attempt transition.
+4. Row/advisory-lock design keyed by namespace + room, plus transactional fence-token guards on every authority/lease/attempt transition.
 5. PostgreSQL server-time expiry semantics, stable installation+host+process-generation owner identity, and skew/crash takeover tests.
 6. Complete SQLite import, single controlled cutover, and reverse rollback design. No dual-write, partial table cutover, or automatic runtime fallback is assumed safe.
-7. PG18/SQLite differential contract suite covering all protocol operations, contention, crash/failure injection, ordering, retention, revocation, tenant isolation, and externally observed reconciliation boundaries.
+7. PG18/SQLite differential contract suite covering all protocol operations, contention, crash/failure injection, ordering, retention, revocation, namespace-routing/mix-up protection, and externally observed reconciliation boundaries.
 8. A verified consumer migration proving no hosted-room/driver/policy runtime path opens SQLite before any claim of PostgreSQL readiness.
 
 Until then, PostgreSQL readiness is explicitly **not established**.
