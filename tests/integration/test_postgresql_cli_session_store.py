@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 
+import json
 from pathlib import Path
 import time
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -180,6 +182,71 @@ def test_agent_lazy_recall_acquisition_persists_and_resumes_without_sqlite(pg_cl
         assert [row["content"] for row in restored] == ["fresh agent turn", "persisted agent answer", "lease-owned write"]
         resumed.reopen_session(session_id)
         assert resumed.get_session(session_id)["ended_at"] is None
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_inline_session_search_uses_selected_postgresql_contextual_contract_without_sqlite(pg_cli_home):
+    """The agent's public inline tool keeps the selected tenant and full response shapes."""
+    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    session_id, history_id = "20260914_010203_pg_search_live", "20260914_010203_pg_search_history"
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("hermes_cli.config.load_config", return_value=_CONFIG),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="http://127.0.0.1/offline",
+                       quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id)
+        store = cast(Any, agent._get_session_db_for_recall())
+        stores.append(store)
+        store.create_session(history_id, "cli")
+        store.set_session_title(history_id, "Selected PostgreSQL contextual history")
+        store.append_message(history_id, "user", "opening contextual evidence", timestamp=10)
+        anchor = store.append_message(history_id, "assistant", "中文记忆 selected PostgreSQL anchor", timestamp=20)
+        store.append_message(history_id, "tool", "tool boundary", timestamp=30)
+        store.append_message(history_id, "assistant", "closing contextual evidence", timestamp=40)
+        assert store.search_index_status()["backend"] == "postgresql"
+        from state_store import contextual_session_search_store
+        from tools.session_search_tool import session_search
+        assert contextual_session_search_store(store) is store
+        direct = json.loads(session_search(query="中文记忆", db=store))
+        assert direct["success"] is True, direct
+        assert agent._get_session_db_for_recall() is store
+
+        def invoke(args):
+            return json.loads(INLINE_TOOL_EXECUTORS["session_search"](
+                agent, args, InlineToolContext(effective_task_id="selected-pg-contextual")))
+
+        discovered = invoke({"query": "中文记忆", "detail": "full", "limit": 3})
+        assert discovered["success"] is True, discovered
+        assert discovered["mode"] == "discover"
+        assert discovered["search_index"]["backend"] == "postgresql"
+        assert discovered["search_index"]["available"] is True
+        hit = next(result for result in discovered["results"] if result["session_id"] == history_id)
+        assert hit["match_message_id"] == anchor
+        assert [message["content"] for message in hit["messages"]] == [
+            "opening contextual evidence", "中文记忆 selected PostgreSQL anchor", "closing contextual evidence",
+        ]
+
+        scrolled = invoke({"session_id": history_id, "around_message_id": anchor, "window": 1})
+        assert scrolled["success"] is True and scrolled["mode"] == "scroll"
+        assert [message["id"] for message in scrolled["messages"]] == [anchor - 1, anchor, anchor + 1]
+        read = invoke({"session_id": history_id})
+        assert read["success"] is True and read["mode"] == "read" and read["message_count"] == 4
+        browsed = invoke({})
+        assert browsed["success"] is True and browsed["mode"] == "browse"
+        assert history_id in [result["session_id"] for result in browsed["results"]]
+        grammar_error = invoke({"query": "中文 AND memory"})
+        assert grammar_error["success"] is False
+        assert "unsupported or ambiguous" in grammar_error["error"]
+        rebuilt = store.rebuild_search_index()
+        assert rebuilt["backend"] == "postgresql" and rebuilt["available"] is True
+        assert invoke({"query": "中文记忆"})["success"] is True
     assert opens == []
     assert not (home / "state.db").exists()
 

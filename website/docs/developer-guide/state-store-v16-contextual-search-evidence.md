@@ -4,9 +4,12 @@
 
 - `b68ccbe76f4e85b539a4c05d69ec59ea8e06f636` — `Change-Id: I83b2756b073f43529edf63e0a9edee40`; migration v16 bounded browse projection, 42 tests. This did not route the complete contextual tool or authorize a backend cutover.
 
-## Decision: no partial contextual projection is portable
+## Decision: complete contextual projection is portable, but runtime activation is bounded
 
-No independently complete contextual `session_search` projection group is currently exposed through `StateStore`. PostgreSQL remains intentionally limited to raw lexical candidate rows. This document records a fail-closed non-implementation rather than returning lexical rows as a substitute for the existing contextual API.
+The complete backend-neutral contextual `session_search` projection group is exposed
+through `StateStore` and admitted for a configured PostgreSQL tenant only after its
+generated-search health gate passes. This document records that verified scope; it is
+not a general PostgreSQL runtime cutover.
 
 ## SQLite contract that a cutover must preserve
 
@@ -28,7 +31,7 @@ PostgreSQL direct `search_messages()` returns the canonical ordered candidate fi
 
 `state_store.ContextualSessionSearchStore` now publishes the atomic contextual-read boundary independently from the incremental write-oriented `StateStore`. `SqliteContextualSessionSearchStore` delegates every required operation to the existing `SessionDB` implementation: canonical candidate search, title/session lookup, anchored detail and scroll views, message visibility state, bounded browse, and public search-index rebuild status.
 
-`tools.session_search_tool` coerces both lazily acquired and injected SQLite stores through this capability before dispatching every public shape. The former tool-private `SessionDB._lock`/`_conn` visibility read now lives solely inside the SQLite adapter. Named-profile resolution likewise opens a read-only contextual store, preserving profile isolation and closing ownership.
+`tools.session_search_tool` coerces both lazily acquired and injected contextual stores through this capability before dispatching every public shape. The former tool-private `SessionDB._lock`/`_conn` visibility read now lives solely inside the SQLite adapter. The selected PostgreSQL CLI facade forwards the already-complete contextual read primitives to the public inline consumer; it is not SQLite emulation. Named-profile resolution likewise opens a read-only contextual store, preserving profile isolation and closing ownership.
 
 ## Profile-aware routing prerequisite
 
@@ -38,9 +41,11 @@ For a configured PostgreSQL profile, the resolver enters the existing canonical-
 
 PostgreSQL is admitted by `contextual_session_search_store(backend="postgresql")` only when every contextual method is present and its generated-search status is valid. No lexical PostgreSQL rows are routed if catalog drift makes the contextual search path unavailable. No runtime backend cutover is implied.
 
-## Required future atomic portability group
+## Public-consumer evidence and bounded route
 
-A valid PostgreSQL public cutover slice must introduce and differentially test the remaining backend-neutral capability covering: existing candidate/model/context search plus anchored views and scroll views; session lookup; public search storage/rebuild status; and bounded recent-session browse. It must preserve tenant-schema qualification, parameterized values, trusted schema derivation, and connection `search_path` reset. Its PG18/SQLite matrix must cover session boundaries, adjacent and duplicate hits, ties, role/source/visibility filters, tool-body behavior, snippets/context 200-character caps, pagination, cross-session isolation, update/delete/reindex maintenance, FTS corruption/deferred rebuild signaling, and tenant isolation.
+The real `AIAgent` inline consumer injects its selected `PostgreSQLCLISessionStore` into `session_search`; the resolver recognizes its backend-owned health status and admits only the full contextual method set. It reuses that already tenant-bound handle rather than opening `state.db`, resolving a second DSN, or silently wrapping it as SQLite. PG18 coverage exercises serialized CJK discovery, grammar failure, anchored/scroll windows, read, browse, health reporting, and explicit rebuild. The public direct tool path additionally resolves explicit root/default or named profiles read-only from their canonical configuration and secret scope; it never accepts an injected cross-profile store.
+
+No gateway, cron, TUI, ACP, hosted-room, async-delegation, or generic legacy `SessionDB` consumer is enabled by this route.
 
 ## Exact remaining gaps / cutover boundary
 
