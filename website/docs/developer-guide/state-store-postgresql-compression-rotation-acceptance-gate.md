@@ -65,7 +65,11 @@ have equivalent contracts; a SQLite fallback is always a failure.
 
 ```bash
 scripts/run_tests.sh tests/agent/test_postgresql_compression_rotation_oracle.py -v --tb=short
-HERMES_TEST_WORKERS=1 scripts/run_tests.sh tests/integration/test_postgresql_compression_rotation_acceptance.py -m integration -v --tb=short
-HERMES_TEST_WORKERS=2 scripts/run_tests.sh tests/integration/test_postgresql_compression_rotation_acceptance.py -m integration -v --tb=short
-HERMES_TEST_WORKERS=1 scripts/run_tests.sh -m integration tests/integration/test_postgresql_phase12_fault_harness.py tests/integration/test_postgresql_compression_coordination.py tests/integration/test_postgresql_cli_session_store.py -v --tb=short
+# ``pyproject.toml`` normally excludes integration tests.  Clear that default
+# explicitly so all 14 parametrized rotation-acceptance cases are selected.
+HERMES_TEST_WORKERS=1 scripts/run_tests.sh -o "addopts=" -m integration tests/integration/test_postgresql_compression_rotation_acceptance.py -v --tb=short
+HERMES_TEST_WORKERS=2 scripts/run_tests.sh -o "addopts=" -m integration tests/integration/test_postgresql_compression_rotation_acceptance.py -v --tb=short
+# These three fixture families are intentionally unmarked; do not apply
+# ``-m integration`` or pytest will deselect them all.
+HERMES_TEST_WORKERS=1 scripts/run_tests.sh -o "addopts=" tests/integration/test_postgresql_phase12_fault_harness.py tests/integration/test_postgresql_compression_coordination.py tests/integration/test_postgresql_cli_session_store.py -v --tb=short
 ```
