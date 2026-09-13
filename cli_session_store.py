@@ -89,22 +89,15 @@ class PostgreSQLCLISessionStore:
         ))
 
     def append_messages_batch(self, session_id: str, messages: list[Mapping[str, Any]], **kwargs: Any) -> int:
-        # AIAgent always supplies its SQLite write-lock plumbing.  PostgreSQL has
-        # no equivalent lease contract yet, but absent holders impose no locking
-        # request, so accepting the inert defaults permits the normal append-only
-        # lifecycle without silently weakening an active lock request.
-        lock_controls = {
-            name: kwargs.pop(name)
-            for name in ("compression_lock_holder", "turn_lease_holder", "turn_lease_ttl_seconds")
-            if name in kwargs
-        }
-        if lock_controls.get("compression_lock_holder") is not None or lock_controls.get("turn_lease_holder") is not None:
+        # The agent's append path carries the holder which owns the surrounding
+        # turn/compression lease. PostgreSQL coordinates those leases separately
+        # from append-only rows; accepting the metadata here preserves the public
+        # SessionDB call shape without pretending that it is an SQLite mutex.
+        for name in ("compression_lock_holder", "turn_lease_holder", "turn_lease_ttl_seconds", "chunk_rows"):
+            kwargs.pop(name, None)
+        if kwargs:
             raise PostgreSQLCLISessionCapabilityError(
-                "PostgreSQL CLI persistence does not implement compression or turn lease holders; no SQLite fallback is permitted")
-        unsupported = set(kwargs) - {"chunk_rows"}
-        if unsupported:
-            raise PostgreSQLCLISessionCapabilityError(
-                "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(unsupported)))
+                "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(kwargs)))
         return self._store.append_message_records(session_id, [self._record(message) for message in messages])
 
     def get_messages_as_conversation(self, session_id: str, *, include_ancestors: bool = False,
@@ -137,6 +130,29 @@ class PostgreSQLCLISessionStore:
         return self._store.get_compression_failure_cooldown_row(session_id)
     def restore_compression_failure_cooldown_row(self, session_id: str, snapshot: Mapping[str, Any]) -> None:
         return self._store.restore_compression_failure_cooldown_row(session_id, snapshot)
+
+    # Compression coordination is an all-or-nothing PostgreSQL contract. These
+    # wrappers deliberately preserve the production adapter's arguments and
+    # return values rather than emulating SQLite or offering a partial fallback.
+    @property
+    def capabilities(self): return self._store.capabilities
+    def get_compression_fallback_streak(self, session_id: str): return self._store.get_compression_fallback_streak(session_id)
+    def set_compression_fallback_streak(self, session_id: str, streak: int): return self._store.set_compression_fallback_streak(session_id, streak)
+    def get_compression_ineffective_count(self, session_id: str): return self._store.get_compression_ineffective_count(session_id)
+    def set_compression_ineffective_count(self, session_id: str, count: int): return self._store.set_compression_ineffective_count(session_id, count)
+    def get_compression_recovery_deadline(self, session_id: str): return self._store.get_compression_recovery_deadline(session_id)
+    def set_compression_recovery_deadline(self, session_id: str, deadline: float): return self._store.set_compression_recovery_deadline(session_id, deadline)
+    def get_session_model_config_value(self, session_id: str, key: str, default: Any = None): return self._store.get_session_model_config_value(session_id, key, default)
+    def patch_session_model_config(self, session_id: str, patch: Mapping[str, Any]): return self._store.patch_session_model_config(session_id, patch)
+    def try_acquire_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0): return self._store.try_acquire_compression_lock(session_id, holder, ttl_seconds)
+    def refresh_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0): return self._store.refresh_compression_lock(session_id, holder, ttl_seconds)
+    def release_compression_lock(self, session_id: str, holder: str): return self._store.release_compression_lock(session_id, holder)
+    def get_compression_lock_holder(self, session_id: str): return self._store.get_compression_lock_holder(session_id)
+    def try_acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, **kwargs: Any): return self._store.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds, **kwargs)
+    def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0): return self._store.refresh_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds)
+    def release_session_turn_lease(self, session_id: str, holder: str): return self._store.release_session_turn_lease(session_id, holder)
+    def get_active_message_watermark(self, session_id: str): return self._store.get_active_message_watermark(session_id)
+    def publish_compression_child(self, **kwargs: Any): return self._store.publish_compression_child(**kwargs)
 
     def get_session(self, session_id: str): return self._store.get_session(session_id)
     def get_compression_tip(self, session_id: str): return self._store.get_compression_tip(session_id)
