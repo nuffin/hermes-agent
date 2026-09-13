@@ -90,6 +90,10 @@ def _connect() -> sqlite3.Connection:
     from hermes_state import _secure_state_db_files
 
     path = _db_path()
+    # PostgreSQL has no async-delegation ledger contract yet.  This must stop
+    # before the legacy state.db directory or SQLite file is touched.
+    from state_store_runtime_readiness import require_legacy_state_db_runtime
+    require_legacy_state_db_runtime(home=path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
     _secure_state_db_files(path, create_main=True)
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
