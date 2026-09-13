@@ -89,6 +89,18 @@ class PostgreSQLCLISessionStore:
         ))
 
     def append_messages_batch(self, session_id: str, messages: list[Mapping[str, Any]], **kwargs: Any) -> int:
+        # AIAgent always supplies its SQLite write-lock plumbing.  PostgreSQL has
+        # no equivalent lease contract yet, but absent holders impose no locking
+        # request, so accepting the inert defaults permits the normal append-only
+        # lifecycle without silently weakening an active lock request.
+        lock_controls = {
+            name: kwargs.pop(name)
+            for name in ("compression_lock_holder", "turn_lease_holder", "turn_lease_ttl_seconds")
+            if name in kwargs
+        }
+        if lock_controls.get("compression_lock_holder") is not None or lock_controls.get("turn_lease_holder") is not None:
+            raise PostgreSQLCLISessionCapabilityError(
+                "PostgreSQL CLI persistence does not implement compression or turn lease holders; no SQLite fallback is permitted")
         unsupported = set(kwargs) - {"chunk_rows"}
         if unsupported:
             raise PostgreSQLCLISessionCapabilityError(
