@@ -22,7 +22,8 @@ A selected PostgreSQL profile reports its canonical profile home/name and derive
 
 - narrow StateStore records; and
 - profile-derived PostgreSQL tenant schema selection; and
-- CLI fresh/resume acquisition through `cli_session_store.open_cli_session_store()`.
+- CLI fresh/resume acquisition through `cli_session_store.open_cli_session_store()`; and
+- bounded `AIAgent` lazy recall acquisition and append-only persistence through that same facade.
 
 The CLI facade persists a real session row, single-message and batch structured
 messages (including identity, order, timestamps, and null content), system-prompt
@@ -55,8 +56,10 @@ runtime is PostgreSQL-ready.
 `tests/integration/test_postgresql_cli_session_store.py` exercises a fresh
 isolated `HERMES_HOME` against loopback PostgreSQL: session creation, ordered
 single and batch message persistence, prompt snapshot, end, a new-store resume/reopen, session
-lookup, unsupported-call refusal, and the file-open trap. It also proves the
-default SQLite factory path is unchanged.
+lookup, unsupported-call refusal, and the file-open trap. Its deterministic offline-agent
+harness constructs the real `AIAgent` with local mocks only, proving lazy selected-PG
+acquisition, first-turn persistence, prompt/history restoration, end/reopen, and
+active lease-holder rejection before a write. It also proves the default SQLite factory path is unchanged.
 
 Run the focused gate with:
 
