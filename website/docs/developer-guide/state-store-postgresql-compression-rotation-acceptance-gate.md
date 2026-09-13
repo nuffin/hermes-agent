@@ -73,3 +73,26 @@ HERMES_TEST_WORKERS=2 scripts/run_tests.sh -o "addopts=" -m integration tests/in
 # ``-m integration`` or pytest will deselect them all.
 HERMES_TEST_WORKERS=1 scripts/run_tests.sh -o "addopts=" tests/integration/test_postgresql_phase12_fault_harness.py tests/integration/test_postgresql_compression_coordination.py tests/integration/test_postgresql_cli_session_store.py -v --tb=short
 ```
+
+## Full selected-PG manifest
+
+`scripts/validate_selected_postgresql_manifest.py` fixes the complete 18-file
+selected-PG gate. It includes the bounded public AIAgent/CLI route, runtime
+readiness/config/factory checks, rotation/coordination/Phase12, runtime
+ownership, delivery, SQLite import, operations, marker-validated target safety,
+StateStore parity, search grammar, and contextual-session contracts.
+
+```bash
+python3 scripts/validate_selected_postgresql_manifest.py --mode serial
+python3 scripts/validate_selected_postgresql_manifest.py --mode parallel
+```
+
+The parallel mode runs four non-overlapping partitions with one worker and zero
+file retries per partition, then requires their summed file/test totals to equal
+the serial manifest. The manifest always clears `addopts` because the repository
+default excludes integration tests. It never broad-selects `-m integration`:
+that selection can include unrelated ACP/aiohttp optional-dependency suites,
+while several owned PostgreSQL fixture families are deliberately unmarked and
+would instead be deselected. Every PostgreSQL integration path uses the
+marker-validated owned UUID target fixture and does not mutate preexisting
+named-volume data.
