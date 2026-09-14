@@ -25,6 +25,24 @@
     {
       "classification": "unported-legacy-runtime",
       "operation": "acquire",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "APIServerAdapter._open_and_cache_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "connect",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "ResponseStore.__init__"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "connect",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "ResponseStore.__init__"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
       "path": "gateway/run.py",
       "symbol": "GatewayRunner._open_session_db_for_active_scope._open"
     },
@@ -109,6 +127,24 @@
     {
       "classification": "unported-legacy-runtime",
       "operation": "acquire",
+      "path": "tui_gateway/compute_host.py",
+      "symbol": "ComputeHost._build_server_session"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tui_gateway/methods_session.py",
+      "symbol": "_profile_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tui_gateway/methods_session.py",
+      "symbol": "_unarchive_recoverable"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
       "path": "tui_gateway/server.py",
       "symbol": "_get_db"
     },
@@ -123,6 +159,12 @@
       "operation": "acquire",
       "path": "tui_gateway/server.py",
       "symbol": "_profile_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
+      "path": "tui_gateway/session_workdir.py",
+      "symbol": "_workdir_owner_db"
     }
   ],
   "ready": true,
