@@ -9,6 +9,7 @@ Phase 13 makes an explicit `state_store.backend: postgresql` selection measurabl
 1. `static_raw_state_db_inventory()` parses the approved runtime modules and publishes each direct `SessionDB`, shared-registry `acquire`, `sqlite3.connect`, and shared `open_db` opener with its caller symbol and porting classification.
 2. `trap_state_db_opens()` intercepts root/profile `state.db` access through both Python `open()` and `sqlite3.connect`, recording the exact caller path and symbol. It is test instrumentation only.
 3. `SessionDB.__init__` calls `require_legacy_state_db_runtime()` **before** test isolation, directory creation, connection, pragma, or schema work. When PostgreSQL is selected, it refuses the legacy SessionDB path with a capability report instead of silently opening or creating `state.db`.
+4. `react_to_message_tool()` calls the same guard before its shared-registry acquisition. A selected PostgreSQL profile returns a bounded structured tool error naming the missing capabilities; it does not open root/profile `state.db`, persist a reaction, or emit `message.reaction`. This is a fail-closed safety boundary, not PostgreSQL reaction support.
 
 The static inventory is checked into `website/docs/developer-guide/state-store-postgresql-runtime-callsite-report.json`. Regenerate it from the feature worktree with:
 
@@ -185,7 +186,7 @@ before a write. The v19 coordination slice additionally persists activity labels
 Run the focused gate with:
 
 ```bash
-scripts/run_tests.sh -o "addopts=" tests/integration/test_postgresql_cli_session_store.py; scripts/run_tests.sh tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
+scripts/run_tests.sh -o "addopts=" tests/integration/test_postgresql_cli_session_store.py tests/tools/test_react_to_message_tool.py; scripts/run_tests.sh tests/test_state_store_runtime_readiness.py tests/test_state_store_config.py tests/test_state_store_factory.py
 ```
 
 ## Remaining work
