@@ -90,7 +90,11 @@ A future implementation must not begin a partial table migration or runtime rout
 7. PG18/SQLite differential contract suite covering all protocol operations, contention, crash/failure injection, ordering, retention, revocation, namespace-routing/mix-up protection, and externally observed reconciliation boundaries.
 8. A verified consumer migration proving no hosted-room/driver/policy runtime path opens SQLite before any claim of PostgreSQL readiness.
 
-Until then, PostgreSQL readiness is explicitly **not established**.
+Until then, PostgreSQL readiness is explicitly **not established**. Selected
+PostgreSQL therefore fails closed at the hosted coordination factory and public
+service/driver/peer/RPC boundaries with
+`HostedRoomCoordinationUnavailableError`, before a separate SQLite coordinator,
+room task, peer operation, replica write, or transport side effect can occur.
 
 ## Evidence reconciliation
 

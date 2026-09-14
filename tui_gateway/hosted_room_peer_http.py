@@ -209,6 +209,9 @@ class PeerRunsHTTPClient:
         self, *, base_url: str, api_key: str, timeout_seconds: float = 30,
         receipt_db_path: Path | str | None = None, poll_min_seconds: float = 0.1,
         poll_max_seconds: float = 2.0, clock: Callable[[], float] = time.monotonic) -> None:
+        from gateway.hosted_room_coordination import require_hosted_room_coordination_runtime
+
+        require_hosted_room_coordination_runtime()
         base_url, self.transport_security = validate_room_link_url(base_url)
         if api_key and len(api_key) < 16:
             raise ValueError("peer API key is missing or too short")

@@ -64,6 +64,11 @@ Activation remains blocked outside that bounded CLI/inline-search path by these 
   agent-build runtime. These surfaces return a typed, actionable refusal before
   an agent, tool, transport, transcript, cache, or `state.db` fallback can run;
   this is a safety boundary, not PostgreSQL SessionDB support.
+- hosted-room coordination, including rooms/events, peer grants and receipts,
+  driver leases/tasks, replicas, policy projection, fences, and recovery. A
+  selected PostgreSQL profile raises `HostedRoomCoordinationUnavailableError`
+  before a hosted SQLite path, room worker, peer client, RPC/group operation,
+  or transport is created. This is not a partial PostgreSQL room adapter.
 
 The error names the missing capabilities and points here. This is deliberately
 not a claim that gateway, cron, TUI/API, ACP, async-delegation, or hosted-room

@@ -43,8 +43,11 @@ def start_hosted_room_service():
     global _service
     if _bound_server is None:
         return None
+    from gateway.hosted_room_coordination import require_hosted_room_coordination_runtime
     from gateway.hosted_rooms import default_db_path
     from tui_gateway.hosted_room_service import HostedRoomService
+
+    require_hosted_room_coordination_runtime()
     db_path = default_db_path()
     with _service_lock:
         if _service is not None and _service.db_path != db_path:
@@ -107,6 +110,13 @@ def _requested_profile(params: dict) -> str:
         return requested
     _foreign_profile_home(requested)
     return str(_bound_server._response_profile_name(requested) or requested)
+
+
+def _require_hosted_room_coordination(_params: dict) -> None:
+    """Refuse the active selected backend before any room SQLite/runtime work."""
+    from gateway.hosted_room_coordination import require_hosted_room_coordination_runtime
+
+    require_hosted_room_coordination_runtime()
 
 
 def _api_server_key(profile: str | None = None) -> str:
@@ -189,19 +199,21 @@ def _room_method(
     (only ``ReplicaError`` when ``replica_only``) to a client error with ``{"reason"}`` data
     when ``with_reason``; anything else maps to ``code``."""
     error_class = _room_error_class  # closure cell: handlers run under server.py globals
+    guard = _require_hosted_room_coordination
 
     def dec(fn):
         def handler(rid, params: dict) -> dict:
-            args = (rid, params)
-            if service_code is not None:
-                service = get_hosted_room_service()
-                if service is None:
-                    return _err(rid, service_code, service_message)
-                args += (service,)
-            if db:
-                from gateway.hosted_rooms import default_db_path
-                args += (default_db_path(),)
             try:
+                guard(params)
+                args = (rid, params)
+                if service_code is not None:
+                    service = get_hosted_room_service()
+                    if service is None:
+                        return _err(rid, service_code, service_message)
+                    args += (service,)
+                if db:
+                    from gateway.hosted_rooms import default_db_path
+                    args += (default_db_path(),)
                 return fn(*args)
             except Exception as exc:
                 if room_code is not None and isinstance(exc, error_class(replica_only)):
@@ -214,8 +226,13 @@ def _room_method(
 
 
 @method("groups.capabilities")
-def _(rid, params: dict, _catalog=_local_catalog, _methods=_METHODS) -> dict:
+def _(rid, params: dict, _catalog=_local_catalog, _methods=_METHODS,
+      _guard=_require_hosted_room_coordination) -> dict:
     """Describe the hosted-room protocol implemented by this gateway."""
+    try:
+        _guard(params)
+    except Exception as exc:
+        return _err(rid, 5109, str(exc))
     from gateway.hosted_rooms import MAX_LOG_LIMIT, PROTOCOL_VERSION, local_authority_gateway_id
     service = get_hosted_room_service()
     driver_ready = bool(service and service.runtime.status()["running"])
