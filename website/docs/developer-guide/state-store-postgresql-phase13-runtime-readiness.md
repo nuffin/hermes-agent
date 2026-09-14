@@ -61,6 +61,13 @@ Activation remains blocked outside that bounded CLI/inline-search path by these 
 - async-delegation ledger routing; and
 - cron session/transcript lifecycle, including durable session creation, title,
   lineage, finalization, retry, and lease semantics.
+- ACP session creation, load/resume, list, fork, and control operations. Their
+  public `SessionManager` boundary rejects selected PostgreSQL before UUID/cwd
+  registration, SessionDB, agent/provider/MCP discovery, protocol response, or
+  transcript side effect. This is a typed `PostgreSQLRuntimeActivationError`
+  naming `acp-session-transcript-lifecycle`; it is **not** PostgreSQL ACP
+  support. Non-session handshake/status behavior remains outside this boundary
+  only when it cannot create, load, control, or act on a session.
 - TUI/API session list, resume, control, workdir ownership, cache, and
   agent-build runtime. These surfaces return a typed, actionable refusal before
   an agent, tool, transport, transcript, cache, or `state.db` fallback can run;
@@ -143,6 +150,11 @@ resolver; it does not activate those unrelated runtime surfaces.
 - a selected named PostgreSQL sandbox profile derives its tenant schema, reports the supported contextual contract, opens no `state.db`, and has no fallback event;
 - the public inline `session_search` path reuses the selected CLI facade and serializes CJK discovery/grammar rejection, anchored scroll, read, browse, health, and explicit rebuild evidence without SQLite;
 - selected-PG `delegate_task(background=true)` reaches the async-dispatch boundary, rejects before its injected runner/external-child side effect, and opens no `state.db`;
+- `tests/acp/test_selected_postgresql_session_boundary.py` proves selected-PG
+  manager and available ACP server session entrypoints reject with that typed
+  capability before agent factory, protocol update, `state.db`, or JSON output;
+  it also proves a root SQLite manager cannot be reused under an active named
+  selected-PG profile, while default SQLite ACP persistence/resume is unchanged.
 - direct `SessionStore` and normal `GatewayRunner` construction reject a selected
   PostgreSQL root or named active profile before route generation, transport
   activity, `state.db`, `sessions.json`, or JSONL output; a root SQLite store

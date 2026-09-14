@@ -228,6 +228,7 @@ def inspect_runtime_activation(
             "async-delegation-ledger-routing",
             "cron-session-transcript-lifecycle",
             "tui-api-session-runtime",
+            "acp-session-transcript-lifecycle",
         ),
         raw_state_db_openers=inventory,
     )
