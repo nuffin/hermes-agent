@@ -36,6 +36,8 @@ def test_static_inventory_reports_every_approved_runtime_raw_opener():
     assert ("cli.py", "HermesCLI._init_session_store", "SessionDB") not in unported
     assert ("gateway/delivery_ledger.py", "_connect", "open_db") in unported
     assert ("tools/async_delegation.py", "_connect", "open_db") in unported
+    assert ("tools/bot_live_delivery.py", "find_canonical_owner", "SessionDB") in unported
+    assert ("tools/bot_live_delivery.py", "_matches", "SessionDB") in unported
     assert ("tui_gateway/server.py", "_get_db", "acquire") in unported
     assert ("tui_gateway/methods_session.py", "_profile_session_db", "acquire") in unported
     assert ("tui_gateway/compute_host.py", "ComputeHost._build_server_session", "acquire") in unported

@@ -30,6 +30,7 @@ _RUNTIME_SOURCE_PATHS = (
     "gateway/run.py",
     "gateway/delivery_ledger.py",
     "tools/async_delegation.py",
+    "tools/bot_live_delivery.py",
     "cron/scheduler.py",
     "tui_gateway/server.py",
     "tui_gateway/methods_session.py",
