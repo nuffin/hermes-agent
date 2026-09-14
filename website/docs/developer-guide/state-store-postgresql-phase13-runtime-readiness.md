@@ -57,7 +57,9 @@ Activation remains blocked outside that bounded CLI/inline-search path by these 
   rewind, recovery, auto-archive/housekeeping, and shutdown routing;
 - gateway delivery-ledger runtime/recovery routing (except the explicit,
   dependency-injected final-response consumer described below); and
-- async-delegation ledger routing.
+- async-delegation ledger routing; and
+- cron session/transcript lifecycle, including durable session creation, title,
+  lineage, finalization, retry, and lease semantics.
 
 The error names the missing capabilities and points here. This is deliberately
 not a claim that gateway, cron, TUI, ACP, async-delegation, or hosted-room
@@ -80,6 +82,25 @@ a fallback. The legacy SQLite JSON mirror/fallback remains available only when
 SQLite is selected. A root-created SQLite `SessionStore` also rechecks the
 active profile for every routing load/save boundary, so multiplexed selected
 profiles cannot route into the root database or mirror.
+
+## Cron fail-closed boundary
+
+Cron is **not PostgreSQL supported**. `run_one_job()` and `run_job()` both
+require the legacy transcript runtime before creating an execution row,
+handing off a restart-safe worker, running either a pre-agent script or a
+`no_agent` script, constructing an agent, saving output, delivering a result,
+or finalizing a session. When PostgreSQL is selected, they return/log the
+structured `CRON_TRANSCRIPT_UNAVAILABLE` refusal with the missing
+`cron-session-transcript-lifecycle` capability. This intentionally creates no
+`state.db`, cron output/cache, JSON transcript, SQLite fallback, delivery, or
+finalization side effect.
+
+The bounded SessionDB-init timeout remains a SQLite-only availability behavior:
+SQLite jobs may continue without a transcript after that timeout, as before.
+Do not treat that legacy availability fallback as a PostgreSQL lifecycle port.
+A full port needs equivalent durable creation/title/lineage/finalization,
+retry/resume, ownership/lease, output and delivery contracts before this guard
+can be removed.
 
 ## Bounded injected final-delivery ledger consumer
 

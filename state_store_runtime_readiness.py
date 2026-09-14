@@ -221,6 +221,7 @@ def inspect_runtime_activation(
             "gateway-session-routing-transcript",
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
+            "cron-session-transcript-lifecycle",
         ),
         raw_state_db_openers=inventory,
     )
