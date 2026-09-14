@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import Any, ContextManager, Protocol, cast
 
 from gateway import hosted_room_driver as state
-from gateway.hosted_room_coordination import SqliteHostedRoomCoordination, sqlite_hosted_room_coordination
+from gateway.hosted_room_coordination import (
+    HostedRoomCoordination,
+    require_hosted_room_coordination_runtime,
+    sqlite_hosted_room_coordination,
+)
 
 _CANCEL_ROUTE_RETRIES = 8
 _STOP_ACK_STATUSES = {"cancelled", "interrupted"}
@@ -109,7 +113,8 @@ class HostedRoomRuntime:
         indeterminate_defer_seconds: float = 60.0, max_concurrent_rooms: int = 4,
         unavailable_retry_min_seconds: float = 1.0, unavailable_retry_max_seconds: float = 30.0,
         process_generation: str | None = None,
-        coordination: SqliteHostedRoomCoordination | None = None) -> None:
+        coordination: HostedRoomCoordination | None = None) -> None:
+        require_hosted_room_coordination_runtime()
         positive = dict(
             lease_ttl_seconds=lease_ttl_seconds, poll_interval_seconds=poll_interval_seconds,
             active_poll_interval_seconds=active_poll_interval_seconds,
