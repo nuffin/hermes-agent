@@ -127,6 +127,12 @@
     {
       "classification": "unported-legacy-runtime",
       "operation": "acquire",
+      "path": "tools/react_to_message_tool.py",
+      "symbol": "_open_session_db"
+    },
+    {
+      "classification": "unported-legacy-runtime",
+      "operation": "acquire",
       "path": "tui_gateway/compute_host.py",
       "symbol": "ComputeHost._build_server_session"
     },

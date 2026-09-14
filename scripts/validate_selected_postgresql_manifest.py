@@ -33,6 +33,7 @@ PARTITIONS = (
             "tests/test_state_store_runtime_readiness.py",
             "tests/test_state_store_config.py",
             "tests/test_state_store_factory.py",
+            "tests/tools/test_react_to_message_tool.py",
         ),
     ),
     (
@@ -68,8 +69,8 @@ MANIFEST = tuple(path for _name, paths in PARTITIONS for path in paths)
 
 
 def validate_manifest() -> None:
-    if len(MANIFEST) != 18 or len(set(MANIFEST)) != len(MANIFEST):
-        raise RuntimeError("selected-PostgreSQL manifest must contain 18 unique files")
+    if len(MANIFEST) != 19 or len(set(MANIFEST)) != len(MANIFEST):
+        raise RuntimeError("selected-PostgreSQL manifest must contain 19 unique files")
     for path in MANIFEST:
         if not (ROOT / path).is_file():
             raise RuntimeError(f"manifest file is missing: {path}")
