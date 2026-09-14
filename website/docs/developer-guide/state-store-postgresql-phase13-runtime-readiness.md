@@ -100,10 +100,15 @@ error contains capability names and this evidence path, never a DSN.
 
 This is a safety boundary, **not** PostgreSQL gateway support. It intentionally
 does not construct a partial SessionDB adapter. In particular, selected
-PostgreSQL never returns an in-memory/generated gateway route and never writes
-`state.db`, `sessions.json`, JSONL transcript/spool data, or a routing cache as
-a fallback. The legacy SQLite JSON mirror/fallback remains available only when
-SQLite is selected. A root-created SQLite `SessionStore` also rechecks the
+PostgreSQL refuses every public and direct legacy mirror lookup/append,
+shutdown flush/recovery/transcript-spool, and channel-directory build/read
+boundary before SQLite acquisition, JSON/cache access, directory creation,
+replay, adapter enumeration, or transport handoff. Those refusals propagate as
+`PostgreSQLRuntimeActivationError`; they are never converted to an empty
+routing directory, JSON fallback, in-memory durable success, or a best-effort
+background action. The legacy SQLite mirror, recovery spool, and channel
+directory remain available only when SQLite is selected. A root-created SQLite
+`SessionStore` also rechecks the
 active profile for every routing load/save boundary, so multiplexed selected
 profiles cannot route into the root database or mirror.
 
