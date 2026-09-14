@@ -69,6 +69,9 @@ class HostedRoomService:
         self, server: ModuleType, *, db_path: Path | str | None = None,
         peer_routes: Mapping[tuple[str, str], PeerMemberRoute] | None = None,
         peer_clients: Mapping[Any, HostedRoomPeerClient] | None = None) -> None:
+        from gateway.hosted_room_coordination import require_hosted_room_coordination_runtime
+
+        require_hosted_room_coordination_runtime()
         self.server, self.db_path = server, Path(db_path or hosted_rooms.default_db_path())
         # All durable room/driver/policy coordination traverses this boundary.
         # Runtime selection remains SQLite-only; no PostgreSQL route exists.

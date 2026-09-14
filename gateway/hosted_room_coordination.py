@@ -7,14 +7,53 @@ select a runtime backend or introduce a PostgreSQL schema/migration.
 
 from __future__ import annotations
 
+import ast
+from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from typing import Any, Callable, Protocol
+
+from state_store_runtime_readiness import (
+    PostgreSQLRuntimeActivationError,
+    RuntimeActivationReport,
+    require_legacy_state_db_runtime,
+)
 
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
 from gateway.hosted_room_policy_checkpoint import HostedRoomPolicyCheckpoint
 from gateway.hosted_rooms_common import DbPath
+
+
+HOSTED_ROOM_COORDINATION_CAPABILITY = "hosted-room-coordination-full-protocol"
+
+
+class HostedRoomCoordinationUnavailableError(RuntimeError):
+    """Selected PostgreSQL has no complete hosted-room coordination contract.
+
+    This is deliberately distinct from a generic room error: callers must not
+    treat the refusal as an empty room list, an in-memory room, or permission to
+    construct the legacy SQLite coordinator.
+    """
+
+    def __init__(self, report: RuntimeActivationReport) -> None:
+        self.report = report
+        self.capability = HOSTED_ROOM_COORDINATION_CAPABILITY
+        super().__init__(
+            "Hosted-room coordination is unavailable because PostgreSQL state_store.backend "
+            f"is selected for {report.profile_home}; missing capability: {self.capability}. "
+            "A complete rooms/events, peer-grants, driver lease/task, replica, policy, "
+            "fencing, and recovery protocol is required before activation. See "
+            "docs/hosted-room-coordination-protocol.md."
+        )
+
+
+def require_hosted_room_coordination_runtime(*, home: Path | str | None = None) -> RuntimeActivationReport:
+    """Refuse selected PostgreSQL before any hosted-room SQLite side effect."""
+    try:
+        return require_legacy_state_db_runtime(home=None if home is None else Path(home))
+    except PostgreSQLRuntimeActivationError as exc:
+        raise HostedRoomCoordinationUnavailableError(exc.report) from exc
 
 
 class HostedRoomCoordination(Protocol):
@@ -56,6 +95,7 @@ class HostedRoomCoordination(Protocol):
     def recover_room(self, lease: driver.DriverLease, **kwargs: Any) -> dict[str, list[driver.TaskIdentity]]: ...
     def list_tasks(self, **kwargs: Any) -> list[dict[str, Any]]: ...
     def policy_checkpoint(self) -> HostedRoomPolicyCheckpoint: ...
+    def __getattr__(self, name: str) -> Any: ...
 
 
 class SqliteHostedRoomCoordination:
@@ -66,7 +106,8 @@ class SqliteHostedRoomCoordination:
     exact replay rules, expiry clock handling, and crash recovery behavior.
     """
 
-    def __init__(self, db_path: DbPath) -> None:
+    def __init__(self, db_path: DbPath, *, home: Path | str | None = None) -> None:
+        require_hosted_room_coordination_runtime(home=home)
         self.db_path = Path(db_path)
 
     def _room(self, operation: Callable[..., Any], **kwargs: Any) -> Any:
@@ -116,6 +157,54 @@ class SqliteHostedRoomCoordination:
         raise AttributeError(name)
 
 
-def sqlite_hosted_room_coordination(db_path: DbPath) -> SqliteHostedRoomCoordination:
-    """Construct the only runtime adapter; PostgreSQL selection is intentionally absent."""
-    return SqliteHostedRoomCoordination(db_path)
+@dataclass(frozen=True)
+class SqliteHostedRoomFactoryCall:
+    path: str
+    symbol: str
+
+
+def static_sqlite_hosted_room_factory_inventory(
+    source_root: Path | None = None,
+) -> tuple[SqliteHostedRoomFactoryCall, ...]:
+    """List production callsites that could otherwise bypass selected-PG safety.
+
+    The checked regression test pins this small inventory. Adding a new direct
+    SQLite coordination factory is therefore an explicit reviewed decision,
+    rather than a silent path around the public service/RPC gates.
+    """
+    root = (source_root or Path(__file__).resolve().parent.parent).resolve()
+    calls: list[SqliteHostedRoomFactoryCall] = []
+    for path in root.rglob("*.py"):
+        relative = path.relative_to(root)
+        if relative.parts[0] in {"tests", ".venv"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        scope: list[str] = []
+
+        class Visitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                scope.append(node.name)
+                self.generic_visit(node)
+                scope.pop()
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                scope.append(node.name)
+                self.generic_visit(node)
+                scope.pop()
+
+            def visit_Call(self, node: ast.Call) -> None:
+                name = node.func.id if isinstance(node.func, ast.Name) else ""
+                if name == "sqlite_hosted_room_coordination":
+                    calls.append(SqliteHostedRoomFactoryCall(
+                        str(relative), ".".join(scope) or "<module>"))
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+    return tuple(sorted(calls, key=lambda item: (item.path, item.symbol)))
+
+
+def sqlite_hosted_room_coordination(
+    db_path: DbPath, *, home: Path | str | None = None
+) -> SqliteHostedRoomCoordination:
+    """Construct the SQLite adapter only when the complete legacy runtime is selected."""
+    return SqliteHostedRoomCoordination(db_path, home=home)
