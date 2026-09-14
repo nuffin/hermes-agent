@@ -76,9 +76,9 @@ HERMES_TEST_WORKERS=1 scripts/run_tests.sh -o "addopts=" tests/integration/test_
 
 ## Full selected-PG manifest
 
-`scripts/validate_selected_postgresql_manifest.py` fixes the complete 18-file
-selected-PG gate. It includes the bounded public AIAgent/CLI route, runtime
-readiness/config/factory checks, rotation/coordination/Phase12, runtime
+`scripts/validate_selected_postgresql_manifest.py` fixes the complete 19-file
+selected-PG gate. It includes the bounded public AIAgent/CLI and desktop-reaction
+routes, runtime readiness/config/factory checks, rotation/coordination/Phase12, runtime
 ownership, delivery, SQLite import, operations, marker-validated target safety,
 StateStore parity, search grammar, and contextual-session contracts.
 
