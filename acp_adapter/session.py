@@ -7,6 +7,10 @@ survive process restarts and appear in ``session_search``; ``load_session`` /
 from __future__ import annotations
 
 from hermes_constants import get_hermes_home, translate_cwd_for_wsl_backend, windows_path_to_wsl
+from state_store_runtime_readiness import (
+    PostgreSQLRuntimeActivationError,
+    require_legacy_state_db_runtime,
+)
 
 import copy
 import json
@@ -169,6 +173,7 @@ class SessionManager:
 
     def create_session(self, cwd: str = ".") -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
+        self._require_legacy_session_runtime()
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
         agent = self._make_agent(session_id=session_id, cwd=cwd)
@@ -179,6 +184,7 @@ class SessionManager:
     def get_session(self, session_id: str) -> Optional[SessionState]:
         """Return the session, transparently restoring it from the DB (e.g. after
         a process restart) when it is not in memory; ``None`` if unknown."""
+        self._require_legacy_session_runtime()
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
@@ -203,6 +209,7 @@ class SessionManager:
 
     def list_sessions(self, cwd: str | None = None) -> List[Dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
+        self._require_legacy_session_runtime()
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
         db = self._get_db()
         persisted_rows: dict[str, dict[str, Any]] = {}
@@ -276,16 +283,29 @@ class SessionManager:
             self._persist(state)
         return state
 
+    def _require_legacy_session_runtime(self) -> None:
+        """Reject selected PostgreSQL before ACP session or provider side effects.
+
+        ACP's persistence contract still depends on SessionDB features that the
+        bounded PostgreSQL state store does not implement. Do not turn that
+        explicit selection into an in-memory or SQLite-backed ACP session.
+        """
+        require_legacy_state_db_runtime(home=get_hermes_home())
+
     def _get_db(self):
-        """Lazily acquire the process-shared SessionDB; ``None`` if unavailable (e.g. import
-        error in a minimal test env). ``HERMES_HOME`` is resolved here, not via the import-time
-        ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured. The
-        registry handle is the one in-process tools (delegation, session_search, goals) also
-        acquire, so the ACP server holds ONE writer on state.db instead of two (#100896)."""
+        """Lazily acquire the process-shared SessionDB in a legacy SQLite runtime.
+
+        A selected PostgreSQL profile is a typed refusal, never an in-memory
+        continuation or a fallback ``state.db`` opener.  The registry handle is
+        the one in-process tools also acquire, so ACP keeps one state-db writer.
+        """
+        self._require_legacy_session_runtime()
         if self._db_instance is None:
             try:
                 from hermes_state_registry import acquire
                 self._db_instance = acquire(get_hermes_home() / "state.db")
+            except PostgreSQLRuntimeActivationError:
+                raise
             except Exception:
                 logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
         return self._db_instance
