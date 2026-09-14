@@ -37,6 +37,10 @@ def test_static_inventory_reports_every_approved_runtime_raw_opener():
     assert ("gateway/delivery_ledger.py", "_connect", "open_db") in unported
     assert ("tools/async_delegation.py", "_connect", "open_db") in unported
     assert ("tui_gateway/server.py", "_get_db", "acquire") in unported
+    assert ("tui_gateway/methods_session.py", "_profile_session_db", "acquire") in unported
+    assert ("tui_gateway/compute_host.py", "ComputeHost._build_server_session", "acquire") in unported
+    assert ("tui_gateway/session_workdir.py", "_workdir_owner_db", "acquire") in unported
+    assert ("gateway/platforms/api_server.py", "APIServerAdapter._open_and_cache_session_db", "acquire") in unported
     assert any(
         item.path == "state_store.py" and item.symbol == "resolve_contextual_session_search_store"
         and item.classification == "backend-neutral-contextual-contract"
@@ -85,6 +89,7 @@ def test_selected_postgresql_profile_fails_before_state_db_open_and_reports_tena
     assert "cli-fresh-resume-session-contract" in report.supported_capabilities
     assert "contextual-session-search-contract" in report.supported_capabilities
     assert "contextual-session-search-contract" not in report.missing_capabilities
+    assert "tui-api-session-runtime" in report.missing_capabilities
     assert report.raw_state_db_openers
     assert events == []
     assert not (profile_home / "state.db").exists()
