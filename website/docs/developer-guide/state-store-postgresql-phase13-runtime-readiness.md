@@ -59,6 +59,13 @@ Activation remains blocked outside that bounded CLI/inline-search path by these 
 - gateway delivery-ledger runtime/recovery routing (except the explicit,
   dependency-injected final-response consumer described below); and
 - async-delegation ledger routing; and
+- Bot Live Delivery owner lineage and durable mailbox admission/claim/completion.
+  Every public mailbox operation and the direct lineage-match helper refuse with
+  `PostgreSQLRuntimeActivationError` before `state.db`, receipt JSON, mailbox
+  directories/locks, or a live-turn handoff. This preserves the SQLite mailbox's
+  at-most-once protocol; it is not PostgreSQL mailbox support. The separately
+  injected final-delivery ledger consumer remains the only supported delivery
+  route described below.
 - cron session/transcript lifecycle, including durable session creation, title,
   lineage, finalization, retry, and lease semantics.
 - ACP session creation, load/resume, list, fork, and control operations. Their
