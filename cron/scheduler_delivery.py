@@ -287,6 +287,9 @@ def _seed_cron_session(
     """Create the session row (so the mirror has a target) and mirror the brief as a USER turn.
     The seeded key must equal the reply's ``build_session_key``: chat_type, user_id, thread_id and
     scope_id (Slack team id) are all part of it, so callers pass exactly what the reply carries."""
+    from state_store_runtime_readiness import require_legacy_state_db_runtime
+
+    require_legacy_state_db_runtime()
     from gateway.config import Platform
     from gateway.session import SessionSource
     from gateway.mirror import mirror_to_session
