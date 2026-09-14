@@ -36,6 +36,7 @@ _RUNTIME_SOURCE_PATHS = (
     "tui_gateway/compute_host.py",
     "tui_gateway/session_workdir.py",
     "gateway/platforms/api_server.py",
+    "tools/react_to_message_tool.py",
     "acp_adapter/session.py",
     "state_store.py",
 )
