@@ -90,6 +90,7 @@ def test_selected_postgresql_profile_fails_before_state_db_open_and_reports_tena
     assert "contextual-session-search-contract" in report.supported_capabilities
     assert "contextual-session-search-contract" not in report.missing_capabilities
     assert "tui-api-session-runtime" in report.missing_capabilities
+    assert "acp-session-transcript-lifecycle" in report.missing_capabilities
     assert report.raw_state_db_openers
     assert events == []
     assert not (profile_home / "state.db").exists()
