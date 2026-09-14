@@ -409,7 +409,10 @@ def _workdir_owner_db(session: dict, fail_log: str):
         try:
             from hermes_state_registry import acquire
             db, close_db = acquire(Path(profile_home) / "state.db"), True
-        except Exception:
+        except Exception as exc:
+            from state_store_runtime_readiness import PostgreSQLRuntimeActivationError
+            if isinstance(exc, PostgreSQLRuntimeActivationError):
+                raise
             logger.debug(fail_log, exc_info=True)
             db = _WORKDIR_DB_OPEN_FAILED
     else:

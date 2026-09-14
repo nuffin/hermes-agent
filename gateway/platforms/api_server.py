@@ -27,6 +27,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from state_store_runtime_readiness import PostgreSQLRuntimeActivationError
+
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
@@ -956,6 +958,8 @@ def _admit_api_agent_request(handler):
         self._pending_agent_requests += 1
         try:
             return await handler(self, request, *args, **kwargs)
+        except PostgreSQLRuntimeActivationError as exc:
+            return self._session_db_unavailable(exc)
         finally:
             _release_pending_api_work(self, reservation)
             _api_agent_request_reservation.reset(token)
@@ -976,7 +980,10 @@ def _require_auth(handler):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        return await handler(self, request, *args, **kwargs)
+        try:
+            return await handler(self, request, *args, **kwargs)
+        except PostgreSQLRuntimeActivationError as exc:
+            return self._session_db_unavailable(exc)
     return _wrapped
 
 
@@ -1738,6 +1745,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             from hermes_constants import get_hermes_home
             return self._open_and_cache_session_db(get_hermes_home())
+        except PostgreSQLRuntimeActivationError:
+            raise
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
@@ -1763,6 +1772,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if cached is not None:
                     return cached
                 return await asyncio.to_thread(self._open_and_cache_session_db, home)
+        except PostgreSQLRuntimeActivationError:
+            raise
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
@@ -2754,8 +2765,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return default if parsed < 0 else min(parsed, maximum)
 
     @staticmethod
-    def _session_db_unavailable() -> "web.Response":
-        return _error_response("Session database unavailable", 503, code="session_db_unavailable")
+    def _session_db_unavailable(exc=None) -> "web.Response":
+        if exc is None:
+            return _error_response("Session database unavailable", 503, err_type="service_unavailable_error",
+                                   code="session_db_unavailable")
+        return web.json_response(
+            {**_openai_error("Session database unavailable", "service_unavailable_error",
+                             code="session_db_unavailable"), "diagnostic": exc.report.as_dict()}, status=503)
 
     @staticmethod
     def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:

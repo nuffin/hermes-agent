@@ -32,6 +32,10 @@ _RUNTIME_SOURCE_PATHS = (
     "tools/async_delegation.py",
     "cron/scheduler.py",
     "tui_gateway/server.py",
+    "tui_gateway/methods_session.py",
+    "tui_gateway/compute_host.py",
+    "tui_gateway/session_workdir.py",
+    "gateway/platforms/api_server.py",
     "acp_adapter/session.py",
     "state_store.py",
 )
@@ -222,6 +226,7 @@ def inspect_runtime_activation(
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
             "cron-session-transcript-lifecycle",
+            "tui-api-session-runtime",
         ),
         raw_state_db_openers=inventory,
     )

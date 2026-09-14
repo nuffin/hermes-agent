@@ -60,9 +60,13 @@ Activation remains blocked outside that bounded CLI/inline-search path by these 
 - async-delegation ledger routing; and
 - cron session/transcript lifecycle, including durable session creation, title,
   lineage, finalization, retry, and lease semantics.
+- TUI/API session list, resume, control, workdir ownership, cache, and
+  agent-build runtime. These surfaces return a typed, actionable refusal before
+  an agent, tool, transport, transcript, cache, or `state.db` fallback can run;
+  this is a safety boundary, not PostgreSQL SessionDB support.
 
 The error names the missing capabilities and points here. This is deliberately
-not a claim that gateway, cron, TUI, ACP, async-delegation, or hosted-room
+not a claim that gateway, cron, TUI/API, ACP, async-delegation, or hosted-room
 runtime is PostgreSQL-ready.
 
 ## Gateway session-routing fail-closed boundary

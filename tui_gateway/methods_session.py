@@ -6,6 +6,8 @@ server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 
 import contextlib
 
+from state_store_runtime_readiness import PostgreSQLRuntimeActivationError
+
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -37,10 +39,13 @@ def _with_db(code: int, *, session_scoped: bool):
     """Append a db arg — the session's db (after ``_with_session``) or ``_profile_db(params)``; ``code`` when None."""
     def deco(fn):
         def handler(rid, params: dict, *session) -> dict:
-            with (_session_db(session[0]) if session_scoped else _profile_db(params)) as db:
-                if db is None:
-                    return _db_unavailable_error(rid, code=code)
-                return fn(rid, params, *session, db)
+            try:
+                with (_session_db(session[0]) if session_scoped else _profile_db(params)) as db:
+                    if db is None:
+                        return _db_unavailable_error(rid, code=code)
+                    return fn(rid, params, *session, db)
+            except PostgreSQLRuntimeActivationError as exc:
+                return _err(rid, code, f"session database unavailable: {exc}", data=exc.report.as_dict())
         return _with_session(handler) if session_scoped else handler
     return deco
 
@@ -852,7 +857,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4006, "session_id required")
     ctx = _Resume(rid, params, target)
     # Profile scope: a DEDICATED handle we own until the agent takes it; else the shared launch db.
-    ctx.db, ctx.owns_db = _profile_session_db(ctx.profile_home)
+    try:
+        ctx.db, ctx.owns_db = _profile_session_db(ctx.profile_home)
+    except PostgreSQLRuntimeActivationError as exc:
+        return _err(rid, 5000, f"session database unavailable: {exc}", data=exc.report.as_dict())
     try:
         if ctx.db is None:
             return _db_unavailable_error(rid, code=5000)
