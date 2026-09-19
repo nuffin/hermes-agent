@@ -94,6 +94,7 @@ class ContextualSessionSearchStore(Protocol):
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Collection[str] | None = None,
+        after_ts: int | None = None, before_ts: int | None = None,
     ) -> list[dict[str, Any]]: ...
     def resolve_session_by_title(self, title: str) -> str | None: ...
     def list_recent_sessions_bounded(
@@ -157,6 +158,7 @@ class StateStore(Protocol):
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Collection[str] | None = None,
+        after_ts: int | None = None, before_ts: int | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def get_compression_tip(self, session_id: str) -> str | None: ...
@@ -356,10 +358,12 @@ class SqliteStateStore:
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Collection[str] | None = None,
+        after_ts: int | None = None, before_ts: int | None = None,
     ) -> list[dict[str, Any]]:
         return self._session_db.search_messages(
             query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
             limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
+            after_ts=after_ts, before_ts=before_ts,
         )
 
     def get_compression_tip(self, session_id: str) -> str:
@@ -571,10 +575,12 @@ class SqliteContextualSessionSearchStore:
     def search_messages(self, query: str, source_filter: list[str] | None = None,
                         exclude_sources: list[str] | None = None, role_filter: list[str] | None = None,
                         limit: int = 20, offset: int = 0, sort: str | None = None,
-                        include_inactive: bool = False, fields: Collection[str] | None = None) -> list[dict[str, Any]]:
+                        include_inactive: bool = False, fields: Collection[str] | None = None,
+                        after_ts: int | None = None, before_ts: int | None = None) -> list[dict[str, Any]]:
         return self._session_db.search_messages(
             query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
             limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
+            after_ts=after_ts, before_ts=before_ts,
         )
 
     def resolve_session_by_title(self, title: str) -> str | None:
