@@ -40,6 +40,11 @@ from tools.approval_smart import _smart_verdict
 
 logger = logging.getLogger(__name__)
 
+
+def _get_approval_config():
+    """Compatibility seam for approval policy consumers and isolated tests."""
+    return approval_context._get_approval_config()
+
 # Frozen at import: reading os.environ per call would let any skill running in the process set
 # this and bypass every approval check (prompt-injection escalation path).
 _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))

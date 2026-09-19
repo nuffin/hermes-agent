@@ -378,7 +378,11 @@ class DispatcherScopeBroker:
     """Ephemeral Unix-peer-credential liveness oracle owned by dispatcher."""
     def __init__(self, board_db: str | Path, board: str, attempt: KanbanScopeAttempt):
         self.board_db, self.board, self.attempt = Path(board_db), board, attempt
-        directory = Path(tempfile.mkdtemp(prefix="hermes-scope-", dir=str(Path(board_db).parent)))
+        # Do not honor TMPDIR here: test/profile environments can make it deep
+        # enough to exceed AF_UNIX's 108-byte limit. A fresh mode-0700 child of
+        # the host's sticky /tmp remains private to this process.
+        socket_tmp_root = "/tmp" if os.path.isdir("/tmp") else None
+        directory = Path(tempfile.mkdtemp(prefix="hermes-scope-", dir=socket_tmp_root))
         try:
             os.chmod(directory, 0o700)
         except BaseException:
