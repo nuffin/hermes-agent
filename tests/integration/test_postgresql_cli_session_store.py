@@ -232,6 +232,15 @@ def test_inline_session_search_uses_selected_postgresql_contextual_contract_with
         assert [message["content"] for message in hit["messages"]] == [
             "opening contextual evidence", "中文记忆 selected PostgreSQL anchor", "closing contextual evidence",
         ]
+        history_started = int(store.get_session(history_id)["started_at"])
+        started_bound = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(history_started))
+        next_bound = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(history_started + 1))
+        bounded = invoke({"query": "selected PostgreSQL", "after": started_bound, "before": next_bound})
+        assert bounded["success"] is True, bounded
+        assert [result["session_id"] for result in bounded["results"]] == [history_id]
+        before_window = invoke({"query": "中文记忆", "before": started_bound})
+        assert before_window["success"] is True, before_window
+        assert before_window["results"] == []
 
         scrolled = invoke({"session_id": history_id, "around_message_id": anchor, "window": 1})
         assert scrolled["success"] is True and scrolled["mode"] == "scroll"
