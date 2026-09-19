@@ -1339,13 +1339,24 @@ def inherit_profile(source_names: List[str], target_name: str, *, no_alias: bool
     profile_dir = get_profile_dir(canon)
     if profile_dir.exists():
         raise _profile_exists_error(canon)
-    _, warnings = _merge_and_flatten_configs(parents, interactive=True)
+    _, warnings = _merge_and_flatten_configs(parents)
+    merged, conflicts, first_parent = {}, [], ""
+    for parent in parents:
+        parent_config, _ = _resolve_inherited_config(parent)
+        if not first_parent:
+            merged, first_parent = parent_config, parent
+            continue
+        merged, found = _deep_merge_with_conflicts(
+            merged, parent_config, base_label=first_parent, overlay_label=parent)
+        conflicts.extend(found)
+    resolutions = _resolve_conflicts_interactively(conflicts)
     clear_named_profile_deleted(profile_dir)
     staging = _clone_staging_dir(profile_dir)
     try:
         _bootstrap_profile_dir(staging, None)
         import yaml
-        (staging / "config.yaml").write_text(yaml.safe_dump({"inherited_from": parents}, sort_keys=False), encoding="utf-8")
+        child_config = _apply_resolutions({"inherited_from": parents}, resolutions)
+        (staging / "config.yaml").write_text(yaml.safe_dump(child_config, sort_keys=False), encoding="utf-8")
         _finish_profile_layout(staging, no_skills=no_skills, clone_all=False, description=description)
         os.rename(staging, profile_dir)
     except BaseException:
