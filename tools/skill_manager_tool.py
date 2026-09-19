@@ -444,11 +444,27 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+    skill_dir_override = None
+    guard_results = (invoke_hook("pre_skill_create:guard", name=name, content=content, category=category)
+                     if has_hook("pre_skill_create:guard") else ())
+    for hook_result in guard_results:
+        if not isinstance(hook_result, dict):
+            continue
+        action = hook_result.get("action")
+        if action == "block":
+            return _err(hook_result.get("reason", "Skill creation blocked by plugin"))
+        if action == "redirect":
+            path = hook_result.get("path")
+            if not path:
+                continue
+            skill_dir_override = Path(os.path.expandvars(os.path.expanduser(str(path))))
+            break
+        if action == "handled":
+            return {"success": True, "message": f"Skill '{name}' created by plugin.", "hook_handled": True}
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
 
-    from hermes_cli.lifecycle import has_hook, invoke_hook
-    skill_dir_override = None
     hook_results = (invoke_hook("pre_skill_create", name=name, content=content, category=category)
                     if has_hook("pre_skill_create") else ())
     for hook_result in hook_results:
@@ -499,19 +515,23 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     if err := _validate_frontmatter(content) or _validate_content_size(content):
         return _err(err)
-    existing = _find_skill(name)
-    old_content = None
-    if existing:
-        with suppress(OSError):
-            old_content = (existing["path"] / "SKILL.md").read_text(encoding="utf-8")
     if hook_result := _run_pre_skill_hook(
-            "pre_skill_edit", name=name, content=content, old_content=old_content):
+            "pre_skill_edit:guard", name=name, content=content):
         if hook_result.get("hook_handled"):
             hook_result["message"] = f"Skill '{name}' edited by plugin."
         return hook_result
     skill_dir, guard = _locate_for_write(name, "edit")
     if guard:
         return guard
+    assert skill_dir is not None
+    old_content = None
+    with suppress(OSError):
+        old_content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    if hook_result := _run_pre_skill_hook(
+            "pre_skill_edit", name=name, content=content, old_content=old_content):
+        if hook_result.get("hook_handled"):
+            hook_result["message"] = f"Skill '{name}' edited by plugin."
+        return hook_result
 
     # SKILL.md always exists here (_find_skill requires it), so a blocked scan restores it.
     if guard := _guarded_write(name, skill_dir, skill_dir / "SKILL.md", "edit", "SKILL.md", content):
@@ -535,6 +555,12 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err(_PATCH_NEEDS_NEW_STRING)
     # No old_string == new_string guard here: fuzzy_find_and_replace rejects that with a
     # richer error (file_preview) this layer cannot produce.
+    if hook_result := _run_pre_skill_hook(
+            "pre_skill_patch:guard", name=name, old_string=old_string, new_string=new_string,
+            file_path=file_path, replace_all=replace_all):
+        if hook_result.get("hook_handled"):
+            hook_result["message"] = f"Skill '{name}' patched by plugin."
+        return hook_result
     skill_dir, guard = _locate_for_write(name, "patch")
     if guard:
         return guard
@@ -584,6 +610,10 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
     """Delete a skill. ``absorbed_into``: None = undeclared (legacy, accepted); "" = explicit prune;
     "<skill>" = absorbed into that umbrella, which must exist (so the model can't claim one)."""
+    if hook_result := _run_pre_skill_hook("pre_skill_delete:guard", name=name):
+        if hook_result.get("hook_handled"):
+            hook_result["message"] = f"Skill '{name}' deleted by plugin."
+        return hook_result
     skill_dir, guard = _locate_for_write(name, "delete")
     if guard := guard or _curator_consolidation_delete_guard(name, absorbed_into):
         return guard
@@ -643,6 +673,11 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err := _validate_content_size(file_content, label=file_path):
         return _err(err)
     if hook_result := _run_pre_skill_hook(
+            "pre_skill_write_file:guard", name=name, file_path=file_path, file_content=file_content):
+        if hook_result.get("hook_handled"):
+            hook_result["message"] = f"File '{file_path}' written to skill '{name}' by plugin."
+        return hook_result
+    if hook_result := _run_pre_skill_hook(
             "pre_skill_write_file", name=name, file_path=file_path, file_content=file_content):
         if hook_result.get("hook_handled"):
             hook_result["message"] = f"File '{file_path}' written to skill '{name}' by plugin."
@@ -667,6 +702,10 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
     if err := _validate_file_path(file_path):
         return _err(err)
+    if hook_result := _run_pre_skill_hook("pre_skill_remove_file:guard", name=name, file_path=file_path):
+        if hook_result.get("hook_handled"):
+            hook_result["message"] = f"File '{file_path}' removed from skill '{name}' by plugin."
+        return hook_result
     if hook_result := _run_pre_skill_hook("pre_skill_remove_file", name=name, file_path=file_path):
         if hook_result.get("hook_handled"):
             hook_result["message"] = f"File '{file_path}' removed from skill '{name}' by plugin."
