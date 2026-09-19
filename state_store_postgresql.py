@@ -1528,6 +1528,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Collection[str] | None = None,
+        after_ts: int | None = None, before_ts: int | None = None,
     ) -> list[dict[str, Any]]:
         """Bounded lexical search, deliberately narrower than SQLite FTS5.
 
@@ -1557,6 +1558,10 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             predicates.append("NOT (s.source = ANY(%s))"); params.append(exclude_sources)
         if role_filter:
             predicates.append("m.role = ANY(%s)"); params.append(role_filter)
+        if after_ts is not None:
+            predicates.append("s.started_at >= %s"); params.append(int(after_ts))
+        if before_ts is not None:
+            predicates.append("s.started_at < %s"); params.append(int(before_ts))
         expression = compile_postgresql_search_expression(query)
         if expression.is_cjk_literal:
             searchable = "(coalesce(m.content, '') || ' ' || coalesce(m.tool_name, '') || ' ' || coalesce(m.tool_calls::text, ''))"
