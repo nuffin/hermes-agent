@@ -28,7 +28,10 @@ def _match_user_deny_rule(command: str) -> str | None:
     the dangerous-pattern detector uses so quoting tricks (``r\\m``,
     ``git st""atus``) can't sidestep a rule."""
     try:
-        deny_patterns = _ctx._get_approval_config().get("deny") or []
+        # Resolve through the facade so project-scope callers and isolated
+        # policy tests share the same dynamic configuration seam.
+        from tools.approval import _get_approval_config
+        deny_patterns = _get_approval_config().get("deny") or []
     except Exception:
         return None
     globs = [p.strip() for p in deny_patterns if isinstance(p, str) and p.strip()]
