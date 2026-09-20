@@ -412,9 +412,13 @@ class PostgreSQLCLISessionStore:
         )
         return existing_roots
 
-    def delete_session_if_empty(self, session_id: str, **kwargs: Any) -> bool:
+    def delete_session_if_empty(self, session_id: str, *, sessions_dir: Any = None, **kwargs: Any) -> bool:
         if kwargs:
-            raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI deletion does not manage session files")
+            raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI deletion does not support these controls")
+        # PostgreSQL owns all durable session data; the SQLite caller supplies
+        # sessions_dir only to remove legacy transcript files, so it is a strict
+        # compatibility no-op in this backend.
+        del sessions_dir
         with self._store._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 f"SELECT id FROM {self._store._schema}.sessions session WHERE id=%s "

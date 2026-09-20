@@ -831,6 +831,32 @@ def test_public_stale_owner_successor_rotates_selected_postgresql(pg_cli_home):
     assert not (home / "state.db").exists()
 
 
+def test_postgresql_empty_session_cleanup_accepts_cli_filesystem_compatibility_arg(pg_cli_home):
+    """The /new and /clear caller always passes SQLite's sessions_dir argument."""
+    home, stores = pg_cli_home
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session("empty-predecessor", "cli")
+        store.end_session("empty-predecessor", "new_session")
+        assert store.delete_session_if_empty("empty-predecessor", sessions_dir=home / "sessions")
+        assert store.get_session("empty-predecessor") is None
+
+        store.create_session("persisted-predecessor", "cli")
+        store.append_message("persisted-predecessor", "user", "must survive boundary")
+        store.end_session("persisted-predecessor", "new_session")
+        assert not store.delete_session_if_empty("persisted-predecessor", sessions_dir=home / "sessions")
+        retained = store.get_session("persisted-predecessor")
+        assert retained["end_reason"] == "new_session" and retained["ended_at"] is not None
+        assert [row["content"] for row in store._store.get_message_records("persisted-predecessor")] == [
+            "must survive boundary"
+        ]
+
+        with pytest.raises(PostgreSQLCLISessionCapabilityError, match="does not support"):
+            store.delete_session_if_empty("persisted-predecessor", unexpected_control=True)
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
 def test_default_sqlite_factory_path_remains_legacy(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
