@@ -1,9 +1,10 @@
 """Regression coverage for selected-PG legacy-maintenance boundaries."""
 from argparse import Namespace
+import sqlite3
 
 import pytest
 
-from state_store_maintenance import StateStoreMaintenanceCapabilityError
+from state_store_maintenance import StateStoreMaintenanceCapabilityError, StateStoreMaintenanceError
 from state_store_runtime_readiness import trap_state_db_opens
 
 
@@ -16,6 +17,14 @@ def _pg_home(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", "postgresql://fixture/only")
+    return home
+
+
+def _invalid_pg_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("state_store:\n  backend: postgresql\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
     return home
 
 
@@ -116,3 +125,90 @@ def test_sqlite_snapshot_create_remains_available(tmp_path, monkeypatch):
     from hermes_cli.backup import create_quick_snapshot
 
     assert create_quick_snapshot(label="sqlite") is None
+
+
+def _preexisting_state_db(home):
+    """Create valid legacy bytes that selected-PG paths must leave untouched."""
+    state_db = home / "state.db"
+    connection = sqlite3.connect(state_db)
+    try:
+        connection.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    return state_db, state_db.read_bytes(), state_db.stat().st_mtime_ns
+
+
+def _assert_legacy_state_db_untouched(home, state_db, original_bytes, original_mtime_ns):
+    assert state_db.read_bytes() == original_bytes
+    assert state_db.stat().st_mtime_ns == original_mtime_ns
+    assert not (home / "state.db-wal").exists()
+    assert not (home / "state.db-shm").exists()
+    assert not list(home.glob("state.db.*"))
+    assert not (home / "snapshots").exists()
+
+
+def test_selected_pg_approvals_suggest_refuses_before_preexisting_state_db(tmp_path, monkeypatch, capsys):
+    home = _pg_home(tmp_path, monkeypatch)
+    state_db, original_bytes, original_mtime_ns = _preexisting_state_db(home)
+    from hermes_cli.approvals_suggest import scan_approval_history, suggest_command
+
+    arguments = Namespace(
+        db=None, days=0, min_count=1, limit=20, apply_indices="1", json=False,
+    )
+    with trap_state_db_opens(home) as events:
+        assert suggest_command(arguments) == 2
+        with pytest.raises(StateStoreMaintenanceCapabilityError, match="PostgreSQL.*no SQLite fallback"):
+            scan_approval_history()
+
+    assert events == []
+    _assert_legacy_state_db_untouched(home, state_db, original_bytes, original_mtime_ns)
+    output = capsys.readouterr().out
+    assert "PostgreSQL" in output
+    assert "no SQLite fallback" in output
+
+
+@pytest.mark.parametrize("should_fix", [False, True])
+def test_invalid_pg_approvals_and_doctor_refuse_before_preexisting_state_db(tmp_path, monkeypatch, capsys, should_fix):
+    home = _invalid_pg_home(tmp_path, monkeypatch)
+    state_db, original_bytes, original_mtime_ns = _preexisting_state_db(home)
+    from hermes_cli import doctor as doctor_module
+    from hermes_cli.approvals_suggest import scan_approval_history, suggest_command
+
+    monkeypatch.setattr(doctor_module, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_module, "_DHH", str(home))
+    arguments = Namespace(
+        db=None, days=0, min_count=1, limit=20, apply_indices="1", json=False,
+    )
+    with trap_state_db_opens(home) as events:
+        assert suggest_command(arguments) == 2
+        with pytest.raises(StateStoreMaintenanceError, match="PostgreSQL.*no SQLite fallback"):
+            scan_approval_history()
+        assert doctor_module.run_doctor(Namespace(fix=should_fix, ack=None)) == 2
+
+    assert events == []
+    _assert_legacy_state_db_untouched(home, state_db, original_bytes, original_mtime_ns)
+    output = capsys.readouterr().out
+    assert "PostgreSQL" in output
+    assert "no SQLite fallback" in output
+
+
+@pytest.mark.parametrize("should_fix", [False, True])
+def test_selected_pg_doctor_refuses_before_preexisting_state_db(tmp_path, monkeypatch, capsys, should_fix):
+    home = _pg_home(tmp_path, monkeypatch)
+    state_db, original_bytes, original_mtime_ns = _preexisting_state_db(home)
+    from hermes_cli import doctor as doctor_module
+    from hermes_cli import doctor_state
+
+    monkeypatch.setattr(doctor_module, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_module, "_DHH", str(home))
+    with trap_state_db_opens(home) as events:
+        with pytest.raises(StateStoreMaintenanceCapabilityError, match="PostgreSQL.*no SQLite fallback"):
+            doctor_state._check_state_db(should_fix)
+        assert doctor_module.run_doctor(Namespace(fix=should_fix, ack=None)) == 2
+
+    assert events == []
+    _assert_legacy_state_db_untouched(home, state_db, original_bytes, original_mtime_ns)
+    output = capsys.readouterr().out
+    assert "PostgreSQL" in output
+    assert "no SQLite fallback" in output
