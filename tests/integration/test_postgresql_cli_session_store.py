@@ -114,6 +114,52 @@ def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_ho
     assert not (home / "state.db").exists()
 
 
+def test_postgresql_cli_history_listing_and_bare_resume_never_open_sqlite(pg_cli_home, monkeypatch, capsys):
+    """The CLI list and bare ``/resume`` enumerate the selected PG profile history."""
+    from cli import HermesCLI
+    from hermes_cli.sessions_cmd import cmd_sessions
+
+    home, stores = pg_cli_home
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session("pg-cli-history", "cli", cwd="/tmp/pg-history")
+        store.set_session_title("pg-cli-history", "PostgreSQL history")
+        store.append_message("pg-cli-history", "user", "persisted PostgreSQL preview", timestamp=100)
+        rows = store.list_sessions_rich(source="cli", limit=10, order_by_last_active=True)
+        assert rows[0]["id"] == "pg-cli-history"
+        assert {"id", "source", "title", "preview", "last_active", "message_count", "cwd"} <= rows[0].keys()
+        assert rows[0]["preview"] == "persisted PostgreSQL preview"
+        assert rows[0]["message_count"] == 1
+
+        # The exact listing facade drives both the interactive renderer and the
+        # command-line list action; no SessionDB() is permitted for this profile.
+        shell = HermesCLI.__new__(HermesCLI)
+        shell.session_id = "current-session"
+        shell._session_db = store
+        shell._pending_resume_sessions = None
+        shell.conversation_history = []
+        shell.agent = None
+        shell._handle_resume_command("/resume")
+        assert shell._pending_resume_sessions[0]["id"] == "pg-cli-history"
+        assert "PostgreSQL history" in capsys.readouterr().out
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
+        result = cmd_sessions(SimpleNamespace(
+            sessions_action="list", limit=10, source=None, workspace=None,
+        ))
+        assert result is None
+        listed = capsys.readouterr().out
+        assert "PostgreSQL history" in listed
+        assert "pg-cli-history" in listed
+
+        assert cmd_sessions(SimpleNamespace(sessions_action="stats")) == 2
+        unsupported = capsys.readouterr().out
+        assert "does not support `hermes sessions stats` yet" in unsupported
+        assert "no SQLite fallback" in unsupported
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
 def test_cli_delete_contract_removes_postgresql_session_without_sqlite(pg_cli_home):
     home, stores = pg_cli_home
     with trap_state_db_opens(home) as opens:

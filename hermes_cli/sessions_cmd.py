@@ -1007,17 +1007,39 @@ def cmd_sessions(args, sessions_parser=None):
     if pre is not None:
         return pre(args)
     observational = action in _OBSERVATIONAL_DB_ACTIONS
-    from hermes_state import SessionDB, _default_db_path
+    from hermes_cli.config import load_config
+    from state_store import resolve_state_store_config
     try:
-        db = SessionDB(read_only=observational)
+        config = load_config()
+        selected_store = resolve_state_store_config(config)
     except Exception as e:
-        # mode=ro cannot create the store; a reader on a fresh profile reports empty rather than failing.
-        if observational and not _default_db_path().exists():
-            return _print_empty_store(action, args)
-        print("Could not open your session history database. "
-              "Run: hermes sessions repair to fix it (a backup is made first).")
-        print(f"Details: {e}")
+        print(f"Could not resolve your session history store: {e}")
         return 1
+    if selected_store.backend == "postgresql":
+        if action != "list":
+            print(
+                f"PostgreSQL session history does not support `hermes sessions {action}` yet; "
+                "no SQLite fallback is permitted."
+            )
+            return 2
+        from cli_session_store import open_cli_session_store
+        try:
+            db = open_cli_session_store(config, read_only=True)
+        except Exception as e:
+            print(f"Could not open your PostgreSQL session history: {e}")
+            return 1
+    else:
+        from hermes_state import SessionDB, _default_db_path
+        try:
+            db = SessionDB(read_only=observational)
+        except Exception as e:
+            # mode=ro cannot create the store; a reader on a fresh profile reports empty rather than failing.
+            if observational and not _default_db_path().exists():
+                return _print_empty_store(action, args)
+            print("Could not open your session history database. "
+                  "Run: hermes sessions repair to fix it (a backup is made first).")
+            print(f"Details: {e}")
+            return 1
     try:
         handler = _DB_HANDLERS.get(action)
         if handler is None:
