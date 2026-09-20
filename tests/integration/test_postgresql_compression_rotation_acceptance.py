@@ -212,6 +212,12 @@ def test_pg18_production_rotation_interface_publishes_fenced_handoff(harness):
             "session_key": "telegram:production", "chat_id": "chat", "profile_name": "tenant-a",
         })
         store.set_system_prompt(parent, "exact cached prompt")
+        for kind, payload in (
+            ("goal", {"goal": "ship", "status": "active"}),
+            ("heartbeat", {"prompt": "check", "status": "active"}),
+            ("loop", {"prompt": "watch", "status": "active"}),
+        ):
+            assert store.put_session_control_state(parent, kind, "active", payload) == 1
         assert store.try_acquire_compression_lock(parent, holder)
         assert _CAPABILITY in store.capabilities
         assert store.publish_compression_child(
@@ -234,12 +240,17 @@ def test_pg18_production_rotation_interface_publishes_fenced_handoff(harness):
         assert [(row["role"], row["content"]) for row in store.get_message_records(child)] == [
             ("assistant", "[CONTEXT COMPACTION] deterministic summary"), ("user", "deterministic live tail"),
         ]
+        for kind in ("goal", "heartbeat", "loop"):
+            parent_control = store.get_session_control_state(parent, kind)
+            child_control = store.get_session_control_state(child, kind)
+            assert parent_control is not None and parent_control["status"] == "cleared"
+            assert child_control is not None and child_control["status"] == "active"
     finally:
         store.close()
 
 
 def test_pg18_unknown_catalog_version_is_rejected_fail_closed(postgresql_test_target: OwnedPostgreSQLTestTarget):
     store = _store(postgresql_test_target.schema); store.close()
-    postgresql_test_target.execute(f"INSERT INTO {postgresql_test_target.schema}.schema_migrations (version, applied_at) VALUES (21, 0)")
-    with pytest.raises(StateStoreConfigurationError, match=r"Unsupported PostgreSQL State Store schema migration versions: \[21\]"):
+    postgresql_test_target.execute(f"INSERT INTO {postgresql_test_target.schema}.schema_migrations (version, applied_at) VALUES (22, 0)")
+    with pytest.raises(StateStoreConfigurationError, match=r"Unsupported PostgreSQL State Store schema migration versions: \[22\]"):
         _store(postgresql_test_target.schema)
