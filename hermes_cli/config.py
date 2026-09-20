@@ -4013,7 +4013,8 @@ _CONFIG_SUBCOMMANDS = {
     "path": lambda args: print(get_config_path()),
     "env-path": lambda args: print(get_env_path()),
     "migrate": _cmd_config_migrate,
-    "check": _cmd_config_check}
+    "check": _cmd_config_check,
+    "state-store": lambda args: __import__("hermes_cli.setup_state_store", fromlist=["run_config_state_store"]).run_config_state_store()}
 
 _CONFIG_USAGE = """Available commands:
   hermes config           Show current configuration
@@ -4023,6 +4024,7 @@ _CONFIG_USAGE = """Available commands:
   hermes config unset <key>        Remove a config value
   hermes config check     Check for missing/outdated config
   hermes config migrate   Update config with new options
+  hermes config state-store Configure SQLite or PostgreSQL state storage
   hermes config path      Show config file path
   hermes config env-path  Show .env file path"""
 
