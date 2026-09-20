@@ -1644,7 +1644,10 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             handoff, live = split_user_originated_turn({"role": "user", "content": content, "display_kind": target["display_kind"], "display_metadata": target["display_metadata"]})
             if live is None:
                 raise ValueError("rewind target is not a user-originated turn")
-            actual = sanitize_context(live["content"]).strip() if isinstance(live.get("content"), str) else live.get("content")
+            from agent.session_persistence import _durable_content
+            actual = _durable_content(live.get("content"))
+            if isinstance(actual, str):
+                actual = sanitize_context(actual).strip()
             if expected_target_content is not None and actual != expected_target_content:
                 raise RuntimeError("rewind target changed before it could be persisted")
             if preserve_compaction_handoff and handoff is None:

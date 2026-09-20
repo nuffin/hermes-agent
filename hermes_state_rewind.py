@@ -6,7 +6,7 @@ summary + live human ask in one row) keeps its hidden handoff scaffold as the ne
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
 _HISTORY_CHANGED = "session history changed before the rewind could be persisted"
 
@@ -17,6 +17,14 @@ class RewindTargetUnavailableError(ValueError):
     required a compaction carrier. Surfaces map this to their own "nothing to undo" message."""
 
 
+class RewindIndeterminateError(RuntimeError):
+    """The backend acknowledgement was lost and the caller must recover by request id."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        super().__init__(f"rewind acknowledgement is indeterminate; recover request {request_id}")
+
+
 @dataclass
 class RewindOutcome:
     prefix: List[Dict[str, Any]]  # history to install: the warm prefix when ``warm_history`` was given, else durable
@@ -24,6 +32,7 @@ class RewindOutcome:
     live_text: str  # lossless retry text when ``require_retryable``, else the display flattening (prefill)
     rewound_count: int
     turns_undone: int
+    request_id: str | None = None
 
 
 class TranscriptRewindStore(Protocol):
@@ -53,16 +62,16 @@ def _comparison_content(message: Dict[str, Any]) -> Any:
 
 def rewind_user_turn(
     store: TranscriptRewindStore, session_id: str, user_ordinal: int, *, warm_history: Optional[List[Dict[str, Any]]] = None,
-    require_retryable: bool = False, require_composite: bool = False, adopt_row_ids: bool = False,
+    require_retryable: bool = False, require_composite: bool = False, adopt_row_ids: bool = False, request_id: str | None = None,
 ) -> RewindOutcome:
     """Backend-neutral policy over one atomic backend mutation primitive."""
     return _rewind_user_turn_impl(store, session_id, user_ordinal, warm_history=warm_history,
                                   require_retryable=require_retryable, require_composite=require_composite,
-                                  adopt_row_ids=adopt_row_ids)
+                                  adopt_row_ids=adopt_row_ids, request_id=request_id)
 
 def _rewind_user_turn_impl(
     self, session_id: str, user_ordinal: int, *, warm_history: Optional[List[Dict[str, Any]]] = None,
-    require_retryable: bool = False, require_composite: bool = False, adopt_row_ids: bool = False,
+    require_retryable: bool = False, require_composite: bool = False, adopt_row_ids: bool = False, request_id: str | None = None,
 ) -> RewindOutcome:
     """Rewind the active transcript to just before user turn ``user_ordinal`` (0 = oldest; negative counts
     back from the newest and clamps to the oldest, so ``-n`` is ``/undo n``). ``warm_history`` (CLI/TUI):
@@ -108,12 +117,39 @@ def _rewind_user_turn_impl(
     target_row_id = target.get("_row_id")
     if not isinstance(target_row_id, int):
         raise RuntimeError("rewind target has no durable row identity")
+    from uuid import uuid4
+    request_id = request_id or uuid4().hex
     try:
-        result = self.rewind_to_message(
-            session_id, target_row_id, preserve_compaction_handoff=scaffold is not None,
-            expected_active_ids=expected_active_ids, expected_target_content=live_view.get("content"))
+        receipt_capable = callable(getattr(self, "get_rewind_receipt", None))
+        mutation_kwargs = {
+            "preserve_compaction_handoff": scaffold is not None,
+            "expected_active_ids": expected_active_ids,
+            "expected_target_content": _comparison_content(live_view) if receipt_capable else live_view.get("content"),
+        }
+        # SQLite retains its historical primitive signature. Receipt-bearing
+        # stores opt in explicitly; this is not a duck-typed SQLite extension.
+        if receipt_capable:
+            mutation_kwargs["request_id"] = request_id
+        result = self.rewind_to_message(session_id, target_row_id, **mutation_kwargs)
     except ValueError as exc:  # target vanished / changed role under us: same class of failure as out-of-range
         raise RewindTargetUnavailableError(str(exc)) from exc
+    except Exception:
+        lookup = getattr(self, "get_rewind_receipt", None)
+        if callable(lookup):
+            try:
+                receipt = lookup(request_id)
+            except Exception as receipt_error:
+                raise RewindIndeterminateError(request_id) from receipt_error
+            if isinstance(receipt, Mapping):
+                result = {
+                    "request_id": request_id,
+                    "rewound_count": int(receipt["retired_count"]),
+                    "replacement_message_id": receipt.get("replacement_message_id"),
+                }
+            else:
+                raise
+        else:
+            raise
     if scaffold is not None:
         replacement_id = result.get("replacement_message_id")
         if not isinstance(replacement_id, int) or not durable_prefix:
@@ -133,7 +169,8 @@ def _rewind_user_turn_impl(
     return RewindOutcome(
         prefix=prefix, live_view=live_view,
         live_text=live_text if live_text is not None else flatten_message_text(live_view.get("content")),
-        rewound_count=int(result.get("rewound_count", 0)), turns_undone=len(durable_user) - user_ordinal)
+        rewound_count=int(result.get("rewound_count", 0)), turns_undone=len(durable_user) - user_ordinal,
+        request_id=request_id)
 
 
 class SessionRewindMixin:

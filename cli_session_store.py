@@ -104,10 +104,13 @@ class PostgreSQLCLISessionStore:
         return self._store.append_message_records(session_id, [self._record(message) for message in messages])
 
     def get_messages_as_conversation(self, session_id: str, *, include_ancestors: bool = False,
-                                     repair_alternation: bool = False, **kwargs: Any) -> list[dict[str, Any]]:
+                                     repair_alternation: bool = False, include_row_ids: bool = False,
+                                     **kwargs: Any) -> list[dict[str, Any]]:
         if kwargs:
             raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI resume does not support: " + ", ".join(sorted(kwargs)))
         restored, _display = self._store.get_resume_conversations(session_id)
+        if not include_row_ids:
+            restored = [{key: value for key, value in message.items() if key != "_row_id"} for message in restored]
         if not include_ancestors:
             # The adapter's resume projection is already the only safe model-fed view.
             return restored
