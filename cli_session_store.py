@@ -250,6 +250,8 @@ class PostgreSQLCLISessionStore:
     def resolve_session_by_title(self, title: str): return self._store.resolve_session_by_title(title)
     def session_lifecycle_statuses(self, session_ids: list[str]): return self._store.session_lifecycle_statuses(session_ids)
     def list_skill_scaffolded_sessions(self, limit: int = 200): return self._store.list_skill_scaffolded_sessions(limit)
+    def list_gateway_sessions(self, *, platform: str | None = None, active_only: bool = True):
+        return self._store.list_gateway_sessions(platform=platform, active_only=active_only)
     # The inline public session_search consumer receives this CLI facade from
     # AIAgent.  These are the complete read-only contextual primitives already
     # implemented by its selected PostgreSQL store, not SQLite emulation.
