@@ -2222,6 +2222,60 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 rows.extend(row for row in cursor.fetchall() if row["id"] not in seen)
             return rows
 
+    def session_lifecycle_statuses(self, session_ids: list[str]) -> dict[str, str]:
+        """Classify every requested session from its final message, like SessionDB.
+
+        The picker contract is deliberately a single indexed batched lookup: an
+        empty requested session is ``empty`` and an unknown ID stays ``empty``.
+        """
+        from hermes_state_sessions import classify_session_status
+
+        ids = [session_id for session_id in (session_ids or []) if session_id]
+        if not ids:
+            return {}
+        statuses = {session_id: "empty" for session_id in ids}
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"""SELECT message.session_id, message.role,
+                           message.tool_calls IS NOT NULL AS has_tool_calls,
+                           message.finish_reason
+                    FROM {self._schema}.messages AS message
+                    JOIN (
+                        SELECT session_id, MAX(id) AS max_id
+                        FROM {self._schema}.messages
+                        WHERE session_id = ANY(%s)
+                        GROUP BY session_id
+                    ) AS latest ON message.id = latest.max_id""",
+                (ids,),
+            )
+            for row in cursor.fetchall():
+                statuses[str(row["session_id"])] = classify_session_status(
+                    role=row["role"], has_tool_calls=bool(row["has_tool_calls"]),
+                    finish_reason=row["finish_reason"],
+                )
+        return statuses
+
+    def list_skill_scaffolded_sessions(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Return the same first-user-turn /skill candidates as SQLite's repair command."""
+        from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
+
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"""SELECT session.id, session.title, message.content
+                    FROM {self._schema}.sessions AS session
+                    JOIN {self._schema}.messages AS message ON message.id = (
+                        SELECT first_message.id FROM {self._schema}.messages AS first_message
+                        WHERE first_message.session_id = session.id
+                          AND first_message.role = 'user'
+                          AND first_message.content IS NOT NULL
+                        ORDER BY first_message.created_at, first_message.id LIMIT 1
+                    )
+                    WHERE session.title IS NOT NULL AND message.content LIKE %s
+                    ORDER BY session.started_at DESC LIMIT %s""",
+                (SKILL_SCAFFOLD_SQL_LIKE, int(limit)),
+            )
+            return list(cursor.fetchall())
+
     def _set_session_title(self, session_id: str, title: str, *, source: str) -> bool:
         cleaned_title = _sanitize_title(title)
         is_user = source == "user"

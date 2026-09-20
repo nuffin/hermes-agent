@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent.skill_commands as skill_commands
+import tools.skills_tool as skills_tool
 from cli_session_store import PostgreSQLCLISessionCapabilityError, open_cli_session_store
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from state_store_runtime_readiness import trap_state_db_opens
@@ -51,6 +53,22 @@ def _open(stores):
     store = open_cli_session_store(_CONFIG)
     stores.append(store)
     return store
+
+
+def _install_skill_scaffold(tmp_path, monkeypatch):
+    """Use the same canonical /skill message builder as SQLite's retitle tests."""
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "work"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: work\ndescription: Test work skill\n---\n\n# work\n\nRepair session title evidence.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    skill_commands.scan_skill_commands()
+    return skill_commands.build_skill_invocation_message("/work", user_instruction="repair the title")
 
 
 def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_home, monkeypatch):
@@ -170,6 +188,56 @@ def test_postgresql_cli_history_listing_and_bare_resume_never_open_sqlite(pg_cli
         assert "Total messages: 3" in stats
         assert "cli: 1 sessions" in stats
         assert "Database size:" not in stats
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_postgresql_sessions_admin_and_browse_match_selected_store_contract(pg_cli_home, monkeypatch, capsys, tmp_path):
+    """Admin actions use PG title/pin/status/scaffold contracts without opening SQLite."""
+    from hermes_cli.sessions_cmd import cmd_sessions
+
+    home, stores = pg_cli_home
+    skill_message = _install_skill_scaffold(tmp_path, monkeypatch)
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session("admin-pg", "cli")
+        store.append_message("admin-pg", "user", "unfinished request")
+        store.create_session("skill-pg", "cli")
+        store.append_message("skill-pg", "user", skill_message)
+        store.append_message("skill-pg", "assistant", "handled", finish_reason="stop")
+        store.set_session_title("skill-pg", "Skill body title")
+
+        assert store.session_lifecycle_statuses(["admin-pg", "skill-pg", "unknown-pg"]) == {
+            "admin-pg": "interrupted", "skill-pg": "complete", "unknown-pg": "empty",
+        }
+        assert [row["id"] for row in store.list_skill_scaffolded_sessions()] == ["skill-pg"]
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
+        assert cmd_sessions(SimpleNamespace(sessions_action="rename", session_id="admin-pg", title=["Admin", "title"])) is None
+        assert store.get_session_title("admin-pg") == "Admin title"
+        capsys.readouterr()
+        assert cmd_sessions(SimpleNamespace(sessions_action="pin", session_ids=["admin-pg"])) is None
+        assert store.get_session("admin-pg")["pinned"] is True
+        assert {row["id"] for row in store.list_sessions_rich(limit=1, include_pinned=True)} >= {"admin-pg"}
+        capsys.readouterr()
+        assert cmd_sessions(SimpleNamespace(sessions_action="pinned", json=True)) is None
+        assert {row["id"] for row in json.loads(capsys.readouterr().out)} == {"admin-pg"}
+        assert cmd_sessions(SimpleNamespace(sessions_action="unpin", session_ids=["admin-pg"])) is None
+        assert store.get_session("admin-pg")["pinned"] is False
+
+        monkeypatch.setattr("agent.title_generator.generate_title", lambda _typed: "Repaired skill title")
+        assert cmd_sessions(SimpleNamespace(sessions_action="retitle-skills", limit=10, apply=True)) is None
+        assert store.get_session_title("skill-pg") == "Repaired skill title"
+
+        observed = {}
+        def picker(rows, session_db):
+            observed["rows"] = rows
+            observed["statuses"] = session_db.session_lifecycle_statuses([row["id"] for row in rows])
+            return None
+        monkeypatch.setattr("hermes_cli.sessions_cmd._session_browse_picker", picker)
+        assert cmd_sessions(SimpleNamespace(sessions_action="browse", source=None, limit=10)) is None
+        assert {row["id"] for row in observed["rows"]} >= {"admin-pg", "skill-pg"}
+        assert observed["statuses"]["admin-pg"] == "interrupted"
     assert opens == []
     assert not (home / "state.db").exists()
 
