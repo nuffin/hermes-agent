@@ -81,7 +81,7 @@ def test_selected_postgresql_gateway_runner_refuses_before_transport_or_route_ar
     _assert_no_gateway_artifacts(home, sessions_dir)
 
 
-def test_selected_named_profile_blocks_a_root_sqlite_store_before_route_creation(tmp_path, monkeypatch):
+def test_selected_named_profile_never_falls_back_to_root_sqlite_when_postgresql_unavailable(tmp_path, monkeypatch):
     """A store created at root must re-check the active named profile per route."""
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -98,8 +98,11 @@ def test_selected_named_profile_blocks_a_root_sqlite_store_before_route_creation
 
     token = set_hermes_home_override(str(profile))
     try:
+        from psycopg import OperationalError
         with trap_state_db_opens(root, profile) as opens:
-            with pytest.raises(PostgreSQLRuntimeActivationError) as caught:
+            # Connection failure is propagated; selected PG must never demote to the
+            # root SessionDB when a named profile has no reachable server.
+            with pytest.raises(OperationalError):
                 store.get_or_create_session(_source())
             with pytest.raises(PostgreSQLRuntimeActivationError):
                 store.append_to_transcript("must-not-spool", {"role": "user", "content": "blocked"})
@@ -112,7 +115,6 @@ def test_selected_named_profile_blocks_a_root_sqlite_store_before_route_creation
     finally:
         reset_hermes_home_override(token)
 
-    assert caught.value.report.profile_home == str(profile.resolve())
     assert opens == []
     assert (root / "state.db").stat().st_size == root_db_size
     assert not (sessions_dir / "sessions.json").exists()
