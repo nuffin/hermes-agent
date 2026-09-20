@@ -221,8 +221,11 @@ class PostgreSQLCLISessionStore:
     def get_session_title_source(self, session_id: str): return self._store.get_session_title_source(session_id)
     def set_session_title_source(self, session_id: str, source: str): return self._store.set_session_title_source(session_id, source)
     def set_session_title(self, session_id: str, title: str): return self._store.set_session_title(session_id, title)
+    def set_session_pinned(self, session_id: str, pinned: bool): return self._store.set_session_pinned(session_id, pinned)
     def get_session_by_title(self, title: str): return self._store.get_session_by_title(title)
     def resolve_session_by_title(self, title: str): return self._store.resolve_session_by_title(title)
+    def session_lifecycle_statuses(self, session_ids: list[str]): return self._store.session_lifecycle_statuses(session_ids)
+    def list_skill_scaffolded_sessions(self, limit: int = 200): return self._store.list_skill_scaffolded_sessions(limit)
     # The inline public session_search consumer receives this CLI facade from
     # AIAgent.  These are the complete read-only contextual primitives already
     # implemented by its selected PostgreSQL store, not SQLite emulation.
@@ -310,7 +313,14 @@ class PostgreSQLCLISessionStore:
             result.sort(key=lambda row: (row.get("last_active") or 0, row.get("started_at") or 0, row["id"]), reverse=True)
         else:
             result.sort(key=lambda row: (row.get("started_at") or 0, row["id"]), reverse=True)
-        return result[offset:offset + limit]
+        page = result[offset:offset + limit]
+        if not include_pinned:
+            return page
+        # SessionDB's include_pinned contract is a page plus every pinned row
+        # that the page missed. The backend summary query already back-fills
+        # those rows; do not discard them with the final presentation slice.
+        page_ids = {row["id"] for row in page}
+        return [*page, *(row for row in result if row.get("pinned") and row["id"] not in page_ids)]
 
     def resolve_resume_session_id(self, session_id: str) -> str:
         """Return the PostgreSQL compression tip that existing resume APIs read."""
