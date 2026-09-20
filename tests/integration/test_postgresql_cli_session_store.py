@@ -164,10 +164,110 @@ def test_postgresql_cli_history_listing_and_bare_resume_never_open_sqlite(pg_cli
         assert "PostgreSQL history" in listed
         assert "pg-cli-history" in listed
 
-        assert cmd_sessions(SimpleNamespace(sessions_action="stats")) == 2
-        unsupported = capsys.readouterr().out
-        assert "does not support `hermes sessions stats` yet" in unsupported
-        assert "no SQLite fallback" in unsupported
+        assert cmd_sessions(SimpleNamespace(sessions_action="stats")) is None
+        stats = capsys.readouterr().out
+        assert "Total sessions: 3" in stats
+        assert "Total messages: 3" in stats
+        assert "cli: 1 sessions" in stats
+        assert "Database size:" not in stats
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def _export_args(**overrides):
+    """Complete parser-shaped export arguments for direct cmd_sessions coverage."""
+    values = {
+        "sessions_action": "export", "output": None, "format": "jsonl", "session_id": "export-pg",
+        "older_than": None, "newer_than": None, "before": None, "after": None, "source": None,
+        "title": None, "end_reason": None, "cwd": None, "min_messages": None, "max_messages": None,
+        "model": None, "provider": None, "user": None, "chat_id": None, "chat_type": None,
+        "branch": None, "min_tokens": None, "max_tokens": None, "min_cost": None, "max_cost": None,
+        "min_tool_calls": None, "max_tool_calls": None, "dry_run": False, "redact": False,
+        "only": None, "lineage": "single", "delete_after_verified": False, "yes": False,
+        "force": False, "upload": False, "public": False, "no_redact": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_postgresql_cli_export_matches_sqlite_oracle_and_stays_local(pg_cli_home, monkeypatch, tmp_path):
+    """Selected PG exports canonical segments/lineages without opening state.db."""
+    from hermes_cli.sessions_cmd import cmd_sessions
+    from hermes_state import SessionDB
+
+    home, stores = pg_cli_home
+    oracle_home = tmp_path / ".hermes-oracle"
+    oracle_home.mkdir()
+    oracle_token = set_hermes_home_override(str(oracle_home))
+    try:
+        sqlite = SessionDB(db_path=tmp_path / "oracle-state.db")
+    finally:
+        reset_hermes_home_override(oracle_token)
+    with trap_state_db_opens(home) as opens:
+        pg = _open(stores)
+        for store, prefix in ((pg, "export-pg"), (sqlite, "export-sqlite")):
+            parent, child = f"{prefix}-parent", prefix
+            store.create_session(parent, "cli", model="oracle/model")
+            store.append_message(parent, "user", "parent evidence", timestamp=100)
+            store.end_session(parent, "compression")
+            store.create_session(child, "cli", model="oracle/model", parent_session_id=parent)
+            store.append_message(child, "assistant", "child answer", timestamp=101, finish_reason="stop")
+
+        pg_single, sqlite_single = pg.export_session("export-pg"), sqlite.export_session("export-sqlite")
+        assert pg_single is not None and sqlite_single is not None
+        for key in ("source", "model", "message_count"):
+            assert pg_single[key] == sqlite_single[key]
+        fields = ("role", "content", "timestamp", "finish_reason")
+        assert [{key: message.get(key) for key in fields} for message in pg_single["messages"]] == [
+            {key: message.get(key) for key in fields} for message in sqlite_single["messages"]
+        ]
+        pg_lineage, sqlite_lineage = pg.export_session_lineage("export-pg"), sqlite.export_session_lineage("export-sqlite")
+        assert pg_lineage is not None and sqlite_lineage is not None
+        assert [segment["id"].replace("export-pg", "export") for segment in pg_lineage["segments"]] == [
+            segment["id"].replace("export-sqlite", "export") for segment in sqlite_lineage["segments"]
+        ]
+        assert [message["content"] for message in pg_lineage["messages"]] == [message["content"] for message in sqlite_lineage["messages"]]
+        assert pg.session_count() == sqlite.session_count()
+        assert pg.message_count() == sqlite.message_count()
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
+        jsonl = tmp_path / "session.jsonl"
+        assert cmd_sessions(_export_args(output=str(jsonl))) is None
+        assert json.loads(jsonl.read_text(encoding="utf-8"))["id"] == "export-pg"
+        markdown_dir = tmp_path / "markdown"
+        assert cmd_sessions(_export_args(output=str(markdown_dir), format="md", lineage="logical")) is None
+        assert "parent evidence" in next(markdown_dir.glob("*.md")).read_text(encoding="utf-8")
+        qmd_dir = tmp_path / "qmd"
+        assert cmd_sessions(_export_args(output=str(qmd_dir), format="qmd")) is None
+        assert "child answer" in next(qmd_dir.glob("*.qmd")).read_text(encoding="utf-8")
+        html = tmp_path / "session.html"
+        assert cmd_sessions(_export_args(output=str(html), format="html")) is None
+        assert "child answer" in html.read_text(encoding="utf-8")
+        prompt_file = tmp_path / "prompts.jsonl"
+        assert cmd_sessions(_export_args(output=str(prompt_file), session_id="export-pg-parent", only="user-prompts")) is None
+        assert json.loads(prompt_file.read_text(encoding="utf-8"))["text"] == "parent evidence"
+    sqlite.close()
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+@pytest.mark.parametrize("overrides, expected", [
+    ({"session_id": None}, "requires --session-id"),
+    ({"source": "cli"}, "bulk, filter, or dry-run"),
+    ({"format": "trace"}, "trace export"),
+    ({"delete_after_verified": True}, "--delete-after-verified"),
+    ({"upload": True}, "--upload"),
+])
+def test_postgresql_cli_export_rejects_unsupported_controls_before_sqlite(pg_cli_home, monkeypatch, capsys, overrides, expected):
+    from hermes_cli.sessions_cmd import cmd_sessions
+
+    home, _stores = pg_cli_home
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
+    with trap_state_db_opens(home) as opens:
+        assert cmd_sessions(_export_args(**overrides)) == 2
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "no SQLite fallback" in output
     assert opens == []
     assert not (home / "state.db").exists()
 

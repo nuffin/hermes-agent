@@ -159,6 +159,60 @@ class PostgreSQLCLISessionStore:
     def publish_compression_child(self, **kwargs: Any): return self._store.publish_compression_child(**kwargs)
 
     def get_session(self, session_id: str): return self._store.get_session(session_id)
+    def resolve_session_id(self, session_id_or_prefix: str) -> str | None:
+        """Resolve an exact ID or one unambiguous PostgreSQL-local prefix."""
+        exact = self._store.get_session(session_id_or_prefix)
+        if exact:
+            return str(exact["id"])
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id FROM {self._store._schema}.sessions WHERE id LIKE %s ORDER BY started_at DESC LIMIT 2",
+                (f"{session_id_or_prefix}%",),
+            )
+            matches = cursor.fetchall()
+        return str(matches[0][0]) if len(matches) == 1 else None
+
+    def session_count(self, source: str | None = None) -> int:
+        """Return the complete PostgreSQL session count for CLI statistics."""
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            if source is None:
+                cursor.execute(f"SELECT COUNT(*) FROM {self._store._schema}.sessions")
+            else:
+                cursor.execute(f"SELECT COUNT(*) FROM {self._store._schema}.sessions WHERE source=%s", (source,))
+            row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    def message_count(self) -> int:
+        """Return the complete physical PostgreSQL message count for CLI statistics."""
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM {self._store._schema}.messages")
+            row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    def export_session(self, session_id: str) -> dict[str, Any] | None:
+        """Project one complete active PostgreSQL segment into SessionDB export shape."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return None
+        messages = self._store.get_message_records(session_id)
+        from hermes_state_portability import _export_timings
+        return {**session, "message_count": len(messages), "messages": messages, "timings": _export_timings(messages, session_id)}
+
+    def export_session_lineage(self, session_id: str) -> dict[str, Any] | None:
+        """Export the complete compression lineage when every segment is available."""
+        lineage_ids = self._store.get_compression_lineage(session_id)
+        if not lineage_ids:
+            return None
+        segments = [segment for segment in (self.export_session(item) for item in lineage_ids) if segment]
+        if not segments:
+            return None
+        messages = [message for segment in segments for message in segment["messages"]]
+        from hermes_state_portability import _export_timings
+        return {
+            **segments[-1], "segments": segments, "lineage_session_ids": [segment["id"] for segment in segments],
+            "message_count": len(messages), "messages": messages,
+            "timings": _export_timings(messages, session_id),
+        }
     def get_compression_tip(self, session_id: str): return self._store.get_compression_tip(session_id)
     def get_conversation_root(self, session_id: str): return self._store.get_conversation_root(session_id)
     def get_compression_lineage(self, session_id: str): return self._store.get_compression_lineage(session_id)
