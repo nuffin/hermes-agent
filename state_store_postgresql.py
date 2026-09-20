@@ -56,6 +56,7 @@ _SESSION_CONTROL_STATE_SCHEMA_VERSION = 21
 _TRANSCRIPT_REWIND_SCHEMA_VERSION = 22
 _FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION = 23
 _GATEWAY_SESSION_ROUTE_SCHEMA_VERSION = 24
+_GATEWAY_TRANSCRIPT_SCHEMA_VERSION = 25
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -172,7 +173,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _GATEWAY_SESSION_ROUTE_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _GATEWAY_TRANSCRIPT_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -768,6 +769,41 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute("DELETE FROM gateway_session_routes WHERE tenant_namespace=%s AND session_key=%s AND session_id=%s AND generation=%s", (tenant_namespace, session_key, expected_session_id, expected_generation))
             return cursor.rowcount == 1
+
+    def list_gateway_sessions(
+        self, *, platform: str | None = None, active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """One live mapping per gateway routing key, mirroring SQLite's listing surface.
+
+        ``gateway_session_routes`` is the key→current-session authority on PostgreSQL, so
+        each currently-routed key contributes exactly its pointed-at session row (the PK
+        on ``(tenant_namespace, session_key)`` keeps the join one-row-per-key). The
+        ``last_active`` projection matches SQLite's freshest-of expression: activity
+        timestamp, latest message timestamp, else ``started_at``. Read-only status
+        consumers call this; it never creates sessions and never touches SQLite.
+        """
+        clauses, params = ["route.tenant_namespace = %s"], [self._schema]
+        if platform:
+            clauses.append("LOWER(s.source) = LOWER(%s)")
+            params.append(platform)
+        if active_only:
+            clauses.append("s.ended_at IS NULL")
+        last_active = (
+            "COALESCE(GREATEST(s.last_activity_at, "
+            f"(SELECT MAX(m.created_at) FROM {self._schema}.messages AS m WHERE m.session_id = s.id), "
+            "s.started_at))"
+        )
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT s.id, s.source, s.session_key, s.chat_id, s.chat_type, s.thread_id, "
+                f"s.display_name, s.started_at, s.ended_at, s.end_reason, {last_active} AS last_active "
+                f"FROM {self._schema}.gateway_session_routes AS route "
+                f"JOIN {self._schema}.sessions AS s ON s.id = route.session_id "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC",
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     @staticmethod
     def _control_kind(control_kind: str) -> str:
