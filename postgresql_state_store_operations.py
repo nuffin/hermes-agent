@@ -1,9 +1,7 @@
-"""Sandbox-only PostgreSQL state-store operational reliability helpers.
+"""PostgreSQL-native state-store doctor and logical-backup primitives.
 
-This module deliberately does not select a runtime backend or expose a CLI command.
-It provides backend-native status, logical backup, and disposable restore verification
-for an already-resolved trusted tenant schema.  SQLite file/WAL recovery semantics do
-not apply here.
+The caller must resolve the active profile and its trusted tenant schema before
+constructing these operations. SQLite file/WAL recovery semantics never apply here.
 """
 
 from __future__ import annotations
@@ -13,10 +11,12 @@ import json
 import os
 import re
 import secrets
+
 import subprocess
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -32,6 +32,7 @@ _REQUIRED_TABLES = (
     "conversation_generations", "session_runtime_owners", "session_runtime_turns",
     "compression_locks", "session_turn_leases",
 )
+_REQUIRED_MIGRATIONS = tuple(range(1, 23))
 
 
 class PostgreSQLSandboxOperationsError(RuntimeError):
@@ -71,7 +72,7 @@ def _json_atomic(path: Path, value: Mapping[str, Any]) -> None:
 
 
 class PostgreSQLSandboxOperations:
-    """Native operations for one trusted state-store tenant in an isolated sandbox.
+    """Native operations for one already-resolved trusted state-store tenant.
 
     ``schema`` must come from ``postgresql_tenant_schema()``, never a CLI value.
     ``pg_dump`` and ``pg_restore`` are invoked without passwords in argv; any password
@@ -85,6 +86,7 @@ class PostgreSQLSandboxOperations:
         *,
         schema: str,
         delivery_schema: str | None = None,
+        profile_identity: Mapping[str, str] | None = None,
         command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         if not _IDENTIFIER_RE.fullmatch(schema) or (delivery_schema is not None and not _IDENTIFIER_RE.fullmatch(delivery_schema)):
@@ -93,6 +95,7 @@ class PostgreSQLSandboxOperations:
         self._dsn = dsn
         self._schema = schema
         self._delivery_schema = delivery_schema
+        self._profile_identity = dict(profile_identity or {})
         self._command_runner = command_runner
         self._restore_target_tokens: dict[str, str] = {}
         try:
@@ -190,7 +193,7 @@ class PostgreSQLSandboxOperations:
                 "WHERE expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
             )
             active_leases = int(cursor.fetchone()[0])
-        if migrations != list(range(1, 21)):
+        if migrations != list(_REQUIRED_MIGRATIONS):
             raise PostgreSQLSandboxOperationsError("PostgreSQL tenant migration catalog is unhealthy")
         with connection.cursor() as cursor:
             cursor.execute(
@@ -259,7 +262,7 @@ class PostgreSQLSandboxOperations:
     def backup(self, backup_root: Path, *, required_extensions: Iterable[str] = (), quiesced: bool = False) -> PostgreSQLLogicalBackup:
         """Create a custom-format schema dump and checksum manifest after an explicit quiesce gate."""
         if not quiesced:
-            raise PostgreSQLSandboxOperationsError("PostgreSQL logical backup requires an explicit quiesced=True sandbox gate")
+            raise PostgreSQLSandboxOperationsError("PostgreSQL logical backup requires explicit --quiesced confirmation")
         required_extensions = tuple(required_extensions)
         with self._connect() as snapshot_connection:
             with snapshot_connection.cursor() as cursor:
@@ -269,7 +272,7 @@ class PostgreSQLSandboxOperations:
             with snapshot_connection.cursor() as cursor:
                 cursor.execute("SELECT pg_export_snapshot()")
                 exported_snapshot = str(cursor.fetchone()[0])
-            root = backup_root.resolve()
+            root = backup_root.expanduser().resolve()
             root.mkdir(parents=True, exist_ok=True)
             backup_id = f"pg18-{int(time.time())}-{uuid.uuid4().hex}"
             directory = root / backup_id
@@ -291,6 +294,9 @@ class PostgreSQLSandboxOperations:
         manifest = {
             "manifest_version": _MANIFEST_VERSION,
             "backup_id": backup_id,
+            "backend": "postgresql",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "profile": self._profile_identity,
             "archive": {"name": archive.name, "bytes": archive.stat().st_size, "sha256": _sha256(archive), "format": "pg_dump_custom"},
             "tenant": snapshot,
             "tool_versions": {"pg_dump": self._tool_version("pg_dump"), "pg_restore": self._tool_version("pg_restore")},
@@ -306,7 +312,8 @@ class PostgreSQLSandboxOperations:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             archive = manifest["archive"]
-            if manifest["manifest_version"] != _MANIFEST_VERSION or archive["format"] != "pg_dump_custom":
+            if (manifest["manifest_version"] != _MANIFEST_VERSION or manifest["backend"] != "postgresql"
+                    or archive["format"] != "pg_dump_custom" or not isinstance(manifest["profile"], dict)):
                 raise ValueError("unsupported manifest")
             if manifest["tenant"]["schema"] != self._schema:
                 raise ValueError("tenant schema mismatch")
@@ -383,7 +390,7 @@ class PostgreSQLSandboxOperations:
             restored_dsn = self._conninfo_module.make_conninfo(**{**self._conninfo, "dbname": database})
             restored = PostgreSQLSandboxOperations(
                 self._settings, restored_dsn, schema=self._schema, delivery_schema=self._delivery_schema,
-                command_runner=self._command_runner,
+                profile_identity=self._profile_identity, command_runner=self._command_runner,
             )
             snapshot = restored.doctor(required_extensions=manifest["tenant"]["required_extensions"])
             expected = manifest["tenant"]

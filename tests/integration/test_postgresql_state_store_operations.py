@@ -103,7 +103,11 @@ def test_pg18_doctor_backup_restore_isolated_and_reversible(sandbox, backup_root
     }
     backup = operations.backup(backup_root, required_extensions=("pg_trgm", "vector"), quiesced=True)
     assert backup.manifest["archive"]["sha256"]
-    assert json.loads(backup.manifest_path.read_text())["tenant"]["table_counts"] == status["table_counts"]
+    manifest = json.loads(backup.manifest_path.read_text())
+    assert manifest["backend"] == "postgresql"
+    assert manifest["created_at"].endswith("+00:00")
+    assert manifest["archive"]["sha256"] == backup.manifest["archive"]["sha256"]
+    assert manifest["tenant"]["table_counts"] == status["table_counts"]
 
     restore_target = f"hermes_state_restore_{uuid.uuid4().hex}"
     result = operations.restore_and_verify(backup.backup_directory, target_database=restore_target)
@@ -137,6 +141,13 @@ def test_pg18_operations_fail_closed_for_missing_extension_bad_manifest_and_exis
     # Invalid manifests are rejected before the owned target is created;
     # unrelated parallel tests must not influence this assertion.
     assert restore_target not in set(_restored_databases())
+
+
+def test_pg18_backup_rejects_missing_explicit_quiescence(sandbox, backup_root: Path):
+    operations, store, _delivery, _state_target, _delivery_target = sandbox
+    store.ensure_session(f"operations-{uuid.uuid4()}", source="operations")
+    with pytest.raises(PostgreSQLSandboxOperationsError, match="--quiesced"):
+        operations.backup(backup_root)
 
 
 def test_pg18_doctor_rejects_catalog_drift_without_migrating(sandbox):

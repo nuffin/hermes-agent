@@ -8,10 +8,11 @@ SQLite fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from state_store import StateStoreConfigurationError
+from state_store import StateStoreConfigurationError, resolve_state_store_config
 from state_store_runtime_readiness import inspect_runtime_activation
 
 
@@ -26,6 +27,8 @@ class StateStoreMaintenanceOperations:
 
     selected_backend: str
     profile_home: Path
+    profile_name: str | None = None
+    tenant_schema: str | None = None
     _sqlite_capabilities = frozenset({
         "sessions-repair", "sessions-recover", "sessions-import", "sessions-repair-profiles",
         "backup", "backup-quick", "archive-import", "snapshot-list", "snapshot-create", "snapshot-restore",
@@ -48,13 +51,65 @@ class StateStoreMaintenanceOperations:
                     f"no SQLite fallback is permitted: {exc}"
                 ) from exc
             return cls("sqlite", (home or _current_home()).expanduser().resolve())
-        return cls(report.selected_backend, Path(report.profile_home))
+        return cls(report.selected_backend, Path(report.profile_home), report.profile_name, report.tenant_schema)
 
     def require(self, capability: str) -> None:
         if capability not in self._sqlite_capabilities:
             raise ValueError(f"Unknown state-store maintenance capability: {capability}")
         if self.selected_backend == "postgresql":
             raise StateStoreMaintenanceCapabilityError(capability, self.profile_home)
+
+    def doctor(self, config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        """Observe the selected PostgreSQL tenant without SQLite access or mutation."""
+        return self._postgresql_operations(config).doctor()
+
+    def logical_backup(
+        self, output_directory: Path, *, quiesced: bool, config: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Create and verify a schema-only PG logical backup via the native primitive."""
+        output_directory = output_directory.expanduser().resolve()
+        if not output_directory.is_dir():
+            raise StateStoreMaintenanceConfigurationError(
+                "PostgreSQL logical-backup requires an existing user-selected output directory"
+            )
+        if hasattr(os, "geteuid") and output_directory.stat().st_uid != os.geteuid():
+            raise StateStoreMaintenanceConfigurationError(
+                "PostgreSQL logical-backup output directory must be owned by the active user"
+            )
+        operations = self._postgresql_operations(config)
+        backup = operations.backup(output_directory, quiesced=quiesced)
+        verification = operations.restore_and_verify(backup.backup_directory)
+        return backup, verification
+
+    def _postgresql_operations(self, config: Mapping[str, Any] | None) -> Any:
+        if self.selected_backend != "postgresql" or not self.tenant_schema:
+            raise StateStoreMaintenanceCapabilityError("state-store doctor", self.profile_home)
+        try:
+            from state_store import _profile_secret_lookup
+            from postgresql_state_store_operations import PostgreSQLSandboxOperations
+
+            from state_store_runtime_readiness import _read_profile_config
+
+            raw_config = config if config is not None else _read_profile_config(self.profile_home)
+            resolved = resolve_state_store_config(
+                raw_config, secret_lookup=lambda name: _profile_secret_lookup(self.profile_home, name),
+            )
+            if resolved.backend != "postgresql" or resolved.postgresql is None:
+                raise StateStoreMaintenanceConfigurationError("PostgreSQL state-store selection changed during maintenance")
+            dsn = _profile_secret_lookup(self.profile_home, resolved.postgresql.dsn_env)
+            if not str(dsn or "").strip():
+                raise StateStoreMaintenanceConfigurationError("PostgreSQL state-store secret is unavailable; no SQLite fallback is permitted")
+            return PostgreSQLSandboxOperations(
+                resolved.postgresql, str(dsn), schema=self.tenant_schema,
+                profile_identity={"home": str(self.profile_home), "name": str(self.profile_name or "default")},
+            )
+        except StateStoreMaintenanceError:
+            raise
+        except Exception as exc:
+            raise StateStoreMaintenanceConfigurationError(
+                "PostgreSQL state-store maintenance could not resolve the active trusted tenant; "
+                "no SQLite fallback is permitted"
+            ) from exc
 
 
 class StateStoreMaintenanceError(RuntimeError):
