@@ -3168,18 +3168,29 @@ def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: An
     is carried unchanged (renumbering per rotation made one session look like many); its provenance is read BEFORE the
     transfer clears the ancestor's row, then restored so an inherited auto-title stays upgradeable.
     """
-    with _swallow('Could not migrate goal on compression: %s'):
-        # Carry a persistent /goal onto the continuation session. Compression mints a fresh child id;
-        # load_goal does a flat per-session lookup with no parent walk, so without this an active goal
-        # silently dies at the boundary (#33618).
-        from hermes_cli.goals import migrate_goal_to_session
-        migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
-    with _swallow('Could not migrate heartbeat on compression: %s'):
-        from hermes_cli.heartbeat import migrate_heartbeat_to_session
-        migrate_heartbeat_to_session(old_session_id, agent.session_id)
-    with _swallow('Could not migrate loop on compression: %s'):
-        from hermes_cli.loops import migrate_loop_to_session
-        migrate_loop_to_session(old_session_id, agent.session_id, reason="compression")
+    # PostgreSQL has one atomic transfer primitive.  Do not fall back to the
+    # three legacy copy-and-clear operations: a failed/colliding child keeps the
+    # parent authoritative rather than creating duplicate active controls.
+    try:
+        from session_control_store import get_session_control_store
+        control_store = get_session_control_store()
+        transfer = getattr(control_store, "transfer_to_session", None)
+        if callable(transfer):
+            transfer(old_session_id, agent.session_id)
+        else:
+            raise ImportError  # SQLite retains its established compatibility path below.
+    except ImportError:
+        with _swallow('Could not migrate goal on compression: %s'):
+            from hermes_cli.goals import migrate_goal_to_session
+            migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
+        with _swallow('Could not migrate heartbeat on compression: %s'):
+            from hermes_cli.heartbeat import migrate_heartbeat_to_session
+            migrate_heartbeat_to_session(old_session_id, agent.session_id)
+        with _swallow('Could not migrate loop on compression: %s'):
+            from hermes_cli.loops import migrate_loop_to_session
+            migrate_loop_to_session(old_session_id, agent.session_id, reason="compression")
+    except Exception:
+        logger.warning("Could not atomically migrate PostgreSQL session controls; parent state preserved", exc_info=True)
     if not old_title:
         return
     _src = None

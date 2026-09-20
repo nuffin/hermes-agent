@@ -51,6 +51,7 @@ _SEARCH_HEALTH_SCHEMA_VERSION = 17
 _SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION = 18
 _COMPRESSION_COORDINATION_SCHEMA_VERSION = 19
 _COMPRESSION_ROTATION_SCHEMA_VERSION = 20
+_SESSION_CONTROL_STATE_SCHEMA_VERSION = 21
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -167,7 +168,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _COMPRESSION_ROTATION_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _SESSION_CONTROL_STATE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -191,6 +192,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION, self._apply_v18, self._validate_v18),
                     (_COMPRESSION_COORDINATION_SCHEMA_VERSION, self._apply_v19, self._validate_v19),
                     (_COMPRESSION_ROTATION_SCHEMA_VERSION, self._apply_v20, self._validate_v20),
+                    (_SESSION_CONTROL_STATE_SCHEMA_VERSION, self._apply_v21, self._validate_v21),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -635,6 +637,103 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._require_index(cursor, "compression_rotation_receipts_parent")
         self._require_foreign_key(cursor, "compression_rotation_receipts_parent_session_id_fkey", "compression_rotation_receipts", "sessions")
         self._require_foreign_key(cursor, "compression_rotation_receipts_child_session_id_fkey", "compression_rotation_receipts", "sessions")
+
+    def _apply_v21(self, cursor: Any) -> None:
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.session_control_state ("
+            f"session_id text NOT NULL REFERENCES {self._schema}.sessions(id) ON DELETE CASCADE, "
+            "control_kind text NOT NULL CHECK (control_kind IN ('goal', 'heartbeat', 'loop')), "
+            "status text NOT NULL, payload jsonb NOT NULL, revision bigint NOT NULL DEFAULT 1 CHECK (revision > 0), "
+            "updated_at double precision NOT NULL, PRIMARY KEY (session_id, control_kind))"
+        )
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS session_control_state_kind_status ON {self._schema}.session_control_state (control_kind, status)")
+
+    def _validate_v21(self, cursor: Any) -> None:
+        self._validate_v20(cursor)
+        self._required_columns(cursor, "session_control_state", {
+            "session_id", "control_kind", "status", "payload", "revision", "updated_at",
+        })
+        self._require_index(cursor, "session_control_state_kind_status")
+        self._require_foreign_key(cursor, "session_control_state_session_id_fkey", "session_control_state", "sessions")
+
+    @staticmethod
+    def _control_kind(control_kind: str) -> str:
+        if control_kind not in {"goal", "heartbeat", "loop"}:
+            raise ValueError(f"unsupported session control kind: {control_kind!r}")
+        return control_kind
+
+    def get_session_control_state(self, session_id: str, control_kind: str) -> dict[str, Any] | None:
+        control_kind = self._control_kind(control_kind)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT status, payload, revision, updated_at FROM session_control_state WHERE session_id=%s AND control_kind=%s", (session_id, control_kind))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        status, payload, revision, updated_at = row
+        return {"status": status, "payload": payload, "revision": int(revision), "updated_at": float(updated_at)}
+
+    def put_session_control_state(self, session_id: str, control_kind: str, status: str, payload: Mapping[str, Any], *, expected_revision: int | None = None) -> int | None:
+        control_kind = self._control_kind(control_kind)
+        if not session_id or not isinstance(payload, Mapping):
+            raise ValueError("session control state requires session_id and object payload")
+        encoded = self._psycopg.types.json.Jsonb(dict(payload))
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
+            now = float(cursor.fetchone()[0])
+            if expected_revision is None:
+                cursor.execute(
+                    "INSERT INTO session_control_state (session_id, control_kind, status, payload, revision, updated_at) VALUES (%s, %s, %s, %s, 1, %s) "
+                    "ON CONFLICT (session_id, control_kind) DO UPDATE SET status=EXCLUDED.status, payload=EXCLUDED.payload, revision=session_control_state.revision + 1, updated_at=EXCLUDED.updated_at RETURNING revision",
+                    (session_id, control_kind, status, encoded, now),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE session_control_state SET status=%s, payload=%s, revision=revision + 1, updated_at=%s WHERE session_id=%s AND control_kind=%s AND revision=%s RETURNING revision",
+                    (status, encoded, now, session_id, control_kind, expected_revision),
+                )
+            row = cursor.fetchone()
+            return None if row is None else int(row[0])
+
+    def list_session_control_states(self, control_kind: str, *, status: str | None = None) -> list[dict[str, Any]]:
+        control_kind = self._control_kind(control_kind)
+        with self._connection() as connection, connection.cursor() as cursor:
+            if status is None:
+                cursor.execute("SELECT session_id, status, payload, revision, updated_at FROM session_control_state WHERE control_kind=%s", (control_kind,))
+            else:
+                cursor.execute("SELECT session_id, status, payload, revision, updated_at FROM session_control_state WHERE control_kind=%s AND status=%s", (control_kind, status))
+            rows = cursor.fetchall()
+        return [{"session_id": row[0], "status": row[1], "payload": row[2], "revision": int(row[3]), "updated_at": float(row[4])} for row in rows]
+
+    def transfer_session_control_states(self, parent_session_id: str, child_session_id: str) -> bool:
+        """Atomically move all durable controls for compression without duplicate actives."""
+        if not parent_session_id or not child_session_id or parent_session_id == child_session_id:
+            return False
+        with self._connection() as connection, connection.cursor() as cursor:
+            # Advisory locks serialize absent-row checks across concurrent rotations.
+            for session_id in sorted((parent_session_id, child_session_id)):
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{self._schema}:session-control:{session_id}",))
+            cursor.execute("SELECT 1 FROM sessions WHERE id=%s FOR KEY SHARE", (parent_session_id,))
+            if cursor.fetchone() is None:
+                return False
+            cursor.execute("SELECT 1 FROM sessions WHERE id=%s FOR KEY SHARE", (child_session_id,))
+            if cursor.fetchone() is None:
+                return False
+            cursor.execute("SELECT 1 FROM session_control_state WHERE session_id=%s FOR UPDATE", (child_session_id,))
+            if cursor.fetchone() is not None:
+                return False
+            cursor.execute("SELECT control_kind, status, payload FROM session_control_state WHERE session_id=%s FOR UPDATE", (parent_session_id,))
+            rows = cursor.fetchall()
+            active = [(kind, status, payload) for kind, status, payload in rows if status not in {"cleared", "done"}]
+            if not active:
+                return False
+            cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
+            now = float(cursor.fetchone()[0])
+            for kind, status, payload in active:
+                cursor.execute("INSERT INTO session_control_state (session_id, control_kind, status, payload, revision, updated_at) VALUES (%s, %s, %s, %s, 1, %s)", (child_session_id, kind, status, self._psycopg.types.json.Jsonb(payload), now))
+                archived = dict(payload)
+                archived["status"] = "cleared"
+                cursor.execute("UPDATE session_control_state SET status='cleared', payload=%s, revision=revision+1, updated_at=%s WHERE session_id=%s AND control_kind=%s", (self._psycopg.types.json.Jsonb(archived), now, parent_session_id, kind))
+        return True
 
     @staticmethod
     def _runtime_namespace(namespace: str | None) -> str:
