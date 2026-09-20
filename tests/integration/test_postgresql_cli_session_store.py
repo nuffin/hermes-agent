@@ -1048,3 +1048,78 @@ def test_postgresql_branch_rolls_back_parent_and_child_on_message_copy_failure(p
     parent_row = store.get_session(parent)
     assert parent_row["ended_at"] is None and parent_row["end_reason"] is None
     assert [row["content"] for row in store._store.get_message_records(parent)] == ["must survive"]
+
+
+def _maintenance_args(action: str, **overrides):
+    values = {
+        "sessions_action": action, "older_than": None, "newer_than": None, "before": None, "after": None,
+        "source": None, "title": None, "end_reason": None, "cwd": None, "min_messages": None,
+        "max_messages": None, "model": None, "provider": None, "user": None, "chat_id": None,
+        "chat_type": None, "branch": None, "min_tokens": None, "max_tokens": None, "min_cost": None,
+        "max_cost": None, "min_tool_calls": None, "max_tool_calls": None, "dry_run": False, "yes": False,
+        "include_archived": False, "include_pinned": False, "never_active": False, "no_backup": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_postgresql_maintenance_archive_prune_markers_and_title_repair_match_sqlite_oracle(
+    pg_cli_home, monkeypatch, capsys, tmp_path,
+):
+    """Real isolated PG maintenance preserves the SQLite candidate/pin/refusal contract."""
+    from hermes_cli.sessions_cmd import cmd_sessions
+    from hermes_state import SessionDB
+
+    home, stores = pg_cli_home
+    oracle_home = tmp_path / ".hermes-maintenance-oracle"
+    oracle_home.mkdir()
+    oracle_token = set_hermes_home_override(str(oracle_home))
+    try:
+        oracle = SessionDB(db_path=tmp_path / "maintenance-oracle.db")
+    finally:
+        reset_hermes_home_override(oracle_token)
+    try:
+        with trap_state_db_opens(home) as opens:
+            pg = _open(stores)
+            for store, suffix in ((pg, "pg"), (oracle, "sqlite")):
+                for session_id, pinned in ((f"old-{suffix}", False), (f"pin-{suffix}", True), (f"open-{suffix}", False)):
+                    store.create_session(session_id, "maintenance")
+                    store.append_message(session_id, "user", session_id, timestamp=10)
+                    if session_id.startswith("open"):
+                        continue
+                    store.end_session(session_id, "done")
+                    store.set_session_pinned(session_id, pinned)
+                store.create_session(f"marker-{suffix}", "maintenance")
+                store.append_message(f"marker-{suffix}", "assistant", "[memory]", tool_calls=[{"id": "call"}])
+                store.end_session(f"marker-{suffix}", "done")
+            filters = {"source": "maintenance", "archived": False, "include_pinned": False}
+            assert [row["id"].removesuffix("-pg") for row in pg.list_prune_candidates(**filters)] == [
+                row["id"].removesuffix("-sqlite") for row in oracle.list_prune_candidates(**filters)
+            ]
+            assert pg.count_prune_matches(**filters) == oracle.count_prune_matches(**filters) == 2
+            assert pg.count_open_prune_matches(**filters) == oracle.count_open_prune_matches(**filters) == 1
+            assert pg.purge_stale_tool_call_markers(dry_run=True)["rows_affected"] == 1
+            assert pg.get_messages("marker-pg")[0]["content"] == "[memory]"
+            assert pg.purge_stale_tool_call_markers()["rows_affected"] == 1
+            assert pg.get_messages("marker-pg")[0]["content"] == ""
+
+            monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
+            assert cmd_sessions(_maintenance_args("archive", source="maintenance", dry_run=True)) is None
+            assert "Dry run" in capsys.readouterr().out
+            assert not pg.get_session("old-pg")["archived"]
+            monkeypatch.setattr("hermes_cli.sessions_cmd._confirm_prompt", lambda _prompt: False)
+            assert cmd_sessions(_maintenance_args("archive", source="maintenance", yes=False)) is None
+            assert "Cancelled." in capsys.readouterr().out
+            assert not pg.get_session("old-pg")["archived"]
+            assert cmd_sessions(_maintenance_args("archive", source="maintenance", yes=True)) is None
+            assert pg.get_session("old-pg")["archived"] is True
+            assert pg.get_session("pin-pg")["archived"] is False
+            assert cmd_sessions(_maintenance_args("prune", source="maintenance", include_archived=True, yes=True)) is None
+            assert pg.get_session("old-pg") is None
+            assert pg.get_session("pin-pg") is not None and pg.get_session("open-pg") is not None
+            assert cmd_sessions(_maintenance_args("prune", source="maintenance", include_archived=True, include_pinned=True, yes=True)) is None
+            assert pg.get_session("pin-pg") is None
+        assert opens == []
+        assert not (home / "state.db").exists()
+    finally:
+        oracle.close()

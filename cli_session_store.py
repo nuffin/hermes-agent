@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -257,6 +258,116 @@ class PostgreSQLCLISessionStore:
     def search_index_status(self): return self._store.search_index_status()
     def rebuild_search_index(self): return self._store.rebuild_search_index()
     def get_next_title_in_lineage(self, title: str): return self._store.get_next_title_in_lineage(title)
+
+    def _prune_where(self, older_than_days: float | None, source: str | None, filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
+        """Tenant-scoped PG equivalent of SessionMaintenanceMixin's bounded filter grammar."""
+        allowed = {
+            "last_active_before", "last_active_after", "started_before", "started_after", "source", "title_like",
+            "end_reason", "cwd_prefix", "min_messages", "max_messages", "model_like", "provider", "user_id",
+            "chat_id", "chat_type", "branch_like", "min_tokens", "max_tokens", "min_cost", "max_cost",
+            "min_tool_calls", "max_tool_calls", "archived", "include_pinned",
+        }
+        unknown = set(filters) - allowed
+        if unknown:
+            raise TypeError(f"unexpected PostgreSQL maintenance filter: {sorted(unknown)[0]}")
+        message_count = "(SELECT COUNT(*) FROM " + self._store._schema + ".messages message WHERE message.session_id=s.id)"
+        tool_call_count = "(SELECT COUNT(*) FROM " + self._store._schema + ".messages tool_message WHERE tool_message.session_id=s.id AND tool_message.role='tool')"
+        last_active = "COALESCE(s.last_activity_at, (SELECT MAX(m.created_at) FROM " + self._store._schema + ".messages m WHERE m.session_id=s.id), s.started_at)"
+        clauses, params = ["s.ended_at IS NOT NULL"], []
+        values = dict(filters)
+        if older_than_days is not None and values.get("last_active_before") is None and values.get("started_before") is None:
+            values["last_active_before"] = time.time() - float(older_than_days) * 86400
+        def add(clause: str, value: Any, enabled: bool = True) -> None:
+            if enabled:
+                clauses.append(clause); params.append(value)
+        add(last_active + " < %s", values.get("last_active_before"), values.get("last_active_before") is not None)
+        if values.get("last_active_before") is not None:
+            clauses.append("(COALESCE(s.end_reason, '') != 'startup_orphan_reap' OR s.ended_at < %s)")
+            params.append(values["last_active_before"])
+        add(last_active + " >= %s", values.get("last_active_after"), values.get("last_active_after") is not None)
+        add("s.started_at < %s", values.get("started_before"), values.get("started_before") is not None)
+        add("s.started_at >= %s", values.get("started_after"), values.get("started_after") is not None)
+        for key, column in (("source", "source"), ("end_reason", "end_reason"), ("provider", "billing_provider"), ("user_id", "user_id"), ("chat_id", "chat_id"), ("chat_type", "chat_type")):
+            value = values.get(key)
+            add((f"LOWER(COALESCE(s.{column}, '')) = LOWER(%s)" if key == "provider" else f"s.{column} = %s"), value, bool(value))
+        for key, column in (("title_like", "title"), ("model_like", "model"), ("branch_like", "git_branch")):
+            value = values.get(key)
+            add(f"LOWER(COALESCE(s.{column}, '')) LIKE %s ESCAPE '\\\\'", "%" + str(value).lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%", bool(value))
+        value = values.get("cwd_prefix")
+        add("(s.cwd = %s OR s.cwd LIKE %s ESCAPE '\\\\')", value, bool(value))
+        if value:
+            params.append(str(value).rstrip("/") + "/%")
+        for key, expression in (("min_messages", message_count + " >= %s"), ("max_messages", message_count + " <= %s"), ("min_tokens", "(COALESCE(s.input_tokens,0)+COALESCE(s.output_tokens,0)) >= %s"), ("max_tokens", "(COALESCE(s.input_tokens,0)+COALESCE(s.output_tokens,0)) <= %s"), ("min_cost", "COALESCE(s.actual_cost_usd,s.estimated_cost_usd,0) >= %s"), ("max_cost", "COALESCE(s.actual_cost_usd,s.estimated_cost_usd,0) <= %s"), ("min_tool_calls", tool_call_count + " >= %s"), ("max_tool_calls", tool_call_count + " <= %s")):
+            add(expression, values.get(key), values.get(key) is not None)
+        if isinstance(values.get("archived"), bool):
+            clauses.append("s.archived = %s"); params.append(values["archived"])
+        if not values.get("include_pinned", False):
+            clauses.append("NOT s.pinned")
+        return " AND ".join(clauses), params
+
+    def list_prune_candidates(self, older_than_days: float | None = None, source: str | None = None, **filters: Any) -> list[dict[str, Any]]:
+        where, params = self._prune_where(older_than_days, source, filters)
+        query = f"SELECT s.id, s.source, s.title, s.model, s.started_at, COALESCE(s.last_activity_at, (SELECT MAX(m.created_at) FROM {self._store._schema}.messages m WHERE m.session_id=s.id), s.started_at) AS last_active, s.ended_at, (SELECT COUNT(*) FROM {self._store._schema}.messages message WHERE message.session_id=s.id) AS message_count, s.archived FROM {self._store._schema}.sessions s WHERE {where} ORDER BY last_active ASC, s.started_at ASC, s.id ASC LIMIT 10000"
+        with self._store._connection() as connection, connection.cursor(row_factory=self._store._psycopg.rows.dict_row) as cursor:
+            cursor.execute(query, params)
+            return list(cursor.fetchall())
+
+    def count_prune_matches(self, older_than_days: float | None = None, source: str | None = None, **filters: Any) -> int:
+        where, params = self._prune_where(older_than_days, source, filters)
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM {self._store._schema}.sessions s WHERE {where}", params)
+            return int(cursor.fetchone()[0])
+
+    def count_open_prune_matches(self, older_than_days: float | None = None, source: str | None = None, **filters: Any) -> int:
+        where, params = self._prune_where(older_than_days, source, filters)
+        where = where.replace("s.ended_at IS NOT NULL", "s.ended_at IS NULL", 1)
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM {self._store._schema}.sessions s WHERE {where}", params)
+            return int(cursor.fetchone()[0])
+
+    def prune_sessions(self, older_than_days: float | None = 90, source: str | None = None, *, sessions_dir: Any = None, **filters: Any) -> int:
+        del sessions_dir
+        where, params = self._prune_where(older_than_days, source, filters)
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT s.id FROM {self._store._schema}.sessions s WHERE {where} FOR UPDATE", params)
+            doomed = [str(row[0]) for row in cursor.fetchall()]
+            if not doomed:
+                return 0
+            # Bulk retention must not inherit explicit-delete's delegate cascade: delete exactly the
+            # ended, filtered roots and detach every surviving child in this same transaction.
+            cursor.execute(
+                f"DELETE FROM {self._store._schema}.compression_rotation_receipts WHERE parent_session_id = ANY(%s) OR child_session_id = ANY(%s)",
+                (doomed, doomed),
+            )
+            cursor.execute(f"DELETE FROM {self._store._schema}.messages WHERE session_id = ANY(%s)", (doomed,))
+            cursor.execute(f"UPDATE {self._store._schema}.sessions SET parent_session_id=NULL WHERE parent_session_id = ANY(%s) AND NOT (id = ANY(%s))", (doomed, doomed))
+            cursor.execute(f"DELETE FROM {self._store._schema}.sessions WHERE id = ANY(%s)", (doomed,))
+            cursor.execute(f"DELETE FROM {self._store._schema}.system_prompts prompt WHERE NOT EXISTS (SELECT 1 FROM {self._store._schema}.sessions session WHERE session.system_prompt_hash=prompt.hash)")
+            return len(doomed)
+
+    def archive_sessions(self, older_than_days: float | None = None, source: str | None = None, **filters: Any) -> int:
+        filters.setdefault("archived", False)
+        rows = self.list_prune_candidates(older_than_days, source, **filters)
+        # set_session_archived owns the compression-lineage transaction and lock; do not split
+        # that canonical operation into a facade-side UPDATE.
+        for row in rows:
+            self._store.set_session_archived(str(row["id"]), True)
+        return len(rows)
+
+    def purge_stale_tool_call_markers(self, *, dry_run: bool = False, backup: bool = True) -> dict[str, Any]:
+        if backup:
+            # SQLite's file snapshot is intentionally non-equivalent; PG changes are transactionally atomic.
+            backup_path = None
+        else:
+            backup_path = None
+        from hermes_state import _STALE_TOOL_CALL_MARKER_RE
+        with self._store._connection() as connection, connection.cursor(row_factory=self._store._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id, content FROM {self._store._schema}.messages WHERE role='assistant' AND tool_calls IS NOT NULL")
+            ids = [int(row["id"]) for row in cursor.fetchall() if isinstance(row["content"], str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(row["content"].strip())]
+            if ids and not dry_run:
+                cursor.execute(f"UPDATE {self._store._schema}.messages SET content='' WHERE id = ANY(%s)", (ids,))
+        return {"dry_run": dry_run, "rows_affected": len(ids), "row_ids": ids, "backup_path": backup_path}
+
     def update_session_billing_route(self, session_id: str, **kwargs: Any): return self._store.update_session_billing_route(session_id, **kwargs)
     def queue_token_counts(self, session_id: str, **kwargs: Any): return self._store.queue_token_counts(session_id, **kwargs)
     def flush_token_counts(self, timeout: float = 5.0): return self._store.flush_token_counts(timeout)
