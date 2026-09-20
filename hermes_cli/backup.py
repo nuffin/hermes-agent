@@ -671,6 +671,9 @@ def run_backup(args) -> bool:
     the caller turns False into exit status 1 so a cron/systemd timer never publishes a "successful"
     archive that is missing state.db. Hard failures keep raising ``SystemExit``.
     """
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("backup")
     hermes_root = get_default_hermes_root()
 
     if not hermes_root.is_dir():
@@ -977,6 +980,9 @@ def _import_members(
 
 def run_import(args) -> None:
     """Restore a Hermes backup from a zip file."""
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("archive-import")
     zip_path = Path(args.zipfile).expanduser().resolve()
     if not zip_path.is_file():
         print(f"Error: File not found: {zip_path}")
@@ -1134,6 +1140,9 @@ def create_quick_snapshot(
     max_file_size: Optional[int] = None) -> Optional[str]:
     """Create one atomic quick snapshot while holding the shared backup slot."""
     home = hermes_home or get_hermes_home()
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("snapshot-create", home=home)
     with _backup_operation_lock(home):
         return _create_quick_snapshot_locked(label, home, keep, max_file_size)
 
@@ -1295,8 +1304,12 @@ def _snapshot_dirs(root: Path) -> List[Path]:
 
 def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) -> List[Dict[str, Any]]:
     """List existing quick state snapshots, most recent first."""
+    home = hermes_home or get_hermes_home()
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("snapshot-list", home=home)
     results = []
-    for d in _snapshot_dirs(_quick_snapshot_root(hermes_home)):
+    for d in _snapshot_dirs(_quick_snapshot_root(home)):
         manifest_path = d / "manifest.json"
         if manifest_path.exists():
             try:
@@ -1311,6 +1324,9 @@ def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) ->
 def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None) -> bool:
     """Restore state from a quick snapshot."""
     home = hermes_home or get_hermes_home()
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("snapshot-restore", home=home)
     root = _quick_snapshot_root(home)
     # Reject ids with separators or traversal so ``root / snapshot_id`` stays inside root.
     if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
@@ -1588,7 +1604,11 @@ def _prune_oldest(newest_first: List[Path], keep: int, remove, what: str) -> int
 
 def prune_quick_snapshots(keep: int = _QUICK_DEFAULT_KEEP, hermes_home: Optional[Path] = None) -> int:
     """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
-    return _prune_oldest(_snapshot_dirs(_quick_snapshot_root(hermes_home)), keep, shutil.rmtree, "snapshot")
+    home = hermes_home or get_hermes_home()
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("snapshot-prune", home=home)
+    return _prune_oldest(_snapshot_dirs(_quick_snapshot_root(home)), keep, shutil.rmtree, "snapshot")
 
 
 def run_quick_backup(args) -> None:
@@ -1694,7 +1714,11 @@ def create_pre_update_backup(
     hermes_home: Optional[Path] = None, keep: int = _PRE_UPDATE_DEFAULT_KEEP) -> Optional[Path]:
     """Full zip backup to ``backups/pre-update-<timestamp>.zip``, auto-pruned; ``None`` if nothing
     was found or the backup failed. Never raises — ``hermes update`` continues anyway."""
-    return _create_prefixed_full_backup(hermes_home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update", "backup")
+    home = hermes_home or get_hermes_home()
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("update-snapshot", home=home)
+    return _create_prefixed_full_backup(home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update", "backup")
 
 
 def create_pre_migration_backup(
@@ -1702,8 +1726,12 @@ def create_pre_migration_backup(
     """Full zip backup to ``backups/pre-migration-<timestamp>.zip`` before ``hermes claw migrate``
     (same dir as update backups so listings/``hermes import`` find it); ``None`` if nothing was
     found or the write failed. Never raises."""
+    home = hermes_home or get_hermes_home()
+    from state_store_maintenance import require_state_store_maintenance
+
+    require_state_store_maintenance("claw-snapshot", home=home)
     return _create_prefixed_full_backup(
-        hermes_home, _PRE_MIGRATION_PREFIX, max(keep, 0), "pre-migration", "pre-migration backup")
+        home, _PRE_MIGRATION_PREFIX, max(keep, 0), "pre-migration", "pre-migration backup")
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

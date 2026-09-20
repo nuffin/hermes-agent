@@ -226,6 +226,12 @@ def import_foreign_session(source: str, path, db=None) -> str:
     """Import one foreign session into the Hermes SessionDB; returns the new Hermes session id.
 
     Raises ``ValueError`` on unknown source or a session with no usable conversation turns."""
+    # An explicitly supplied backend-native store owns its selection.  The
+    # implicit legacy acquisition must never create SessionDB under PostgreSQL.
+    if db is None:
+        from state_store_maintenance import require_state_store_maintenance
+
+        require_state_store_maintenance("sessions-import")
     source = (source or "").strip().lower().lstrip("@")
     if source not in _SOURCE_LABELS:
         raise ValueError(f"Unknown foreign session source: {source!r}")

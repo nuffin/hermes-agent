@@ -1018,9 +1018,6 @@ def _print_empty_store(action: str, args) -> None:
 
 def cmd_sessions(args, sessions_parser=None):
     action = args.sessions_action
-    pre = _PRE_DB_HANDLERS.get(action)
-    if pre is not None:
-        return pre(args)
     observational = action in _OBSERVATIONAL_DB_ACTIONS
     from hermes_cli.config import load_config
     from state_store import resolve_state_store_config
@@ -1028,8 +1025,18 @@ def cmd_sessions(args, sessions_parser=None):
         config = load_config()
         selected_store = resolve_state_store_config(config)
     except Exception as e:
-        print(f"Could not resolve your session history store: {e}")
+        print(f"Could not resolve your session history store: {e}; no SQLite fallback is permitted.")
         return 1
+    pre = _PRE_DB_HANDLERS.get(action)
+    if pre is not None:
+        # These handlers own legacy state.db probing/opening, so select before dispatch.
+        from state_store_maintenance import StateStoreMaintenanceError, require_state_store_maintenance
+        try:
+            require_state_store_maintenance(f"sessions-{action}", config)
+        except StateStoreMaintenanceError as e:
+            print(e)
+            return 2
+        return pre(args)
     if selected_store.backend == "postgresql":
         if action not in {"list", "stats", "export", "delete", "rename", "pin", "unpin", "pinned", "retitle-skills", "browse"}:
             print(
