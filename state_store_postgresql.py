@@ -201,6 +201,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_TRANSCRIPT_REWIND_SCHEMA_VERSION, self._apply_v22, self._validate_v22),
                     (_FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION, self._apply_v23, self._validate_v23),
                     (_GATEWAY_SESSION_ROUTE_SCHEMA_VERSION, self._apply_v24, self._validate_v24),
+                    (_GATEWAY_TRANSCRIPT_SCHEMA_VERSION, self._apply_v25, self._validate_v25),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -717,6 +718,30 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._required_columns(cursor, "gateway_session_routes", {"tenant_namespace", "session_key", "session_id", "generation", "flags", "metadata", "created_at", "updated_at"})
         self._require_index(cursor, "gateway_session_routes_session_unique")
         self._require_foreign_key(cursor, "gateway_session_routes_session_id_fkey", "gateway_session_routes", "sessions")
+
+    def _apply_v25(self, cursor: Any) -> None:
+        """Gateway transcript slice: durable platform-message identity and lookup support.
+
+        The ``messages`` table already carries ``platform_message_id`` (v7); this
+        migration adds the UNIQUE partial index that makes a platform message id
+        durable identity for exactly-once persistence (the transient-failure
+        dedupe guard), plus the per-session lookup partial index mirroring
+        SQLite's ``idx_messages_platform_msg_id``.
+        """
+        cursor.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS messages_platform_message_id_unique "
+            f"ON {self._schema}.messages (platform_message_id) WHERE platform_message_id IS NOT NULL"
+        )
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS messages_session_platform_message_id "
+            f"ON {self._schema}.messages (session_id, platform_message_id) WHERE platform_message_id IS NOT NULL"
+        )
+
+    def _validate_v25(self, cursor: Any) -> None:
+        self._validate_v24(cursor)
+        self._required_columns(cursor, "messages", {"platform_message_id"})
+        self._require_index(cursor, "messages_platform_message_id_unique")
+        self._require_index(cursor, "messages_session_platform_message_id")
 
     @staticmethod
     def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1348,14 +1373,30 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
         return self.append_message_record(session_id, MessageRecord(role=role, content=content))
 
-    def append_message_record(self, session_id: str, record: MessageRecord) -> int:
-        with self._connection() as connection, connection.cursor() as cursor:
+    def append_message_record(self, session_id: str, record: MessageRecord, *,
+                              turn_lease_holder: str | None = None,
+                              turn_lease_ttl_seconds: float = 300.0,
+                              reject_active_turn_lease: bool = False) -> int:
+        """Append one record row, optionally fenced by the turn-lease guards.
+
+        Mirrors the SQLite oracle's ``append_message`` guard kwargs: a writer
+        holding a turn lease passes ``turn_lease_holder`` (renewed on expiry,
+        refused when lost); a destructive mutation passes
+        ``reject_active_turn_lease`` to refuse while any active lease exists.
+        """
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._transcript_write_guards(cursor, session_id,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                reject_active_turn_lease=reject_active_turn_lease)
             cursor.execute(
                 f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
                 f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id, created_at",
                 self._record_params(session_id, record),
             )
-            message_id, created_at = cursor.fetchone()
+            row = cursor.fetchone()
+            message_id = row["id"] if isinstance(row, Mapping) else row[0]
+            created_at = row["created_at"] if isinstance(row, Mapping) else row[1]
             cursor.execute(
                 f"UPDATE {self._schema}.sessions SET last_activity_at = GREATEST("
                 "COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
@@ -1712,6 +1753,260 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             seen.add(parent_id)
             current = parent_id
         return session_id
+
+    def _refuse_closed_compression_parent(self, cursor: Any, session_id: str) -> None:
+        """Refuse a transcript write against a parent already closed by compression."""
+        from hermes_state_errors import CompressionSessionClosedError
+        cursor.execute(f"SELECT ended_at, end_reason FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+        row = cursor.fetchone()
+        if row is not None:
+            ended_at = row["ended_at"] if isinstance(row, Mapping) else row[0]
+            end_reason = row["end_reason"] if isinstance(row, Mapping) else row[1]
+            if ended_at is not None and end_reason == "compression":
+                raise CompressionSessionClosedError(session_id)
+
+    def _transcript_write_guards(self, cursor: Any, session_id: str, *, turn_lease_holder: str | None = None,
+                                 turn_lease_ttl_seconds: float = 300.0,
+                                 reject_active_turn_lease: bool = False,
+                                 reject_active_compression_lock: bool = False,
+                                 compression_lock_holder: str | None = None) -> None:
+        """PostgreSQL twin of the SQLite oracle's ``_check_transcript_write_guards``.
+
+        Ordinary appends only refuse a compression-closed parent (the advisory
+        lease machinery is untouched, exactly like SQLite, where plain appends
+        never consult compression_locks). Destructive mutations opt in via the
+        ``reject_active_*`` flags; a turn-lease holder renews on expiry and is
+        refused the moment it no longer owns the lease. Stale-lease liveness is
+        expiry-only here: cross-process PID forensics stay SQLite-local.
+        """
+        from hermes_state_errors import SessionCompressionInProgressError, SessionTurnLeaseLostError
+        if not (turn_lease_holder or reject_active_turn_lease or reject_active_compression_lock):
+            self._refuse_closed_compression_parent(cursor, session_id)
+            return
+        now = self._coordination_clock_and_lock(cursor, "transcript-write", session_id)
+        if reject_active_compression_lock:
+            cursor.execute(
+                f"SELECT holder FROM {self._schema}.compression_locks WHERE session_id=%s AND expires_at>%s FOR UPDATE",
+                (session_id, now),
+            )
+            lock = cursor.fetchone()
+            if lock is not None:
+                holder = lock["holder"] if isinstance(lock, Mapping) else lock[0]
+                if holder != compression_lock_holder:
+                    raise SessionCompressionInProgressError(
+                        f"Session {session_id!r} is being compressed by another writer")
+        if turn_lease_holder or reject_active_turn_lease:
+            conversation_id = self._compression_turn_lease_key_on_cursor(cursor, session_id)
+            cursor.execute(
+                f"SELECT holder, expires_at FROM {self._schema}.session_turn_leases WHERE conversation_id=%s FOR UPDATE",
+                (conversation_id,),
+            )
+            lease = cursor.fetchone()
+            holder = None if lease is None else (lease["holder"] if isinstance(lease, Mapping) else lease[0])
+            expires_at = None if lease is None else float(lease["expires_at"] if isinstance(lease, Mapping) else lease[1])
+            if turn_lease_holder:
+                if lease is None or holder != turn_lease_holder:
+                    raise SessionTurnLeaseLostError(
+                        f"Session turn lease lost; refusing transcript write for {session_id!r}")
+                assert expires_at is not None
+                if expires_at <= now:
+                    # Expiry makes the row reclaimable, not lost: the advisory lock
+                    # serializes this renewal with acquisition, so a starved owner
+                    # that still holds the lease recovers (same rule as SQLite).
+                    cursor.execute(
+                        f"UPDATE {self._schema}.session_turn_leases SET expires_at=%s, updated_at=%s "
+                        "WHERE conversation_id=%s AND holder=%s",
+                        (now + self._coordination_ttl(turn_lease_ttl_seconds), now, conversation_id, turn_lease_holder))
+            elif lease is not None:
+                assert expires_at is not None
+                if expires_at > now:
+                    raise SessionTurnLeaseLostError(
+                        f"Session has an active turn lease; refusing transcript mutation for {session_id!r}")
+                cursor.execute(
+                    f"DELETE FROM {self._schema}.session_turn_leases WHERE conversation_id=%s AND holder=%s",
+                    (conversation_id, holder))
+        self._refuse_closed_compression_parent(cursor, session_id)
+
+    @staticmethod
+    def _replace_record_from_dict(msg: Mapping[str, Any]) -> MessageRecord:
+        """Bind one replacement message dict to a :class:`MessageRecord`.
+
+        Mirrors the oracle's ``_message_row_params`` binding rules:
+        ``platform_message_id`` falls back to ``message_id`` (yuanbao's
+        message-dict convention) and reasoning columns are kept only on
+        assistant rows (``keep_reasoning`` semantics).
+        """
+        keep_reasoning = msg.get("role") == "assistant"
+        fields = MessageRecord.__dataclass_fields__
+        values = {name: msg[name] for name in fields if name in msg}
+        values.setdefault("role", "unknown")
+        values["platform_message_id"] = msg.get("platform_message_id") or msg.get("message_id")
+        values["observed"] = bool(msg.get("observed"))
+        values["_compressed_summary"] = bool(msg.get("_compressed_summary"))
+        if not keep_reasoning:
+            for column in ("reasoning", "reasoning_content", "reasoning_details",
+                           "codex_reasoning_items", "codex_message_items"):
+                values[column] = None
+        return MessageRecord(**values)
+
+    def replace_messages(self, session_id: str, messages: list[dict[str, Any]], active_only: bool = False,
+                         archive_dropped: bool = False, reject_active_turn_lease: bool = False) -> None:
+        """Atomically replace a session's messages (/retry, /undo, /compress).
+
+        Mirrors the SQLite oracle's ``replace_messages``: destructive DELETE by
+        default (``active_only`` spares soft-archived rows); ``archive_dropped``
+        soft-archives the live rows rewind-style instead; ``reject_active_turn_lease``
+        refuses the rewrite while another writer holds an active lease (and also
+        refuses an active compression lock, matching the oracle's guard pairing).
+        """
+        from hermes_state_errors import CompressionSessionClosedError
+        records = [self._replace_record_from_dict(msg) for msg in messages]
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            if reject_active_turn_lease:
+                self._transcript_write_guards(cursor, session_id,
+                    reject_active_turn_lease=True, reject_active_compression_lock=True)
+            else:
+                self._refuse_closed_compression_parent(cursor, session_id)
+            # Serialize concurrent rewriters on the session row before the drop.
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                raise CompressionSessionClosedError(session_id)
+            if archive_dropped:
+                cursor.execute(
+                    f"UPDATE {self._schema}.messages SET active=false WHERE session_id=%s AND active",
+                    (session_id,))
+            else:
+                cursor.execute(
+                    f"DELETE FROM {self._schema}.messages WHERE session_id=%s{' AND active' if active_only else ''}",
+                    (session_id,))
+            for record in records:
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
+                    f"VALUES ({', '.join('%s' for _ in range(21))})",
+                    self._record_params(session_id, record),
+                )
+
+    def get_messages_as_conversation(self, session_id: str, include_inactive: bool = False,
+                                     include_row_ids: bool = False) -> list[dict[str, Any]]:
+        """Load messages in OpenAI format, mirroring the SQLite oracle projection.
+
+        Covers the gateway transcript read path: born-durable persistence marker,
+        sanitized user/assistant text, verbatim ``api_content``, platform id
+        exposed as ``message_id``, reasoning restored on assistant rows only.
+        Ancestor lineage, display-generation dedupe, and alternation repair
+        remain SessionDB-only and are deliberately not ported in this slice.
+        """
+        from hermes_state import _strip_background_review_harness, _strip_stale_tool_call_markers
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        from agent.memory_manager import sanitize_context
+        columns = (
+            "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+            "finish_reason, reasoning, reasoning_content, reasoning_details, "
+            "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
+            "_compressed_summary, created_at AS timestamp, api_content, display_kind, display_metadata"
+        )
+        active_clause = "" if include_inactive else " AND active"
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT {columns} FROM {self._schema}.messages WHERE session_id=%s{active_clause} ORDER BY id",
+                (session_id,))
+            rows = list(cursor.fetchall())
+        messages: list[dict[str, Any]] = []
+        for row in rows:
+            content = self._decode_content(row["content"])
+            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+                content = sanitize_context(content).strip()
+            msg: dict[str, Any] = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER: True}
+            if include_row_ids and row["id"] is not None:
+                msg["_row_id"] = int(row["id"])
+            msg.update((column, row[column]) for column in ("api_content", "display_kind") if row[column])
+            if row["display_metadata"]:
+                metadata = self._record_json(row["display_metadata"], object_only=True)
+                if metadata is not None:
+                    msg["display_metadata"] = metadata
+            msg.update(
+                (column, row[column]) for column in ("timestamp", "tool_call_id", "tool_name", "effect_disposition") if row[column])
+            if row["tool_calls"]:
+                tool_calls = self._record_json(row["tool_calls"])
+                msg["tool_calls"] = tool_calls if isinstance(tool_calls, list) else []
+            if row["platform_message_id"]:
+                msg["message_id"] = row["platform_message_id"]
+            if row["observed"]:
+                msg["observed"] = True
+            if row["role"] == "assistant":
+                msg.update((column, row[column]) for column in ("finish_reason", "reasoning") if row[column])
+                if row["reasoning_content"] is not None:
+                    msg["reasoning_content"] = row["reasoning_content"]
+                for column in ("reasoning_details", "codex_reasoning_items", "codex_message_items"):
+                    if row[column]:
+                        value = self._record_json(row[column])
+                        if value is not None:
+                            msg[column] = value
+            messages.append(msg)
+        return _strip_stale_tool_call_markers(_strip_background_review_harness(messages))
+
+    def latest_message_row_id(self, session_id: str, *, role: str = "user", offset: int = 0,
+                              require_text: bool = True) -> int | None:
+        """Row id of the most recent active *role* message, or ``None`` (oracle parity)."""
+        if not session_id or role not in {"user", "assistant"} or offset < 0:
+            return None
+        text_filter = "AND content IS NOT NULL AND btrim(content) != '' " if require_text else ""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.messages WHERE session_id=%s AND role=%s AND active "
+                f"{text_filter}ORDER BY id DESC LIMIT 1 OFFSET %s",
+                (session_id, role, int(offset)))
+            row = cursor.fetchone()
+            return int(row[0]) if row is not None else None
+
+    def latest_conversation_role(self, session_id: str) -> str | None:
+        """Role of the newest active non-bookkeeping row, or ``None`` (oracle parity)."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT role FROM {self._schema}.messages WHERE session_id=%s AND active "
+                "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1",
+                (session_id,))
+            row = cursor.fetchone()
+            return row[0] if row is not None else None
+
+    def has_gateway_input_owner(self, session_id: str, owner: str) -> bool:
+        """Probe the accepted-input marker without allocating message bodies."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT 1 FROM {self._schema}.messages WHERE session_id=%s AND role='user' "
+                "AND observed=false AND (active OR compacted) "
+                "AND display_metadata->>'gateway_input_owner' = %s LIMIT 1",
+                (session_id, owner))
+            return cursor.fetchone() is not None
+
+    def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
+        """Partial-index probe for the gateway's transient-failure dedupe guard."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT 1 FROM {self._schema}.messages WHERE session_id=%s AND platform_message_id=%s LIMIT 1",
+                (session_id, platform_message_id))
+            return cursor.fetchone() is not None
+
+    def set_message_api_content(self, session_id: str, row_id: int, content: Any, api_content: str) -> int:
+        """Backfill the ``api_content`` sidecar onto ONE known durable user row."""
+        if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+            return 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET api_content=%s WHERE id=%s AND session_id=%s "
+                "AND role='user' AND active AND content IS NOT DISTINCT FROM %s",
+                (api_content, row_id, session_id, self._encode_content(content)))
+            return int(cursor.rowcount)
+
+    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: str) -> int:
+        """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row (0/1 rows)."""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET api_content=%s WHERE id=(SELECT id FROM {self._schema}.messages "
+                "WHERE session_id=%s AND role='user' AND active ORDER BY id DESC LIMIT 1) "
+                "AND content IS NOT DISTINCT FROM %s",
+                (api_content, session_id, self._encode_content(content)))
+            return int(cursor.rowcount)
 
     def try_acquire_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
         with self._connection() as connection, connection.cursor() as cursor:
