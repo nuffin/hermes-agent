@@ -42,6 +42,8 @@ _RUNTIME_SOURCE_PATHS = (
     "gateway/platforms/api_server.py",
     "tools/react_to_message_tool.py",
     "acp_adapter/session.py",
+    "hermes_cli/approvals_suggest.py",
+    "hermes_cli/doctor_state.py",
     "state_store.py",
 )
 _RAW_OPENER_CALLS = frozenset({"SessionDB", "acquire", "connect", "open_db"})

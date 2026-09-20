@@ -32,7 +32,7 @@ class StateStoreMaintenanceOperations:
     _sqlite_capabilities = frozenset({
         "sessions-repair", "sessions-recover", "sessions-import", "sessions-repair-profiles",
         "backup", "backup-quick", "archive-import", "snapshot-list", "snapshot-create", "snapshot-restore",
-        "snapshot-prune", "update-snapshot", "claw-snapshot",
+        "snapshot-prune", "update-snapshot", "claw-snapshot", "approvals-suggest", "doctor",
     })
 
     _postgresql_capabilities = frozenset({"sessions-prune", "sessions-archive", "sessions-clean-markers"})
