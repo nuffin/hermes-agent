@@ -191,6 +191,8 @@ class StateStore(Protocol):
 
     def get_session(self, session_id: str) -> dict[str, Any] | None: ...
 
+    def get_recent_session_model_route(self, session_id: str) -> dict[str, Any] | None: ...
+
     def update_session_cwd(
         self, session_id: str, cwd: str, git_branch: str | None = None,
         git_repo_root: str | None = None, replace_git_meta: bool = False,
