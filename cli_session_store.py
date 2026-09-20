@@ -8,6 +8,9 @@ from typing import Any, Mapping
 from state_store import MessageRecord, open_state_store, resolve_state_store_config
 
 
+_LOCAL_FILTER_CANDIDATE_LIMIT = 1000
+
+
 class PostgreSQLCLISessionCapabilityError(RuntimeError):
     """A CLI path requested a SessionDB feature not yet ported to PostgreSQL."""
 
@@ -209,17 +212,22 @@ class PostgreSQLCLISessionStore:
                 "PostgreSQL CLI session listing does not support these filters")
         if limit < 0 or offset < 0:
             raise ValueError("session list limit and offset must be non-negative")
-        # Fetch a bounded candidate window from the store before applying
-        # SessionDB-only title/id and workspace predicates. The interactive
-        # callers ask for a small page; the larger window prevents an excluded
-        # candidate from consuming it while preserving state-store MRU ordering.
+        search = (search_query or "").strip().lower()
+        # Source/archive/hidden/pinned filters are backend predicates, so they
+        # must be applied before pagination.  Bare /resume has no local filter:
+        # fetch only its requested page and hydrate only those rows.  Title/ID
+        # and workspace filters require post-fetch inspection, which stays
+        # explicitly bounded rather than imposing that scan on every listing.
+        local_filter = bool(search or session_key)
+        candidate_limit = limit + offset
+        if local_filter:
+            candidate_limit = max(candidate_limit, _LOCAL_FILTER_CANDIDATE_LIMIT)
         rows = self._store.list_session_summaries(
             source=source, exclude_sources=tuple(exclude_sources or ()),
-            limit=max(limit + offset, 1000), offset=0,
+            limit=candidate_limit, offset=0,
             include_archived=include_archived, archived_only=archived_only,
             include_hidden=include_hidden, include_pinned=include_pinned,
         )
-        search = (search_query or "").strip().lower()
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
         for summary in rows:
