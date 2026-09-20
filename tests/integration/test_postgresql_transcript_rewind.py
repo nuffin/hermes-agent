@@ -6,6 +6,8 @@ import uuid
 import pytest
 
 from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
+from cli_session_store import PostgreSQLCLISessionStore
+from hermes_state_rewind import rewind_user_turn
 from state_store import MessageRecord, PostgreSQLStateStoreConfig
 from state_store_postgresql import PostgreSQLStateStore
 from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
@@ -75,5 +77,37 @@ def test_rewind_retains_only_composite_handoff_and_refuses_live_leases(monkeypat
         records = store.get_message_records(session_id)
         assert records[-1]["display_kind"] == "hidden"
         assert "\n\nask" not in records[-1]["content"]
+    finally:
+        store.close()
+
+
+def test_facade_rewind_recovers_lost_acknowledgement_from_its_request_receipt(monkeypatch, postgresql_test_target):
+    store = _store(monkeypatch, postgresql_test_target)
+    session_id = f"rewind-facade-{uuid.uuid4()}"
+    try:
+        store.ensure_session(session_id, source="test")
+        store.append_message_record(session_id, MessageRecord(role="user", content="keep"))
+        store.append_message_record(session_id, MessageRecord(role="assistant", content="kept"))
+        store.append_message_record(session_id, MessageRecord(role="user", content="retry"))
+        store.append_message_record(session_id, MessageRecord(role="assistant", content="retired"))
+        facade = PostgreSQLCLISessionStore(store)
+        original = facade.rewind_to_message
+        acknowledged = False
+
+        def lose_first_ack(*args, **kwargs):
+            nonlocal acknowledged
+            result = original(*args, **kwargs)
+            if not acknowledged:
+                acknowledged = True
+                raise ConnectionError("simulated acknowledgement loss")
+            return result
+
+        monkeypatch.setattr(facade, "rewind_to_message", lose_first_ack)
+        outcome = rewind_user_turn(facade, session_id, -1, require_retryable=True)
+        assert outcome.request_id
+        assert outcome.live_text == "retry"
+        assert outcome.rewound_count == 2
+        assert store.get_rewind_receipt(outcome.request_id) is not None
+        assert len(store.get_active_message_ids(session_id)) == 2
     finally:
         store.close()
