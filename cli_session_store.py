@@ -116,6 +116,19 @@ class PostgreSQLCLISessionStore:
     def get_resume_conversations(self, session_id: str):
         return self._store.get_resume_conversations(session_id)
 
+    def get_active_message_ids(self, session_id: str):
+        return self._store.get_active_message_ids(session_id)
+
+    def rewind_to_message(self, session_id: str, target_message_id: int, **kwargs: Any):
+        return self._store.rewind_to_message(session_id, target_message_id, **kwargs)
+
+    def get_rewind_receipt(self, request_id: str):
+        return self._store.get_rewind_receipt(request_id)
+
+    def rewind_user_turn(self, session_id: str, user_ordinal: int, **kwargs: Any):
+        from hermes_state_rewind import rewind_user_turn
+        return rewind_user_turn(self, session_id, user_ordinal, **kwargs)
+
     # Observation and cooldown coordination are durable PostgreSQL operations.
     # Deliberate compression publication remains unavailable through this facade
     # until its parent/child transaction is ported as one contract.
