@@ -1031,7 +1031,7 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"Could not resolve your session history store: {e}")
         return 1
     if selected_store.backend == "postgresql":
-        if action not in {"list", "stats", "export"}:
+        if action not in {"list", "stats", "export", "delete"}:
             print(
                 f"PostgreSQL session history does not support `hermes sessions {action}` yet; "
                 "no SQLite fallback is permitted."
@@ -1044,7 +1044,7 @@ def cmd_sessions(args, sessions_parser=None):
                 return 2
         from cli_session_store import open_cli_session_store
         try:
-            db = open_cli_session_store(config, read_only=True)
+            db = open_cli_session_store(config, read_only=action != "delete")
         except Exception as e:
             print(f"Could not open your PostgreSQL session history: {e}")
             return 1
