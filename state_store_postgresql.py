@@ -2036,6 +2036,45 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     def flush_token_counts(self, timeout: float = 5.0) -> bool:
         return self._token_usage_transport.flush(timeout)
 
+    def read_insights_snapshot(self, *, cutoff: float, source: str | None):
+        """Return canonical analytics rows from this tenant; callers never receive a PG cursor."""
+        from agent.insights import InsightsSnapshot
+        predicate, params = "s.started_at >= %s", [cutoff]
+        if source is not None:
+            predicate += " AND s.source = %s"
+            params.append(source)
+        session_columns = ("s.id, s.source, s.model, s.started_at, s.ended_at, "
+                           "(SELECT COUNT(*) FROM {schema}.messages sm WHERE sm.session_id=s.id) AS message_count, "
+                           "(SELECT COUNT(*) FROM {schema}.messages tm WHERE tm.session_id=s.id AND tm.role='tool') AS tool_call_count, "
+                           "s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens, s.billing_provider, "
+                           "s.billing_base_url, s.billing_mode, s.estimated_cost_usd, s.actual_cost_usd, s.cost_status, "
+                           "s.cost_source, s.api_call_count").format(schema=self._schema)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            def rows(sql: str):
+                cursor.execute(sql, params)
+                return tuple(dict(row) for row in cursor.fetchall())
+            sessions = rows(f"SELECT {session_columns} FROM {self._schema}.sessions s WHERE {predicate} ORDER BY s.started_at DESC")
+            tool_rows = rows(f"SELECT m.session_id, m.tool_name, COUNT(*) AS count FROM {self._schema}.messages m "
+                             f"JOIN {self._schema}.sessions s ON s.id=m.session_id WHERE {predicate} "
+                             "AND m.role='tool' AND m.tool_name IS NOT NULL GROUP BY m.session_id, m.tool_name")
+            assistant_rows = rows(f"SELECT m.session_id, m.tool_calls FROM {self._schema}.messages m "
+                                  f"JOIN {self._schema}.sessions s ON s.id=m.session_id WHERE {predicate} "
+                                  "AND m.role='assistant' AND m.tool_calls IS NOT NULL")
+            skill_rows = rows(f"SELECT m.tool_calls, m.created_at AS timestamp FROM {self._schema}.messages m "
+                              f"JOIN {self._schema}.sessions s ON s.id=m.session_id WHERE {predicate} "
+                              "AND m.role='assistant' AND m.tool_calls IS NOT NULL AND "
+                              "(position('skill_view' in m.tool_calls::text) > 0 OR position('skill_manage' in m.tool_calls::text) > 0)")
+            stats_rows = rows(f"SELECT COUNT(*) AS total_messages, SUM(CASE WHEN m.role='user' THEN 1 ELSE 0 END) AS user_messages, "
+                              "SUM(CASE WHEN m.role='assistant' THEN 1 ELSE 0 END) AS assistant_messages, "
+                              "SUM(CASE WHEN m.role='tool' THEN 1 ELSE 0 END) AS tool_messages "
+                              f"FROM {self._schema}.messages m JOIN {self._schema}.sessions s ON s.id=m.session_id WHERE {predicate}")
+            usage_rows = rows(f"SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url, u.api_call_count, "
+                              "u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens, "
+                              "u.estimated_cost_usd, u.actual_cost_usd, u.cost_status, u.cost_source, u.billing_mode "
+                              f"FROM {self._schema}.session_model_usage u JOIN {self._schema}.sessions s ON s.id=u.session_id WHERE {predicate}")
+        stats = stats_rows[0] if stats_rows else {}
+        return InsightsSnapshot(sessions, tool_rows, assistant_rows, skill_rows, stats, usage_rows)
+
     def _persist_token_usage_delta(self, session_id: str, **kwargs: Any) -> None:
         self.update_token_counts(session_id, **kwargs)
 
@@ -2223,6 +2262,20 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 f"DELETE FROM {self._schema}.system_prompts p WHERE NOT EXISTS "
                 f"(SELECT 1 FROM {self._schema}.sessions s WHERE s.system_prompt_hash = p.hash)"
             )
+
+    def get_recent_session_model_route(self, session_id: str) -> dict[str, Any] | None:
+        """Most recent main-loop billing route, with a portable deterministic tie-break."""
+        if not self.flush_token_counts():
+            raise RuntimeError("token accounting flush did not complete")
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT model, billing_provider, billing_base_url, billing_mode, api_call_count "
+                f"FROM {self._schema}.session_model_usage WHERE session_id=%s AND task='' "
+                "AND model <> 'unknown' AND billing_provider <> '' "
+                "ORDER BY last_seen DESC, first_seen DESC, model DESC, billing_provider DESC, billing_base_url DESC, billing_mode DESC LIMIT 1",
+                (session_id,),
+            )
+            return cursor.fetchone()
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         self.flush_token_counts()
