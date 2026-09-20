@@ -957,8 +957,23 @@ def _cmd_stats(db, args):
     for src in ("cli", "telegram", "discord", "whatsapp", "slack"):
         if (c := db.session_count(source=src)) > 0:
             print(f"  {src}: {c} sessions")
-    if db.db_path.exists():
-        print(f"Database size: {_size_mb(db.db_path):.1f} MB")
+    db_path = vars(db).get("db_path")
+    if db_path is not None and db_path.exists():
+        print(f"Database size: {_size_mb(db_path):.1f} MB")
+
+
+def _postgresql_export_capability_error(args) -> str | None:
+    """Reject controls whose complete export contract remains SQLite-only."""
+    if not getattr(args, "session_id", None):
+        return "PostgreSQL session export requires --session-id; bulk and filter export are not supported"
+    if _any_filter_args(args) or getattr(args, "dry_run", False):
+        return "PostgreSQL session export does not support bulk, filter, or dry-run controls"
+    if getattr(args, "format", "jsonl") == "trace":
+        return "PostgreSQL session export does not support trace export"
+    unsupported = [name for name in ("upload", "public", "no_redact", "delete_after_verified") if getattr(args, name, False)]
+    if unsupported:
+        return "PostgreSQL session export does not support " + ", ".join(f"--{name.replace('_', '-')}" for name in unsupported)
+    return None
 
 
 # -- dispatch -----------------------------------------------------------------
@@ -1008,12 +1023,17 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"Could not resolve your session history store: {e}")
         return 1
     if selected_store.backend == "postgresql":
-        if action != "list":
+        if action not in {"list", "stats", "export"}:
             print(
                 f"PostgreSQL session history does not support `hermes sessions {action}` yet; "
                 "no SQLite fallback is permitted."
             )
             return 2
+        if action == "export":
+            error = _postgresql_export_capability_error(args)
+            if error:
+                print(f"{error}; no SQLite fallback is permitted.")
+                return 2
         from cli_session_store import open_cli_session_store
         try:
             db = open_cli_session_store(config, read_only=True)
