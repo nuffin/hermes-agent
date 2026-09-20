@@ -52,6 +52,29 @@ class SessionPersistenceMixin:
 
         require_legacy_state_db_runtime()
 
+    def _postgresql_route_store(self):
+        """Return the tenant-bound route authority only when PostgreSQL is selected.
+
+        This must be consulted before any legacy SessionDB resolver.  Transcript
+        methods retain their separate fail-closed guards.
+        """
+        from hermes_cli.config import load_config
+        from state_store import open_state_store, resolve_state_store_config
+
+        config = load_config() or {}
+        if resolve_state_store_config(config).backend != "postgresql":
+            return None
+        cached = getattr(self, "_pg_route_store", None)
+        if cached is not None:
+            return cached
+        from gateway.session_route_store import PostgreSQLSessionRouteStore
+        from state_store import postgresql_tenant_schema
+
+        cached = PostgreSQLSessionRouteStore(
+            open_state_store(config), tenant_namespace=postgresql_tenant_schema())
+        self._pg_route_store = cached
+        return cached
+
     def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None):
         """SessionDB for the active profile scope. ``db_path`` pins the store; otherwise
         ``_default_db_path()`` follows the context-local HERMES_HOME (resolved per call so
