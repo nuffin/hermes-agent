@@ -1740,11 +1740,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     def _persist_token_usage_delta(self, session_id: str, **kwargs: Any) -> None:
         self.update_token_counts(session_id, **kwargs)
 
-    def update_token_counts(self, session_id: str, input_tokens: int = 0, output_tokens: int = 0, model: str | None = None, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None, actual_cost_usd: float | None = None, cost_status: str | None = None, cost_source: str | None = None, pricing_version: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, billing_mode: str | None = None, api_call_count: int = 0, absolute: bool = False) -> None:
+    def update_token_counts(self, session_id: str, input_tokens: int = 0, output_tokens: int = 0, model: str | None = None, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: float | None = None, actual_cost_usd: float | None = None, cost_status: str | None = None, cost_source: str | None = None, pricing_version: str | None = None, billing_provider: str | None = None, billing_base_url: str | None = None, billing_mode: str | None = None, api_call_count: int = 0, absolute: bool = False, source: str | None = None) -> None:
         counters = (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)
         has_usage = bool(any(counters) or api_call_count or estimated_cost_usd)
         accounted = bool(has_usage or actual_cost_usd is not None)
-        self.ensure_session(session_id)
+        # The first token delta may arrive before the normal session creator succeeds.
+        # Preserve its real surface instead of leaving a durable unknown placeholder.
+        self.ensure_session(session_id, source=source or "unknown")
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(f"SELECT model, billing_provider, api_call_count FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
             row = cursor.fetchone() or {}
