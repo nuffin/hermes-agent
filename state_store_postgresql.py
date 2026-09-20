@@ -718,22 +718,33 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute("SELECT 1 FROM sessions WHERE id=%s FOR KEY SHARE", (child_session_id,))
             if cursor.fetchone() is None:
                 return False
-            cursor.execute("SELECT 1 FROM session_control_state WHERE session_id=%s FOR UPDATE", (child_session_id,))
-            if cursor.fetchone() is not None:
-                return False
-            cursor.execute("SELECT control_kind, status, payload FROM session_control_state WHERE session_id=%s FOR UPDATE", (parent_session_id,))
-            rows = cursor.fetchall()
-            active = [(kind, status, payload) for kind, status, payload in rows if status not in {"cleared", "done"}]
-            if not active:
-                return False
             cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
             now = float(cursor.fetchone()[0])
-            for kind, status, payload in active:
-                cursor.execute("INSERT INTO session_control_state (session_id, control_kind, status, payload, revision, updated_at) VALUES (%s, %s, %s, %s, 1, %s)", (child_session_id, kind, status, self._psycopg.types.json.Jsonb(payload), now))
-                archived = dict(payload)
-                archived["status"] = "cleared"
-                cursor.execute("UPDATE session_control_state SET status='cleared', payload=%s, revision=revision+1, updated_at=%s WHERE session_id=%s AND control_kind=%s", (self._psycopg.types.json.Jsonb(archived), now, parent_session_id, kind))
-        return True
+            return self._transfer_session_control_states_in_transaction(
+                cursor, parent_session_id, child_session_id, now, require_empty_child=True,
+            )
+
+    def _transfer_session_control_states_in_transaction(
+        self, cursor: Any, parent_session_id: str, child_session_id: str, now: float, *, require_empty_child: bool,
+    ) -> bool:
+        """Move active controls while the caller owns the parent/child publication transaction."""
+        cursor.execute("SELECT 1 FROM session_control_state WHERE session_id=%s FOR UPDATE", (child_session_id,))
+        if require_empty_child and cursor.fetchone() is not None:
+            raise RuntimeError("compression child unexpectedly already has session controls")
+        cursor.execute("SELECT control_kind, status, payload FROM session_control_state WHERE session_id=%s FOR UPDATE", (parent_session_id,))
+        rows = cursor.fetchall()
+        normalized_rows = [
+            (row["control_kind"], row["status"], row["payload"])
+            if isinstance(row, Mapping) else (row[0], row[1], row[2])
+            for row in rows
+        ]
+        active = [(kind, status, payload) for kind, status, payload in normalized_rows if status not in {"cleared", "done"}]
+        for kind, status, payload in active:
+            cursor.execute("INSERT INTO session_control_state (session_id, control_kind, status, payload, revision, updated_at) VALUES (%s, %s, %s, %s, 1, %s)", (child_session_id, kind, status, self._psycopg.types.json.Jsonb(payload), now))
+            archived = dict(payload)
+            archived["status"] = "cleared"
+            cursor.execute("UPDATE session_control_state SET status='cleared', payload=%s, revision=revision+1, updated_at=%s WHERE session_id=%s AND control_kind=%s", (self._psycopg.types.json.Jsonb(archived), now, parent_session_id, kind))
+        return bool(active)
 
     @staticmethod
     def _runtime_namespace(namespace: str | None) -> str:
@@ -1319,6 +1330,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             if watermark is not None:
                 upper = int(watermark_ceiling) if watermark_ceiling is not None else 9223372036854775807
                 cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_COLUMNS)}) SELECT %s, role, content, created_at, {', '.join(_MESSAGE_RECORD_COLUMNS)} FROM {self._schema}.messages WHERE session_id=%s AND active AND id > %s AND id <= %s ORDER BY id", (child_session_id, parent_session_id, int(watermark), upper))
+            # The child is being published here, so control state must cross the
+            # lineage boundary in this same transaction.  Moving it afterwards
+            # could leave a durable child without its active /goal,/heartbeat or
+            # /loop controls if the process dies between commits.
+            self._transfer_session_control_states_in_transaction(
+                cursor, parent_session_id, child_session_id, now, require_empty_child=True,
+            )
             cursor.execute(f"INSERT INTO {self._schema}.compression_rotation_receipts (request_id, parent_session_id, child_session_id, holder, fence, committed_at) VALUES (%s, %s, %s, %s, %s, %s)", (receipt_id, parent_session_id, child_session_id, compression_lock_holder or "unleased", fence, now))
         return child_session_id
 
