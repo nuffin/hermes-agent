@@ -55,6 +55,7 @@ _COMPRESSION_ROTATION_SCHEMA_VERSION = 20
 _SESSION_CONTROL_STATE_SCHEMA_VERSION = 21
 _TRANSCRIPT_REWIND_SCHEMA_VERSION = 22
 _FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION = 23
+_GATEWAY_SESSION_ROUTE_SCHEMA_VERSION = 24
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -171,7 +172,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _GATEWAY_SESSION_ROUTE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -198,6 +199,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_SESSION_CONTROL_STATE_SCHEMA_VERSION, self._apply_v21, self._validate_v21),
                     (_TRANSCRIPT_REWIND_SCHEMA_VERSION, self._apply_v22, self._validate_v22),
                     (_FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION, self._apply_v23, self._validate_v23),
+                    (_GATEWAY_SESSION_ROUTE_SCHEMA_VERSION, self._apply_v24, self._validate_v24),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -696,6 +698,76 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._required_columns(cursor, "foreign_import_receipts", {"origin_fingerprint", "session_id", "origin_json", "committed_at"})
         self._require_index(cursor, "foreign_import_receipts_session_unique")
         self._require_foreign_key(cursor, "foreign_import_receipts_session_id_fkey", "foreign_import_receipts", "sessions")
+
+    def _apply_v24(self, cursor: Any) -> None:
+        """Route authority only; gateway transcripts and delivery remain unported."""
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.gateway_session_routes ("
+            "tenant_namespace text NOT NULL, session_key text NOT NULL, session_id text NOT NULL "
+            f"REFERENCES {self._schema}.sessions(id), generation bigint NOT NULL DEFAULT 1 CHECK (generation > 0), "
+            "flags jsonb NOT NULL DEFAULT '{}'::jsonb, metadata jsonb NOT NULL DEFAULT '{}'::jsonb, "
+            "created_at double precision NOT NULL, updated_at double precision NOT NULL, "
+            "PRIMARY KEY (tenant_namespace, session_key))"
+        )
+        cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS gateway_session_routes_session_unique ON {self._schema}.gateway_session_routes (tenant_namespace, session_id)")
+
+    def _validate_v24(self, cursor: Any) -> None:
+        self._validate_v23(cursor)
+        self._required_columns(cursor, "gateway_session_routes", {"tenant_namespace", "session_key", "session_id", "generation", "flags", "metadata", "created_at", "updated_at"})
+        self._require_index(cursor, "gateway_session_routes_session_unique")
+        self._require_foreign_key(cursor, "gateway_session_routes_session_id_fkey", "gateway_session_routes", "sessions")
+
+    @staticmethod
+    def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _gateway_route_row(self, cursor: Any) -> dict[str, Any] | None:
+        row = cursor.fetchone()
+        return None if row is None else dict(row)
+
+    def get_or_create_gateway_session_route(self, tenant_namespace: str, session_key: str, session_id: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        if not tenant_namespace or not session_key or not session_id:
+            raise ValueError("gateway route requires tenant namespace, session key, and session id")
+        session_metadata = {key: value for key, value in dict(metadata).items() if key in _SESSION_METADATA_COLUMNS}
+        self.ensure_session(session_id, source=str(metadata.get("source") or "gateway"), metadata=session_metadata)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
+            clock_row = cursor.fetchone()
+            now = float(clock_row["extract"] if isinstance(clock_row, Mapping) else clock_row[0])
+            cursor.execute(
+                "INSERT INTO gateway_session_routes (tenant_namespace, session_key, session_id, flags, metadata, created_at, updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (tenant_namespace, session_key) DO UPDATE SET updated_at=gateway_session_routes.updated_at "
+                "RETURNING tenant_namespace,session_key,session_id,generation,flags,metadata,created_at,updated_at",
+                (tenant_namespace, session_key, session_id, self._psycopg.types.json.Jsonb({}), self._psycopg.types.json.Jsonb(self._route_payload(metadata)), now, now),
+            )
+            return dict(cursor.fetchone())
+
+    def get_gateway_session_route_by_key(self, tenant_namespace: str, session_key: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute("SELECT tenant_namespace,session_key,session_id,generation,flags,metadata,created_at,updated_at FROM gateway_session_routes WHERE tenant_namespace=%s AND session_key=%s", (tenant_namespace, session_key))
+            return self._gateway_route_row(cursor)
+
+    def get_gateway_session_route_by_session_id(self, tenant_namespace: str, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute("SELECT tenant_namespace,session_key,session_id,generation,flags,metadata,created_at,updated_at FROM gateway_session_routes WHERE tenant_namespace=%s AND session_id=%s", (tenant_namespace, session_id))
+            return self._gateway_route_row(cursor)
+
+    def switch_gateway_session_route(self, tenant_namespace: str, session_key: str, session_id: str, expected_session_id: str, expected_generation: int, metadata: Mapping[str, Any], flags: Mapping[str, Any]) -> dict[str, Any] | None:
+        session_metadata = {key: value for key, value in dict(metadata).items() if key in _SESSION_METADATA_COLUMNS}
+        self.ensure_session(session_id, source=str(metadata.get("source") or "gateway"), metadata=session_metadata)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())")
+            clock_row = cursor.fetchone()
+            now = float(clock_row["extract"] if isinstance(clock_row, Mapping) else clock_row[0])
+            cursor.execute("UPDATE gateway_session_routes SET session_id=%s,generation=generation+1,flags=%s,metadata=%s,updated_at=%s WHERE tenant_namespace=%s AND session_key=%s AND session_id=%s AND generation=%s RETURNING tenant_namespace,session_key,session_id,generation,flags,metadata,created_at,updated_at", (session_id, self._psycopg.types.json.Jsonb(self._route_payload(flags)), self._psycopg.types.json.Jsonb(self._route_payload(metadata)), now, tenant_namespace, session_key, expected_session_id, expected_generation))
+            return self._gateway_route_row(cursor)
+
+    def delete_or_repair_gateway_session_route(self, tenant_namespace: str, session_key: str, expected_session_id: str, expected_generation: int, replacement_session_id: str | None, metadata: Mapping[str, Any]) -> dict[str, Any] | bool | None:
+        if replacement_session_id:
+            return self.switch_gateway_session_route(tenant_namespace, session_key, replacement_session_id, expected_session_id, expected_generation, metadata, {})
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("DELETE FROM gateway_session_routes WHERE tenant_namespace=%s AND session_key=%s AND session_id=%s AND generation=%s", (tenant_namespace, session_key, expected_session_id, expected_generation))
+            return cursor.rowcount == 1
 
     @staticmethod
     def _control_kind(control_kind: str) -> str:
