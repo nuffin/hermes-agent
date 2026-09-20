@@ -333,20 +333,111 @@ class PostgreSQLCLISessionStore:
                 allowed = {row[0] for row in cursor.fetchall()}
             rows = [row for row in rows if row["id"] in allowed]
         return rows[offset:offset + limit]
+    def _delegate_delete_ids(self, cursor: Any, session_id: str) -> list[str]:
+        """Return recursively tagged delegate descendants, excluding *session_id*.
+
+        The recursive CTE uses ``UNION`` deliberately: malformed delegation cycles
+        terminate, and the root can never become its own descendant.  Untagged
+        branch/compression children remain outside this list and are orphaned.
+        """
+        schema = self._store._schema
+        cursor.execute(
+            f"WITH RECURSIVE delegates(id) AS ("
+            f"SELECT id FROM {schema}.sessions WHERE id=%s "
+            "UNION "
+            f"SELECT child.id FROM {schema}.sessions child "
+            "JOIN delegates parent ON ("
+            "child.model_config ->> '_delegate_from' = parent.id "
+            "OR (child.parent_session_id = parent.id "
+            "AND child.model_config ? '_delegate_from'))"
+            ") SELECT id FROM delegates WHERE id <> %s ORDER BY id",
+            (session_id, session_id),
+        )
+        return [str(row[0]) for row in cursor.fetchall()]
+
+    def get_session_delete_targets(self, session_id: str) -> list[str]:
+        """Rows an explicit delete would remove, matching SessionDB semantics."""
+        with self._store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id FROM {self._store._schema}.sessions WHERE id=%s",
+                (session_id,),
+            )
+            if cursor.fetchone() is None:
+                return []
+            return [session_id, *self._delegate_delete_ids(cursor, session_id)]
+
+    def _delete_session_ids(self, cursor: Any, root_ids: list[str]) -> list[str]:
+        """Delete existing roots and their delegates in the caller's transaction."""
+        schema = self._store._schema
+        cursor.execute(
+            f"SELECT id FROM {schema}.sessions WHERE id = ANY(%s) FOR UPDATE",
+            (root_ids,),
+        )
+        existing_roots = [str(row[0]) for row in cursor.fetchall()]
+        if not existing_roots:
+            return []
+        doomed = set(existing_roots)
+        for root_id in existing_roots:
+            doomed.update(self._delegate_delete_ids(cursor, root_id))
+        doomed_ids = sorted(doomed)
+        # Lock the entire doomed set before changing dependencies. A concurrent
+        # child insertion needs a conflicting FK lock on its parent.
+        cursor.execute(f"SELECT id FROM {schema}.sessions WHERE id = ANY(%s) FOR UPDATE", (doomed_ids,))
+        cursor.execute(
+            f"DELETE FROM {schema}.compression_rotation_receipts "
+            "WHERE parent_session_id = ANY(%s) OR child_session_id = ANY(%s)",
+            (doomed_ids, doomed_ids),
+        )
+        cursor.execute(f"DELETE FROM {schema}.messages WHERE session_id = ANY(%s)", (doomed_ids,))
+        cursor.execute(
+            f"UPDATE {schema}.sessions SET parent_session_id=NULL "
+            "WHERE parent_session_id = ANY(%s) AND NOT (id = ANY(%s))",
+            (doomed_ids, doomed_ids),
+        )
+        cursor.execute(f"DELETE FROM {schema}.sessions WHERE id = ANY(%s)", (doomed_ids,))
+        cursor.execute(
+            f"DELETE FROM {schema}.system_prompts prompt WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {schema}.sessions session "
+            "WHERE session.system_prompt_hash = prompt.hash)"
+        )
+        return existing_roots
+
     def delete_session_if_empty(self, session_id: str, **kwargs: Any) -> bool:
         if kwargs:
             raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI deletion does not manage session files")
         with self._store._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(f"DELETE FROM {self._store._schema}.sessions s WHERE s.id=%s AND s.title IS NULL AND NOT EXISTS (SELECT 1 FROM {self._store._schema}.messages m WHERE m.session_id=s.id) AND NOT EXISTS (SELECT 1 FROM {self._store._schema}.sessions c WHERE c.parent_session_id=s.id)", (session_id,))
-            return cursor.rowcount > 0
+            cursor.execute(
+                f"SELECT id FROM {self._store._schema}.sessions session WHERE id=%s "
+                "AND title IS NULL AND NOT EXISTS (SELECT 1 FROM "
+                f"{self._store._schema}.messages message WHERE message.session_id=session.id) "
+                "AND NOT EXISTS (SELECT 1 FROM "
+                f"{self._store._schema}.sessions child WHERE child.parent_session_id=session.id) FOR UPDATE",
+                (session_id,),
+            )
+            if cursor.fetchone() is None:
+                return False
+            return bool(self._delete_session_ids(cursor, [session_id]))
+
     def delete_session(self, session_id: str, **kwargs: Any) -> bool:
-        if set(kwargs) - {"sessions_dir"}:
+        unsupported = set(kwargs) - {"sessions_dir", "expected_delete_ids"}
+        if unsupported:
             raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI deletion does not support these controls")
+        expected = kwargs.get("expected_delete_ids")
+        if expected is not None and not isinstance(expected, list):
+            raise PostgreSQLCLISessionCapabilityError("expected_delete_ids must be a list")
+        # PostgreSQL owns all durable session data; sessions_dir is a strict
+        # compatibility no-op and no filesystem data is removed in this mode.
         with self._store._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(f"DELETE FROM {self._store._schema}.messages WHERE session_id=%s", (session_id,))
-            cursor.execute(f"UPDATE {self._store._schema}.sessions SET parent_session_id=NULL WHERE parent_session_id=%s", (session_id,))
-            cursor.execute(f"DELETE FROM {self._store._schema}.sessions WHERE id=%s", (session_id,))
-            return cursor.rowcount > 0
+            cursor.execute(
+                f"SELECT id FROM {self._store._schema}.sessions WHERE id=%s FOR UPDATE",
+                (session_id,),
+            )
+            if cursor.fetchone() is None:
+                return False
+            current = {session_id, *self._delegate_delete_ids(cursor, session_id)}
+            if expected is not None and current != set(expected):
+                return False
+            return bool(self._delete_session_ids(cursor, [session_id]))
     def close(self): self._store.close()
 
     def __getattr__(self, name: str):

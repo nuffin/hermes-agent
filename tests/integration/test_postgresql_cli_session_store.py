@@ -272,14 +272,132 @@ def test_postgresql_cli_export_rejects_unsupported_controls_before_sqlite(pg_cli
     assert not (home / "state.db").exists()
 
 
-def test_cli_delete_contract_removes_postgresql_session_without_sqlite(pg_cli_home):
+def test_postgresql_delete_matches_sqlite_delegate_contract_and_keeps_generation(pg_cli_home):
+    """Real PG delete cascades only delegate rows, inside one transaction."""
+    home, stores = pg_cli_home
+    root, delegate, nested, branch = "delete-root", "delete-delegate", "delete-nested", "delete-branch"
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session(root, "cli", system_prompt="exclusive root prompt")
+        store.create_session(delegate, "cli", model_config={"_delegate_from": root}, system_prompt="delegate prompt")
+        store.create_session(nested, "cli", parent_session_id=delegate, model_config={"_delegate_from": delegate})
+        store.create_session(branch, "cli", parent_session_id=root, system_prompt="shared branch prompt")
+        for session_id in (root, delegate, nested, branch):
+            store.append_message(session_id, "user", f"message {session_id}")
+        root_hash = store.get_session(root)["system_prompt_hash"]
+        branch_hash = store.get_session(branch)["system_prompt_hash"]
+        assert root_hash and branch_hash and root_hash != branch_hash
+        with store._store._connection() as connection, connection.cursor() as cursor:
+            schema = store._store._schema
+            cursor.execute(
+                f"INSERT INTO {schema}.session_model_usage (session_id, model) VALUES (%s, %s)",
+                (delegate, "delete-test-model"),
+            )
+            cursor.execute(
+                f"INSERT INTO {schema}.compression_rotation_receipts "
+                "(request_id, parent_session_id, child_session_id, holder, fence, committed_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                ("delete-receipt", root, delegate, "delete-test", 1, 1.0),
+            )
+            cursor.execute(
+                f"INSERT INTO {schema}.conversation_generations (source, session_key, generation) "
+                "VALUES (%s, %s, %s)",
+                ("cli", root, 9),
+            )
+        assert store.get_session_delete_targets(root) == [root, delegate, nested]
+        assert not store.delete_session(root, expected_delete_ids=[root, delegate])
+        assert store.get_session(root) is not None
+        assert store.delete_session(root, sessions_dir=home / "sessions", expected_delete_ids=[root, delegate, nested])
+        assert all(store.get_session(session_id) is None for session_id in (root, delegate, nested))
+        assert store.get_session(branch)["parent_session_id"] is None
+        assert [row["content"] for row in store._store.get_message_records(branch)] == [f"message {branch}"]
+        with store._store._connection() as connection, connection.cursor() as cursor:
+            schema = store._store._schema
+            cursor.execute(f"SELECT COUNT(*) FROM {schema}.session_model_usage WHERE session_id=%s", (delegate,))
+            assert cursor.fetchone()[0] == 0
+            cursor.execute(f"SELECT COUNT(*) FROM {schema}.compression_rotation_receipts WHERE request_id=%s", ("delete-receipt",))
+            assert cursor.fetchone()[0] == 0
+            cursor.execute(f"SELECT COUNT(*) FROM {schema}.system_prompts WHERE hash=%s", (root_hash,))
+            assert cursor.fetchone()[0] == 0
+            cursor.execute(f"SELECT COUNT(*) FROM {schema}.system_prompts WHERE hash=%s", (branch_hash,))
+            assert cursor.fetchone()[0] == 1
+            cursor.execute(f"SELECT generation FROM {schema}.conversation_generations WHERE source=%s AND session_key=%s", ("cli", root))
+            assert cursor.fetchone()[0] == 9
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_postgresql_delete_observationally_matches_sqlite_oracle(pg_cli_home, tmp_path):
+    """The selected PG store has the same single-session delete observations as SQLite."""
+    from hermes_state import SessionDB
+
+    _home, stores = pg_cli_home
+    pg = _open(stores)
+    oracle_home = tmp_path / ".hermes-sqlite-delete-oracle"
+    oracle_home.mkdir()
+    token = set_hermes_home_override(str(oracle_home))
+    try:
+        sqlite = SessionDB(db_path=tmp_path / "sqlite-delete-oracle.db")
+    finally:
+        reset_hermes_home_override(token)
+    root, delegate, branch = "oracle-root", "oracle-delegate", "oracle-branch"
+    try:
+        for store in (sqlite, pg):
+            store.create_session(root, "cli")
+            store.create_session(delegate, "cli", model_config={"_delegate_from": root})
+            store.create_session(branch, "cli", parent_session_id=root)
+            for session_id in (root, delegate, branch):
+                store.append_message(session_id, "user", f"message {session_id}")
+        assert pg.get_session_delete_targets(root) == sqlite.get_session_delete_targets(root)
+        targets = sqlite.get_session_delete_targets(root)
+        assert sqlite.delete_session(root, expected_delete_ids=targets)
+        assert pg.delete_session(root, expected_delete_ids=targets)
+        for store in (sqlite, pg):
+            assert store.get_session(root) is None
+            assert store.get_session(delegate) is None
+            branch_session = store.get_session(branch)
+            assert branch_session is not None and branch_session["parent_session_id"] is None
+            assert [row["content"] for row in store.get_messages(branch)] == [f"message {branch}"]
+    finally:
+        sqlite.close()
+
+
+def test_postgresql_delete_rolls_back_on_dependent_cleanup_failure(pg_cli_home):
+    """A failed final cleanup restores messages and the session atomically."""
+    _home, stores = pg_cli_home
+    session_id = "delete-rollback"
+    store = _open(stores)
+    store.create_session(session_id, "cli", system_prompt="rollback prompt")
+    store.append_message(session_id, "user", "must survive rollback")
+    with store._store._connection() as connection, connection.cursor() as cursor:
+        schema = store._store._schema
+        cursor.execute(f"CREATE FUNCTION {schema}.fail_delete_prompt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced cleanup failure'; END; $$")
+        cursor.execute(f"CREATE TRIGGER fail_delete_prompt BEFORE DELETE ON {schema}.system_prompts FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_delete_prompt()")
+    with pytest.raises(Exception, match="forced cleanup failure"):
+        store.delete_session(session_id)
+    assert store.get_session(session_id) is not None
+    assert [row["content"] for row in store._store.get_message_records(session_id)] == ["must survive rollback"]
+
+
+def test_cli_delete_contract_removes_postgresql_session_without_sqlite(pg_cli_home, monkeypatch, capsys):
+    from hermes_cli.sessions_cmd import cmd_sessions
+
     home, stores = pg_cli_home
     with trap_state_db_opens(home) as opens:
         store = _open(stores)
         store.create_session("delete-pg-cli", "cli")
         store.append_messages_batch("delete-pg-cli", [{"role": "user", "content": "remove me"}])
-        assert store.delete_session("delete-pg-cli", sessions_dir=home / "sessions")
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
+        assert cmd_sessions(SimpleNamespace(sessions_action="delete", session_id="delete-pg-cli", yes=True)) is None
+        assert "Deleted session 'delete-pg-cli'." in capsys.readouterr().out
         assert store.get_session("delete-pg-cli") is None
+        assert cmd_sessions(SimpleNamespace(sessions_action="delete", session_id="missing-pg-cli", yes=True)) == 1
+        assert "No session 'missing-pg-cli'." in capsys.readouterr().out
+        store.create_session("cancel-pg-cli", "cli")
+        monkeypatch.setattr("hermes_cli.sessions_cmd._confirm_prompt", lambda _prompt: False)
+        assert cmd_sessions(SimpleNamespace(sessions_action="delete", session_id="cancel-pg-cli", yes=False)) is None
+        assert store.get_session("cancel-pg-cli") is not None
+        assert "Cancelled." in capsys.readouterr().out
     assert opens == []
     assert not (home / "state.db").exists()
 
