@@ -52,6 +52,7 @@ _SESSION_RUNTIME_OWNERSHIP_SCHEMA_VERSION = 18
 _COMPRESSION_COORDINATION_SCHEMA_VERSION = 19
 _COMPRESSION_ROTATION_SCHEMA_VERSION = 20
 _SESSION_CONTROL_STATE_SCHEMA_VERSION = 21
+_TRANSCRIPT_REWIND_SCHEMA_VERSION = 22
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -168,7 +169,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SESSION_CONTROL_STATE_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _TRANSCRIPT_REWIND_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -193,6 +194,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_COMPRESSION_COORDINATION_SCHEMA_VERSION, self._apply_v19, self._validate_v19),
                     (_COMPRESSION_ROTATION_SCHEMA_VERSION, self._apply_v20, self._validate_v20),
                     (_SESSION_CONTROL_STATE_SCHEMA_VERSION, self._apply_v21, self._validate_v21),
+                    (_TRANSCRIPT_REWIND_SCHEMA_VERSION, self._apply_v22, self._validate_v22),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -655,6 +657,27 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         })
         self._require_index(cursor, "session_control_state_kind_status")
         self._require_foreign_key(cursor, "session_control_state_session_id_fkey", "session_control_state", "sessions")
+
+    def _apply_v22(self, cursor: Any) -> None:
+        """Receipt-backed transcript rewind; all consumer-visible effects wait for this commit."""
+        cursor.execute(f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS rewind_count bigint NOT NULL DEFAULT 0")
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.rewind_receipts ("
+            "request_id text PRIMARY KEY, session_id text NOT NULL "
+            f"REFERENCES {self._schema}.sessions(id), conversation_root_id text NOT NULL, target_message_id bigint NOT NULL, "
+            "turn_holder text, turn_fence bigint, compression_holder text, compression_fence bigint, "
+            "replacement_message_id bigint, retired_count bigint NOT NULL, active_prefix_ids jsonb NOT NULL, committed_at double precision NOT NULL)"
+        )
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS messages_active_target ON {self._schema}.messages (session_id, id) WHERE active")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS rewind_receipts_session_committed ON {self._schema}.rewind_receipts (session_id, committed_at)")
+
+    def _validate_v22(self, cursor: Any) -> None:
+        self._validate_v21(cursor)
+        self._required_columns(cursor, "sessions", {"rewind_count"})
+        self._required_columns(cursor, "rewind_receipts", {"request_id", "session_id", "conversation_root_id", "target_message_id", "turn_holder", "turn_fence", "compression_holder", "compression_fence", "replacement_message_id", "retired_count", "active_prefix_ids", "committed_at"})
+        self._require_index(cursor, "messages_active_target")
+        self._require_index(cursor, "rewind_receipts_session_committed")
+        self._require_foreign_key(cursor, "rewind_receipts_session_id_fkey", "rewind_receipts", "sessions")
 
     @staticmethod
     def _control_kind(control_kind: str) -> str:
@@ -1238,7 +1261,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     @property
     def capabilities(self) -> tuple[str, ...]:
         """Explicitly advertised durable capabilities; never infer from methods."""
-        return ("atomic-compression-rotation-v1",)
+        return ("atomic-compression-rotation-v1", "transcript-rewind-v1")
 
     def get_compression_publication_receipt(self, request_id: str) -> dict[str, Any] | None:
         """Return the committed publication for one caller-owned request id.
@@ -1484,14 +1507,15 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         while current:
             cursor.execute(f"SELECT parent_session_id, end_reason, model_config FROM {self._schema}.sessions WHERE id=%s", (current,))
             row = cursor.fetchone()
-            if row is None or row[0] is None:
+            if row is None or (row["parent_session_id"] if isinstance(row, Mapping) else row[0]) is None:
                 return current
-            parent_id, _reason, config = str(row[0]), row[1], row[2]
+            parent_id = str(row["parent_session_id"] if isinstance(row, Mapping) else row[0])
+            config = row["model_config"] if isinstance(row, Mapping) else row[2]
             if parent_id in seen:
                 return current
             cursor.execute(f"SELECT end_reason FROM {self._schema}.sessions WHERE id=%s", (parent_id,))
             parent = cursor.fetchone()
-            if parent is None or parent[0] != "compression" or self._is_explicit_branch({"model_config": config}):
+            if parent is None or (parent["end_reason"] if isinstance(parent, Mapping) else parent[0]) != "compression" or self._is_explicit_branch({"model_config": config}):
                 return current
             seen.add(parent_id)
             current = parent_id
@@ -1558,6 +1582,92 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             except json.JSONDecodeError:
                 return content
         return content
+
+    def get_active_message_ids(self, session_id: str) -> list[int]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT id FROM {self._schema}.messages WHERE session_id=%s AND active ORDER BY id", (session_id,))
+            return [int(row[0]) for row in cursor.fetchall()]
+
+    def get_rewind_receipt(self, request_id: str) -> dict[str, Any] | None:
+        if not request_id:
+            raise ValueError("rewind receipt requires a request id")
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT * FROM {self._schema}.rewind_receipts WHERE request_id=%s", (request_id,))
+            row = cursor.fetchone()
+        return None if row is None else dict(row)
+
+    def rewind_to_message(self, session_id: str, target_message_id: int, *, preserve_compaction_handoff: bool = False,
+                          expected_active_ids: Collection[int] | None = None, expected_target_content: Any = None,
+                          request_id: str | None = None) -> dict[str, Any]:
+        """Commit one fenced, receipt-backed soft rewind or return its prior receipt.
+
+        Every refusal precedes mutation. A caller that loses the acknowledgement retries
+        only with the same ``request_id`` and adopts this durable receipt; it must not
+        replay a request whose receipt is absent.
+        """
+        from uuid import uuid4
+        from agent.context_compressor import split_user_originated_turn
+        from agent.memory_manager import sanitize_context
+        request_id = request_id or uuid4().hex
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            now = self._coordination_clock_and_lock(cursor, "transcript-rewind", session_id)
+            cursor.execute(f"SELECT * FROM {self._schema}.rewind_receipts WHERE request_id=%s FOR UPDATE", (request_id,))
+            prior = cursor.fetchone()
+            if prior is not None:
+                if prior["session_id"] != session_id or int(prior["target_message_id"]) != target_message_id:
+                    raise ValueError("rewind request id is already bound to another mutation")
+                return {"request_id": request_id, "rewound_count": int(prior["retired_count"]),
+                        "new_head_id": prior["replacement_message_id"], "replacement_message_id": prior["replacement_message_id"],
+                        "active_prefix_ids": list(prior["active_prefix_ids"])}
+            cursor.execute(f"SELECT id, ended_at FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            session = cursor.fetchone()
+            if session is None or session["ended_at"] is not None:
+                raise ValueError("rewind session is missing or no longer active")
+            root = self._compression_turn_lease_key_on_cursor(cursor, session_id)
+            cursor.execute(f"SELECT holder, fence FROM {self._schema}.session_turn_leases WHERE conversation_id=%s AND expires_at>%s FOR UPDATE", (root, now))
+            turn_lease = cursor.fetchone()
+            if turn_lease is not None:
+                raise RuntimeError("session has an active turn lease; refusing transcript mutation")
+            cursor.execute(f"SELECT holder, fence FROM {self._schema}.compression_locks WHERE session_id=%s AND expires_at>%s FOR UPDATE", (session_id, now))
+            compression_lease = cursor.fetchone()
+            if compression_lease is not None:
+                raise RuntimeError("session is being compressed by another writer")
+            cursor.execute(f"SELECT * FROM {self._schema}.messages WHERE session_id=%s AND active ORDER BY id FOR UPDATE", (session_id,))
+            rows = list(cursor.fetchall())
+            active_ids = [int(row["id"]) for row in rows]
+            if expected_active_ids is not None and active_ids != [int(item) for item in expected_active_ids]:
+                raise RuntimeError("active transcript changed before the rewind could be persisted")
+            target = next((row for row in rows if int(row["id"]) == target_message_id), None)
+            if target is None or target["role"] != "user":
+                raise ValueError("rewind target is not an active user message")
+            content = self._decode_content(target["content"])
+            handoff, live = split_user_originated_turn({"role": "user", "content": content, "display_kind": target["display_kind"], "display_metadata": target["display_metadata"]})
+            if live is None:
+                raise ValueError("rewind target is not a user-originated turn")
+            actual = sanitize_context(live["content"]).strip() if isinstance(live.get("content"), str) else live.get("content")
+            if expected_target_content is not None and actual != expected_target_content:
+                raise RuntimeError("rewind target changed before it could be persisted")
+            if preserve_compaction_handoff and handoff is None:
+                raise ValueError("preserve_compaction_handoff requires an active composite carrier")
+            replacement_id = None
+            if preserve_compaction_handoff:
+                if handoff is None:  # guarded above; keeps the transactional path type-safe.
+                    raise ValueError("preserve_compaction_handoff requires an active composite carrier")
+                record = MessageRecord(**{name: handoff[name] for name in MessageRecord.__dataclass_fields__ if name in handoff})
+                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id", self._record_params(session_id, record))
+                inserted = cursor.fetchone()
+                replacement_id = int(inserted["id"] if isinstance(inserted, Mapping) else inserted[0])
+            if replacement_id is None:
+                cursor.execute(f"UPDATE {self._schema}.messages SET active=false WHERE session_id=%s AND active AND id >= %s", (session_id, target_message_id))
+            else:
+                cursor.execute(f"UPDATE {self._schema}.messages SET active=false WHERE session_id=%s AND active AND id >= %s AND id <> %s", (session_id, target_message_id, replacement_id))
+            retired = sum(1 for row in rows if int(row["id"]) >= target_message_id)
+            prefix_ids = [row_id for row_id in active_ids if row_id < target_message_id]
+            if replacement_id is not None:
+                prefix_ids.append(replacement_id)
+            cursor.execute(f"UPDATE {self._schema}.sessions SET rewind_count=rewind_count+1, last_activity_at=GREATEST(COALESCE(last_activity_at, started_at), %s) WHERE id=%s", (now, session_id))
+            cursor.execute(f"INSERT INTO {self._schema}.rewind_receipts (request_id, session_id, conversation_root_id, target_message_id, turn_holder, turn_fence, compression_holder, compression_fence, replacement_message_id, retired_count, active_prefix_ids, committed_at) VALUES (%s, %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s, %s, %s)", (request_id, session_id, root, target_message_id, replacement_id, retired, self._psycopg.types.json.Jsonb(prefix_ids), now))
+            return {"request_id": request_id, "rewound_count": retired, "target_message": dict(target), "new_head_id": replacement_id, "replacement_message_id": replacement_id, "active_prefix_ids": prefix_ids}
 
     def get_message_records(self, session_id: str) -> list[dict[str, Any]]:
         columns = (
