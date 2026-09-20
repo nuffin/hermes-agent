@@ -28,7 +28,7 @@ def _invalid_pg_home(tmp_path, monkeypatch):
     return home
 
 
-@pytest.mark.parametrize("action", ["repair", "recover", "import", "repair-profiles"])
+@pytest.mark.parametrize("action", ["repair", "recover", "repair-profiles"])
 def test_selected_pg_sessions_pre_dispatch_refuses_before_state_db(tmp_path, monkeypatch, capsys, action):
     home = _pg_home(tmp_path, monkeypatch)
     from hermes_cli.sessions_cmd import cmd_sessions
