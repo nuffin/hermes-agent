@@ -176,6 +176,8 @@ class PostgreSQLCLISessionStore:
     def branch_session(self, **kwargs: Any): return self._store.branch_session(**kwargs)
 
     def get_session(self, session_id: str): return self._store.get_session(session_id)
+    def get_recent_session_model_route(self, session_id: str): return self._store.get_recent_session_model_route(session_id)
+    def read_insights_snapshot(self, *, cutoff: float, source: str | None): return self._store.read_insights_snapshot(cutoff=cutoff, source=source)
     def resolve_session_id(self, session_id_or_prefix: str) -> str | None:
         """Resolve an exact ID or one unambiguous PostgreSQL-local prefix."""
         exact = self._store.get_session(session_id_or_prefix)
@@ -488,3 +490,16 @@ def open_cli_session_store(config: Mapping[str, Any], *, read_only: bool = False
         from hermes_state_registry import acquire
         return acquire()
     return PostgreSQLCLISessionStore(open_state_store(config))
+
+
+def open_selected_read_store(config: Mapping[str, Any]) -> Any | None:
+    """Open the configured read store, preserving SQLite's empty-install behavior.
+
+    PostgreSQL selection never consults ``state.db``; failures propagate to the command surface.
+    """
+    resolved = resolve_state_store_config(config)
+    if resolved.backend == "sqlite":
+        from hermes_state import _default_db_path
+        if not _default_db_path().exists():
+            return None
+    return open_cli_session_store(config, read_only=True)
