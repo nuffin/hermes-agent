@@ -251,13 +251,17 @@ def import_foreign_session(source: str, path, db=None) -> str:
         from hermes_state_registry import acquire
         db = acquire()  # the CLI resume that follows acquires this same handle
     try:
+        origin = {"tool": tool, "path": str(path), "foreign_session_id": parsed.get("session_id")}
+        title = f"Imported from {_SOURCE_LABELS[source]}: {first_user}"
+        if hasattr(db, "import_foreign_history"):
+            result = db.import_foreign_history(origin, turns, title=title, cwd=parsed.get("cwd"), profile=None)
+            return result["session_id"]
         session_id = new_session_id()
-        origin = {"imported_from": {"tool": tool, "path": str(path), "foreign_session_id": parsed.get("session_id")}}
-        db.create_session(session_id, source=tool, cwd=parsed.get("cwd"), origin_json=json.dumps(origin))
+        db.create_session(session_id, source=tool, cwd=parsed.get("cwd"), origin_json=json.dumps({"imported_from": origin}))
         for turn in turns:
             db.append_message(session_id, turn["role"], turn["content"])
-        with contextlib.suppress(Exception):  # title is cosmetic; the import itself succeeded
-            db.set_session_title(session_id, f"Imported from {_SOURCE_LABELS[source]}: {first_user}")
+        with contextlib.suppress(Exception):
+            db.set_session_title(session_id, title)
         return session_id
     finally:
         if owns_db:

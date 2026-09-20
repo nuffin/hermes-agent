@@ -247,10 +247,10 @@ def _print_recovery_verdict(report, output, allow_partial) -> int:
     return 1
 
 
-def _cmd_import(args):
+def _cmd_import(args, db=None):
     from hermes_cli.foreign_sessions import run_sessions_import
     # Explicit path but nothing imported -> non-zero for scripts. Picker cancel (no path) -> exit 0.
-    if run_sessions_import(args) is None and getattr(args, "path", None):
+    if run_sessions_import(args, db=db) is None and getattr(args, "path", None):
         return 1
 
 
@@ -1029,6 +1029,17 @@ def cmd_sessions(args, sessions_parser=None):
         return 1
     pre = _PRE_DB_HANDLERS.get(action)
     if pre is not None:
+        if selected_store.backend == "postgresql" and action == "import":
+            from cli_session_store import open_cli_session_store
+            try:
+                db = open_cli_session_store(config, read_only=False)
+            except Exception as e:
+                print(f"Could not open your PostgreSQL session history: {e}")
+                return 1
+            try:
+                return pre(args, db=db)
+            finally:
+                db.close()
         # These handlers own legacy state.db probing/opening, so select before dispatch.
         from state_store_maintenance import StateStoreMaintenanceError, require_state_store_maintenance
         try:

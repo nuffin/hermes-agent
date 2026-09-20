@@ -54,6 +54,10 @@ class PostgreSQLCLISessionStore:
             self._store.set_system_prompt(session_id, kwargs["system_prompt"])
         return created
 
+    def import_foreign_history(self, origin: Mapping[str, Any], messages: list[Mapping[str, Any]], *, title: str,
+                               cwd: str | None, profile: str | None):
+        return self._store.import_foreign_history(origin, messages, title=title, cwd=cwd, profile=profile)
+
     ensure_session = create_session
 
     def append_message(

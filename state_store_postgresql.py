@@ -22,6 +22,7 @@ from typing import Any, Collection
 from hermes_cli.timefmt import coerce_epoch
 from agent.session_activity import bound_activity_description, normalize_activity_provenance
 from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
+from hermes_state_ids import new_session_id
 from hermes_state_runtime_ownership import RuntimeOwner, RuntimeOwnershipReceipt, SessionRuntimeOwnershipMixin, TurnState
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
 from state_store_postgresql_search import compile_postgresql_search_expression
@@ -53,6 +54,7 @@ _COMPRESSION_COORDINATION_SCHEMA_VERSION = 19
 _COMPRESSION_ROTATION_SCHEMA_VERSION = 20
 _SESSION_CONTROL_STATE_SCHEMA_VERSION = 21
 _TRANSCRIPT_REWIND_SCHEMA_VERSION = 22
+_FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION = 23
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -169,7 +171,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _TRANSCRIPT_REWIND_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -195,6 +197,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_COMPRESSION_ROTATION_SCHEMA_VERSION, self._apply_v20, self._validate_v20),
                     (_SESSION_CONTROL_STATE_SCHEMA_VERSION, self._apply_v21, self._validate_v21),
                     (_TRANSCRIPT_REWIND_SCHEMA_VERSION, self._apply_v22, self._validate_v22),
+                    (_FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION, self._apply_v23, self._validate_v23),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -679,6 +682,21 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._require_index(cursor, "rewind_receipts_session_committed")
         self._require_foreign_key(cursor, "rewind_receipts_session_id_fkey", "rewind_receipts", "sessions")
 
+    def _apply_v23(self, cursor: Any) -> None:
+        """Store an idempotency receipt for one committed foreign transcript."""
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.foreign_import_receipts ("
+            "origin_fingerprint text PRIMARY KEY, session_id text NOT NULL "
+            f"REFERENCES {self._schema}.sessions(id), origin_json jsonb NOT NULL, committed_at double precision NOT NULL)"
+        )
+        cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS foreign_import_receipts_session_unique ON {self._schema}.foreign_import_receipts (session_id)")
+
+    def _validate_v23(self, cursor: Any) -> None:
+        self._validate_v22(cursor)
+        self._required_columns(cursor, "foreign_import_receipts", {"origin_fingerprint", "session_id", "origin_json", "committed_at"})
+        self._require_index(cursor, "foreign_import_receipts_session_unique")
+        self._require_foreign_key(cursor, "foreign_import_receipts_session_id_fkey", "foreign_import_receipts", "sessions")
+
     @staticmethod
     def _control_kind(control_kind: str) -> str:
         if control_kind not in {"goal", "heartbeat", "loop"}:
@@ -1110,6 +1128,72 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 (session_id,),
             )
         return session_id
+
+    @staticmethod
+    def _foreign_import_fingerprint(origin: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        tool, path, foreign_id = origin.get("tool"), origin.get("path"), origin.get("foreign_session_id")
+        if not isinstance(tool, str) or not tool.strip() or not isinstance(path, str) or not path.strip():
+            raise ValueError("foreign import origin requires non-empty tool and path")
+        if foreign_id is not None and (not isinstance(foreign_id, str) or not foreign_id.strip()):
+            raise ValueError("foreign import foreign_session_id must be a non-empty string when present")
+        canonical = {"tool": tool.strip(), "path": path, "foreign_session_id": foreign_id.strip() if isinstance(foreign_id, str) else None}
+        identity = ({"tool": canonical["tool"], "foreign_session_id": canonical["foreign_session_id"]}
+                    if canonical["foreign_session_id"] else {"tool": canonical["tool"], "path": canonical["path"]})
+        return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(), canonical
+
+    def import_foreign_history(self, origin: Mapping[str, Any], messages: list[Mapping[str, Any]], *, title: str,
+                               cwd: str | None, profile: str | None) -> dict[str, Any]:
+        """Atomically import one normalized foreign transcript into this tenant.
+
+        Validation completes before a connection opens. The receipt makes a lost
+        acknowledgement retry-safe; imported rows deliberately carry no live
+        routing, activity, lease, or ownership state.
+        """
+        if not isinstance(origin, Mapping) or not isinstance(messages, list):
+            raise ValueError("foreign import requires an origin and a messages list")
+        fingerprint, canonical_origin = self._foreign_import_fingerprint(origin)
+        if not isinstance(title, str) or not (clean_title := _sanitize_title(title)):
+            raise ValueError("foreign import requires a non-empty title")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ValueError("foreign import cwd must be a string or null")
+        if profile is not None and not isinstance(profile, str):
+            raise ValueError("foreign import profile must be a string or null")
+        normalized: list[tuple[str, str]] = []
+        previous_role = None
+        for message in messages:
+            if not isinstance(message, Mapping):
+                raise ValueError("foreign import messages must be objects")
+            role, content = message.get("role"), message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str) or not content.strip():
+                raise ValueError("foreign import messages require non-empty user or assistant content")
+            if role == previous_role:
+                raise ValueError("foreign import messages must alternate roles")
+            normalized.append((role, content))
+            previous_role = role
+        if not normalized or normalized[0][0] != "user":
+            raise ValueError("foreign import must begin with a user message")
+        now = time.time()
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{self._schema}:foreign-import:{fingerprint}",))
+            cursor.execute(f"SELECT session_id FROM {self._schema}.foreign_import_receipts WHERE origin_fingerprint=%s", (fingerprint,))
+            receipt = cursor.fetchone()
+            if receipt is not None:
+                return {"session_id": str(receipt["session_id"]), "already_imported": True}
+            session_id = new_session_id(hex_len=12)
+            stored_title = clean_title
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE title=%s FOR UPDATE", (stored_title,))
+            if cursor.fetchone() is not None:
+                stored_title = _sanitize_title(f"{clean_title[:84]} ({session_id[-12:]})")
+            cursor.execute(
+                f"INSERT INTO {self._schema}.sessions (id, source, started_at, title, title_source, cwd, profile_name, origin_json, last_activity_at) "
+                "VALUES (%s, %s, %s, %s, 'user', %s, %s, %s, NULL)",
+                (session_id, canonical_origin["tool"], now, stored_title, cwd, profile, json.dumps({"imported_from": canonical_origin})),
+            )
+            for role, content in normalized:
+                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at) VALUES (%s, %s, %s, %s)", (session_id, role, content, now))
+            cursor.execute(f"INSERT INTO {self._schema}.foreign_import_receipts (origin_fingerprint, session_id, origin_json, committed_at) VALUES (%s, %s, %s, %s)",
+                           (fingerprint, session_id, self._psycopg.types.json.Jsonb(canonical_origin), now))
+            return {"session_id": session_id, "already_imported": False}
 
     @staticmethod
     def _encode_content(content: Any) -> Any:
