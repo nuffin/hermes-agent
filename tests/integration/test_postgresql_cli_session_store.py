@@ -869,3 +869,182 @@ def test_default_sqlite_factory_path_remains_legacy(tmp_path, monkeypatch):
         assert (home / "state.db").exists()
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("command", ["/branch PG branch", "/fork PG fork"])
+def test_interactive_postgresql_branch_and_fork_are_atomic_and_resume_visible(
+    pg_cli_home, monkeypatch, command,
+):
+    """Both slash spellings use the one-transaction PG publisher, never SQLite."""
+    from cli import HermesCLI
+
+    home, stores = pg_cli_home
+    parent = f"pg-{command.split()[0][1:]}-parent"
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session(parent, "cli", model="oracle/model")
+        store.set_session_title(parent, "PG parent title")
+        store.append_messages_batch(parent, [
+            {"role": "user", "content": {"text": "canonical input"}, "timestamp": 100,
+             "api_content": "wire-user", "display_kind": "chat", "display_metadata": {"ordinal": 1}},
+            {"role": "assistant", "content": "canonical output", "timestamp": 101,
+             "tool_calls": [{"id": "call-1", "type": "function"}], "reasoning": "because",
+             "reasoning_details": [{"type": "reasoning.text", "text": "detail"}],
+             "codex_reasoning_items": [{"id": "rs-1", "type": "reasoning"}],
+             "codex_message_items": [{"id": "msg-1", "type": "message"}],
+             "api_content": "wire-assistant", "display_kind": "assistant",
+             "display_metadata": {"ordinal": 2}},
+            {"role": "tool", "content": None, "tool_name": "local", "tool_call_id": "call-1",
+             "effect_disposition": "success", "timestamp": 102, "api_content": "wire-tool"},
+        ])
+        expected = store._store.get_message_records(parent)
+        shell = HermesCLI.__new__(HermesCLI)
+        shell._agent_running = False
+        shell._session_db = store
+        shell.session_id = parent
+        shell.model = "oracle/model"
+        shell.max_turns = 17
+        shell.reasoning_config = {"effort": "medium"}
+        shell.session_start = None
+        shell._pending_title = None
+        shell._resumed = False
+        shell.agent = None
+        shell.conversation_history = [{"role": "user", "content": "stale in-memory copy"}]
+        shell._transfer_session_yolo = MagicMock()
+        monkeypatch.setattr("cli._sync_process_session_id", lambda _session_id: None)
+
+        HermesCLI._handle_branch_command(shell, command)
+        child = shell.session_id
+        assert child != parent
+        parent_row, child_row = store.get_session(parent), store.get_session(child)
+        assert parent_row["end_reason"] == "branched" and parent_row["ended_at"] is not None
+        assert child_row["parent_session_id"] == parent
+        assert child_row["model"] == "oracle/model"
+        assert child_row["model_config"] == {
+            "max_iterations": 17, "reasoning_config": {"effort": "medium"}, "_branched_from": parent,
+        }
+        assert child_row["title"] == command.removeprefix("/branch ").removeprefix("/fork ")
+        fields = ("role", "content", "tool_name", "tool_calls", "tool_call_id", "effect_disposition", "timestamp",
+                  "reasoning", "reasoning_details", "codex_reasoning_items", "codex_message_items", "api_content",
+                  "display_kind", "display_metadata", "active", "compacted")
+        actual = store._store.get_message_records(child)
+        assert [{key: row[key] for key in fields} for row in actual] == [
+            {key: row[key] for key in fields} for row in expected
+        ]
+        assert [row["content"] for row in store.get_resume_conversations(child)[0]] == [
+            row["content"] for row in expected
+        ]
+        assert child in [row["id"] for row in store.search_sessions(source="cli")]
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_postgresql_branch_normalized_observation_matches_sqlite_oracle(pg_cli_home, tmp_path, monkeypatch):
+    """The new atomic path preserves the legacy slash command's visible contract."""
+    from cli import HermesCLI
+    from hermes_state import SessionDB
+
+    home, stores = pg_cli_home
+    pg = _open(stores)
+    oracle_home = tmp_path / ".hermes-branch-sqlite-oracle"
+    oracle_home.mkdir()
+    oracle_token = set_hermes_home_override(str(oracle_home))
+    try:
+        sqlite = SessionDB(db_path=tmp_path / "branch-sqlite-oracle.db")
+    finally:
+        reset_hermes_home_override(oracle_token)
+    parent_ids = {"pg": "branch-oracle-pg-parent", "sqlite": "branch-oracle-sqlite-parent"}
+    history = [
+        {"role": "user", "content": "compare input", "timestamp": 100},
+        {"role": "assistant", "content": "compare output", "tool_calls": [{"id": "call-1"}],
+         "reasoning": "comparison", "reasoning_details": [{"type": "reasoning.text", "text": "detail"}],
+         "codex_reasoning_items": [{"id": "rs-1"}], "codex_message_items": [{"id": "msg-1"}], "timestamp": 101},
+        {"role": "tool", "content": "compare tool", "tool_name": "local", "tool_call_id": "call-1", "timestamp": 102},
+    ]
+    with trap_state_db_opens(home) as opens:
+        for store, parent in ((pg, parent_ids["pg"]), (sqlite, parent_ids["sqlite"])):
+            store.create_session(parent, "cli", model="oracle/model")
+            store.set_session_title(parent, "Oracle branch title")
+        pg.append_messages_batch(parent_ids["pg"], history)
+        shells = {}
+        monkeypatch.setattr("cli._sync_process_session_id", lambda _session_id: None)
+        for name, store in (("pg", pg), ("sqlite", sqlite)):
+            shell = HermesCLI.__new__(HermesCLI)
+            shell._agent_running = False
+            shell._session_db = store
+            shell.session_id = parent_ids[name]
+            shell.model = "oracle/model"
+            shell.max_turns = 17
+            shell.reasoning_config = {"effort": "medium"}
+            shell.session_start = None
+            shell._pending_title = None
+            shell._resumed = False
+            shell.agent = None
+            shell.conversation_history = history
+            shell._transfer_session_yolo = MagicMock()
+            HermesCLI._handle_branch_command(shell, "/branch Oracle child")
+            shells[name] = shell
+
+        fields = ("role", "content", "tool_name", "tool_calls", "tool_call_id", "reasoning",
+                  "reasoning_details", "codex_reasoning_items", "codex_message_items")
+        def normalize(value):
+            if isinstance(value, str) and value[:1] in "[{":
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+            return value
+        def normalize_rows(rows):
+            return [{key: normalize(row.get(key)) for key in fields} for row in rows]
+        def observe(store, parent, child):
+            session = store.get_session(child)
+            model_config = session["model_config"]
+            if isinstance(model_config, str):
+                model_config = json.loads(model_config)
+            model_config["_branched_from"] = "PARENT"
+            messages = store.get_messages_as_conversation(child)
+            return {
+                "parent_end_reason": store.get_session(parent)["end_reason"],
+                "child": {"parent_session_id": "PARENT", "model": session["model"],
+                          "model_config": model_config, "title": session["title"]},
+                "records": normalize_rows(messages), "counter": len(messages),
+                "search_visible": child in [row["id"] for row in store.search_sessions(source="cli")],
+                "resume": normalize_rows(store.get_resume_conversations(child)[0]),
+            }
+
+        observed = {
+            name: observe(store, parent_ids[name], shells[name].session_id)
+            for name, store in (("pg", pg), ("sqlite", sqlite))
+        }
+        assert observed["pg"] == observed["sqlite"]
+    sqlite.close()
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_postgresql_branch_rolls_back_parent_and_child_on_message_copy_failure(pg_cli_home):
+    """A failed canonical copy cannot strand a closed parent or partial branch."""
+    _home, stores = pg_cli_home
+    store = _open(stores)
+    parent, child = "pg-branch-rollback-parent", "pg-branch-rollback-child"
+    store.create_session(parent, "cli", model="oracle/model")
+    store.append_message(parent, "user", "must survive")
+    with store._store._connection() as connection, connection.cursor() as cursor:
+        schema = store._store._schema
+        cursor.execute(
+            f"CREATE FUNCTION {schema}.fail_branch_copy() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN RAISE EXCEPTION 'forced branch copy failure'; END; $$"
+        )
+        cursor.execute(
+            f"CREATE TRIGGER fail_branch_copy BEFORE INSERT ON {schema}.messages "
+            f"FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_branch_copy()"
+        )
+    with pytest.raises(Exception, match="forced branch copy failure"):
+        store.branch_session(
+            parent_session_id=parent, child_session_id=child, source="cli", model="oracle/model",
+            model_config={"max_iterations": 1}, title="never published",
+        )
+    assert store.get_session(child) is None
+    parent_row = store.get_session(parent)
+    assert parent_row["ended_at"] is None and parent_row["end_reason"] is None
+    assert [row["content"] for row in store._store.get_message_records(parent)] == ["must survive"]
