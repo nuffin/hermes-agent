@@ -125,6 +125,12 @@ def test_postgresql_cli_history_listing_and_bare_resume_never_open_sqlite(pg_cli
         store.create_session("pg-cli-history", "cli", cwd="/tmp/pg-history")
         store.set_session_title("pg-cli-history", "PostgreSQL history")
         store.append_message("pg-cli-history", "user", "persisted PostgreSQL preview", timestamp=100)
+        store.create_session("pg-oneshot-history", "oneshot", cwd="/tmp/pg-oneshot")
+        store.set_session_title("pg-oneshot-history", "PostgreSQL one-shot history")
+        store.append_message("pg-oneshot-history", "user", "persisted one-shot preview", timestamp=101)
+        store.create_session("pg-gateway-history", "telegram", cwd="/tmp/pg-gateway")
+        store.set_session_title("pg-gateway-history", "Gateway history must stay hidden")
+        store.append_message("pg-gateway-history", "user", "gateway preview", timestamp=102)
         rows = store.list_sessions_rich(source="cli", limit=10, order_by_last_active=True)
         assert rows[0]["id"] == "pg-cli-history"
         assert {"id", "source", "title", "preview", "last_active", "message_count", "cwd"} <= rows[0].keys()
@@ -140,8 +146,14 @@ def test_postgresql_cli_history_listing_and_bare_resume_never_open_sqlite(pg_cli
         shell.conversation_history = []
         shell.agent = None
         shell._handle_resume_command("/resume")
-        assert shell._pending_resume_sessions[0]["id"] == "pg-cli-history"
-        assert "PostgreSQL history" in capsys.readouterr().out
+        pending_ids = [row["id"] for row in shell._pending_resume_sessions]
+        assert {"pg-cli-history", "pg-oneshot-history"} <= set(pending_ids)
+        assert "pg-gateway-history" not in pending_ids
+        assert shell._resolve_resume_target("2")[0] == pending_ids[1]
+        resume_output = capsys.readouterr().out
+        assert "PostgreSQL history" in resume_output
+        assert "PostgreSQL one-shot history" in resume_output
+        assert "Gateway history must stay hidden" not in resume_output
 
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: _CONFIG)
         result = cmd_sessions(SimpleNamespace(
