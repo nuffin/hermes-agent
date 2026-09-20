@@ -1056,6 +1056,75 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 )
         return len(records)
 
+    def branch_session(
+        self, *, parent_session_id: str, child_session_id: str, source: str,
+        model: str | None, model_config: Mapping[str, Any], title: str,
+    ) -> str:
+        """Atomically publish an interactive branch from one live parent.
+
+        This is deliberately distinct from compression rotation: a branch owns a
+        complete physical copy of the parent's active transcript and remains a
+        separately visible session.  Holding the parent row lock fences appenders
+        through the message FK while the watermark and copy are taken, so a
+        failure cannot leave either a closed parent or a partial child.
+        """
+        if not parent_session_id or not child_session_id:
+            raise ValueError("branch requires parent and child session ids")
+        if parent_session_id == child_session_id:
+            raise ValueError("branch child must differ from parent")
+        if not title:
+            raise ValueError("branch requires a title")
+        metadata = dict(model_config)
+        metadata["_branched_from"] = parent_session_id
+        message_columns = (
+            "session_id", "role", "content", "created_at", *_MESSAGE_RECORD_WRITE_COLUMNS,
+            "active", "compacted",
+        )
+        source_columns = ("role", "content", "created_at", *_MESSAGE_RECORD_WRITE_COLUMNS, "active", "compacted")
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            now = self._coordination_clock_and_lock(cursor, "interactive_branch", parent_session_id)
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.sessions WHERE id=%s AND ended_at IS NULL FOR UPDATE",
+                (parent_session_id,),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError("branch parent is missing or no longer active")
+            cursor.execute(
+                f"SELECT holder FROM {self._schema}.session_turn_leases "
+                "WHERE conversation_id=%s AND expires_at>%s FOR UPDATE",
+                (parent_session_id, now),
+            )
+            lease = cursor.fetchone()
+            if lease is not None:
+                raise RuntimeError("branch parent has an active turn lease")
+            cursor.execute(
+                f"SELECT COALESCE(MAX(id), 0) AS watermark FROM {self._schema}.messages "
+                "WHERE session_id=%s AND active",
+                (parent_session_id,),
+            )
+            watermark = int(cursor.fetchone()["watermark"])
+            cursor.execute(
+                f"INSERT INTO {self._schema}.sessions "
+                "(id, source, started_at, model, model_config, parent_session_id, title, title_source, last_activity_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'user', %s)",
+                (child_session_id, source, now, model, self._psycopg.types.json.Jsonb(metadata),
+                 parent_session_id, _sanitize_title(title), now),
+            )
+            cursor.execute(
+                f"INSERT INTO {self._schema}.messages ({', '.join(message_columns)}) "
+                f"SELECT %s, {', '.join(source_columns)} FROM {self._schema}.messages "
+                "WHERE session_id=%s AND active AND id<=%s ORDER BY id",
+                (child_session_id, parent_session_id, watermark),
+            )
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET ended_at=%s, end_reason='branched' "
+                "WHERE id=%s AND ended_at IS NULL",
+                (now, parent_session_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("branch parent changed while publishing")
+        return child_session_id
+
     @property
     def capabilities(self) -> tuple[str, ...]:
         """Explicitly advertised durable capabilities; never infer from methods."""

@@ -157,6 +157,7 @@ class PostgreSQLCLISessionStore:
     def get_active_message_watermark(self, session_id: str): return self._store.get_active_message_watermark(session_id)
     def get_compression_publication_receipt(self, request_id: str): return self._store.get_compression_publication_receipt(request_id)
     def publish_compression_child(self, **kwargs: Any): return self._store.publish_compression_child(**kwargs)
+    def branch_session(self, **kwargs: Any): return self._store.branch_session(**kwargs)
 
     def get_session(self, session_id: str): return self._store.get_session(session_id)
     def resolve_session_id(self, session_id_or_prefix: str) -> str | None:

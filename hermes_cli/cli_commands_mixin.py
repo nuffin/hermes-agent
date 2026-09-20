@@ -1441,6 +1441,34 @@ class CLICommandsMixin:
         branch_title = branch_name or self._session_db.get_next_title_in_lineage(
             self._session_db.get_session_title(self.session_id) or "branch")
         parent_session_id = self.session_id
+        # PostgreSQL owns the durable branch publication as one transaction.  Flush
+        # first, so its canonical active rows include the idle CLI transcript, then
+        # leave all process/agent/memory switching effects until after commit.
+        from cli_session_store import PostgreSQLCLISessionStore
+        if isinstance(self._session_db, PostgreSQLCLISessionStore):
+            if self.agent:
+                with suppress(Exception):
+                    self.agent._flush_messages_to_session_db(
+                        self.conversation_history, conversation_history=self.conversation_history)
+            try:
+                self._session_db.branch_session(
+                    parent_session_id=parent_session_id, child_session_id=new_session_id,
+                    source=os.environ.get("HERMES_SESSION_SOURCE", "cli"), model=self.model,
+                    model_config={"max_iterations": self.max_turns, "reasoning_config": self.reasoning_config},
+                    title=branch_title,
+                )
+            except Exception as e:
+                return _cp(f"  Failed to create branch session: {e}")
+            self._transfer_session_yolo(self.session_id, new_session_id)
+            self.session_id, self.session_start, self._pending_title = new_session_id, now, None
+            self._resumed = True
+            _sync_process_session_id(new_session_id)
+            if self.agent:
+                self.agent.session_start = now
+            _sync_agent_to_session(self, new_session_id, parent_session_id=parent_session_id, reason="branch")
+            msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+            return _cp(f"  ⑂ Branched session \"{branch_title}\" ({_plural(msg_count, 'user message')})",
+                       f"  Original session: {parent_session_id}", f"  Branch session:   {new_session_id}")
         # Create the child BEFORE ending the parent: a failed create_session must leave the session the
         # user is still on open, not ended with end_reason="branched" and no branch (#11030).
         # The stable ``_branched_from`` marker keeps the branch visible in /resume + /sessions
