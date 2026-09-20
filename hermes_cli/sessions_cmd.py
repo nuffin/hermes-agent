@@ -853,6 +853,22 @@ def _cmd_optimize(db, args):
     _print_size_change(db, before_mb)
 
 
+def _cmd_postgresql_optimize(config) -> int:
+    """Render PostgreSQL-native maintenance evidence without SQLite file claims."""
+    import json
+
+    from postgresql_state_store_operations import PostgreSQLSandboxOperationsError
+    from state_store_maintenance import StateStoreMaintenanceError, require_state_store_maintenance
+
+    try:
+        operations = require_state_store_maintenance("sessions-optimize", config)
+        print(json.dumps(operations.optimize(config), sort_keys=True, indent=2, default=str))
+        return 0
+    except (StateStoreMaintenanceError, PostgreSQLSandboxOperationsError) as exc:
+        print(f"PostgreSQL session optimize failed: {exc}")
+        return 2
+
+
 def _cmd_clean_markers(db, args):
     print(f"{'Dry run — scanning' if args.dry_run else 'Scanning'} for stale tool-call marker rows (#78148)…")
     report = db.purge_stale_tool_call_markers(dry_run=args.dry_run, backup=not args.no_backup)
@@ -1049,6 +1065,8 @@ def cmd_sessions(args, sessions_parser=None):
             return 2
         return pre(args)
     if selected_store.backend == "postgresql":
+        if action == "optimize":
+            return _cmd_postgresql_optimize(config)
         if action not in {"list", "stats", "export", "delete", "rename", "pin", "unpin", "pinned", "retitle-skills", "browse", "prune", "archive", "clean-markers"}:
             print(
                 f"PostgreSQL session history does not support `hermes sessions {action}` yet; "

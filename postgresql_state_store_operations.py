@@ -32,7 +32,10 @@ _REQUIRED_TABLES = (
     "conversation_generations", "session_runtime_owners", "session_runtime_turns",
     "compression_locks", "session_turn_leases",
 )
-_REQUIRED_MIGRATIONS = tuple(range(1, 23))
+_REQUIRED_MIGRATIONS = tuple(range(1, 24))
+_OPTIMIZE_TABLES = _REQUIRED_TABLES
+_OPTIMIZE_STATEMENT_TIMEOUT_MS = 30_000
+_OPTIMIZE_LOCK_TIMEOUT_MS = 2_000
 
 
 class PostgreSQLSandboxOperationsError(RuntimeError):
@@ -258,6 +261,152 @@ class PostgreSQLSandboxOperations:
             raise
         except Exception as exc:
             raise PostgreSQLSandboxOperationsError("PostgreSQL sandbox doctor could not validate tenant health") from exc
+
+    def _optimize_diagnostic(self, cursor: Any) -> dict[str, Any]:
+        """Return a non-mutating, fail-closed readiness record for bounded VACUUM.
+
+        Unlike ``doctor()``, this deliberately reports index drift instead of
+        raising immediately so an operator can see why optimize refused.  It
+        never repairs catalog drift or creates missing objects.
+        """
+        issues: list[str] = []
+        if not self._schema_exists(cursor, self._schema):
+            return {
+                "backend": "postgresql", "schema": self._schema,
+                "catalog": {"healthy": False, "issues": ["tenant_schema_missing"]},
+                "search": {"generated_document": "unknown", "gin_index": "unknown", "healthy": False},
+                "leases": {"session_turn_leases": 0, "compression_locks": 0, "runtime_turns": 0, "active_total": 0},
+            }
+        cursor.execute(f"SELECT version FROM {_quote_identifier(self._schema)}.schema_migrations ORDER BY version")
+        migrations = [int(row[0]) for row in cursor.fetchall()]
+        if migrations != list(_REQUIRED_MIGRATIONS):
+            issues.append("migration_catalog_unhealthy")
+        present_tables: set[str] = set()
+        for table in _OPTIMIZE_TABLES:
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema=%s AND table_name=%s)",
+                (self._schema, table),
+            )
+            if cursor.fetchone()[0]:
+                present_tables.add(table)
+            else:
+                issues.append(f"missing_table:{table}")
+        generated_document = "unknown"
+        gin_index = "unknown"
+        if "messages" in present_tables:
+            cursor.execute(
+                "SELECT attgenerated='s' FROM pg_attribute "
+                "WHERE attrelid=(%s || '.messages')::regclass AND attname='search_document' AND NOT attisdropped",
+                (self._schema,),
+            )
+            generated_document = "valid" if bool((cursor.fetchone() or (False,))[0]) else "invalid"
+            cursor.execute(
+                "SELECT i.indisvalid AND i.indisready AND i.indislive AND am.amname='gin' "
+                "AND array_agg(a.attname ORDER BY key.ordinality)=ARRAY['search_document']::name[] "
+                "FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid JOIN pg_am am ON am.oid=c.relam "
+                "JOIN unnest(i.indkey) WITH ORDINALITY key(attnum, ordinality) ON true "
+                "JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum "
+                "WHERE c.relnamespace=%s::regnamespace AND c.relname='messages_search_document_gin' "
+                "GROUP BY i.indisvalid, i.indisready, i.indislive, am.amname",
+                (self._schema,),
+            )
+            gin_index = "valid" if bool((cursor.fetchone() or (False,))[0]) else "invalid"
+        search_healthy = generated_document == "valid" and gin_index == "valid"
+        if not search_healthy:
+            issues.append("search_catalog_unhealthy")
+
+        leases = {"session_turn_leases": 0, "compression_locks": 0, "runtime_turns": 0}
+        if "session_turn_leases" in present_tables:
+            cursor.execute(
+                f"SELECT count(*) FROM {_quote_identifier(self._schema)}.session_turn_leases "
+                "WHERE expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
+            )
+            leases["session_turn_leases"] = int(cursor.fetchone()[0])
+        if "compression_locks" in present_tables:
+            cursor.execute(
+                f"SELECT count(*) FROM {_quote_identifier(self._schema)}.compression_locks "
+                "WHERE expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
+            )
+            leases["compression_locks"] = int(cursor.fetchone()[0])
+        if {"session_runtime_turns", "session_runtime_owners"} <= present_tables:
+            cursor.execute(
+                f"SELECT count(*) FROM {_quote_identifier(self._schema)}.session_runtime_turns AS turn "
+                f"JOIN {_quote_identifier(self._schema)}.session_runtime_owners AS owner "
+                "ON (owner.namespace, owner.session_id, owner.fence) = (turn.namespace, turn.session_id, turn.owner_fence) "
+                "WHERE turn.state IN ('running', 'indeterminate') "
+                "AND owner.expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
+            )
+            leases["runtime_turns"] = int(cursor.fetchone()[0])
+        leases["active_total"] = sum(leases.values())
+        return {
+            "backend": "postgresql", "schema": self._schema,
+            "catalog": {"healthy": not issues, "issues": issues, "migration_versions": migrations},
+            "search": {"generated_document": generated_document, "gin_index": gin_index, "healthy": search_healthy},
+            "leases": leases,
+        }
+
+    def optimize(self) -> dict[str, Any]:
+        """Run tenant-scoped ``VACUUM (ANALYZE)`` only after a bounded native gate.
+
+        This is intentionally not SQLite's FTS merge/file-size operation: it
+        neither opens ``state.db`` nor reports filesystem reclamation.  It
+        refuses catalog/search drift and live turn/compression leases instead of
+        attempting repair or waiting indefinitely for a lock.
+        """
+        try:
+            connection = self._connect()
+            connection.autocommit = True
+            try:
+                with connection.cursor() as cursor:
+                    before = self._optimize_diagnostic(cursor)
+                    if not before["catalog"]["healthy"]:
+                        raise PostgreSQLSandboxOperationsError(
+                            "PostgreSQL optimize refused: catalog or search index is unhealthy; repair it before retrying"
+                        )
+                    if before["leases"]["active_total"]:
+                        raise PostgreSQLSandboxOperationsError(
+                            "PostgreSQL optimize refused: active session-turn or compression lease exists"
+                        )
+                    missing_privileges: list[str] = []
+                    for table in _OPTIMIZE_TABLES:
+                        cursor.execute("SELECT has_table_privilege(%s, 'MAINTAIN')", (f"{self._schema}.{table}",))
+                        if not cursor.fetchone()[0]:
+                            missing_privileges.append(table)
+                    if missing_privileges:
+                        raise PostgreSQLSandboxOperationsError(
+                            "PostgreSQL optimize refused: missing MAINTAIN privilege on " + ", ".join(missing_privileges)
+                        )
+                    cursor.execute(f"SET lock_timeout = '{_OPTIMIZE_LOCK_TIMEOUT_MS}ms'")
+                    cursor.execute(f"SET statement_timeout = '{_OPTIMIZE_STATEMENT_TIMEOUT_MS}ms'")
+                    targets = ", ".join(
+                        f"{_quote_identifier(self._schema)}.{_quote_identifier(table)}" for table in _OPTIMIZE_TABLES
+                    )
+                    cursor.execute(f"VACUUM (ANALYZE) {targets}")
+                    after = self._optimize_diagnostic(cursor)
+                    if not after["catalog"]["healthy"]:
+                        raise PostgreSQLSandboxOperationsError(
+                            "PostgreSQL optimize completed but post-operation catalog validation failed"
+                        )
+                    return {
+                        "backend": "postgresql", "operation": "vacuum_analyze", "schema": self._schema,
+                        "tables": list(_OPTIMIZE_TABLES),
+                        "timeouts": {"statement_timeout_ms": _OPTIMIZE_STATEMENT_TIMEOUT_MS, "lock_timeout_ms": _OPTIMIZE_LOCK_TIMEOUT_MS},
+                        "before": before, "after": after,
+                        "file_size_equivalence": False,
+                    }
+            finally:
+                connection.close()
+        except PostgreSQLSandboxOperationsError:
+            raise
+        except Exception as exc:
+            sqlstate = getattr(exc, "sqlstate", None)
+            if sqlstate == "55P03":
+                raise PostgreSQLSandboxOperationsError("PostgreSQL optimize failed: lock timeout; no SQLite fallback is permitted") from exc
+            if sqlstate == "57014":
+                raise PostgreSQLSandboxOperationsError("PostgreSQL optimize failed: statement timeout; no SQLite fallback is permitted") from exc
+            if sqlstate == "42501":
+                raise PostgreSQLSandboxOperationsError("PostgreSQL optimize failed: insufficient privilege; no SQLite fallback is permitted") from exc
+            raise PostgreSQLSandboxOperationsError("PostgreSQL optimize failed without a SQLite fallback") from exc
 
     def backup(self, backup_root: Path, *, required_extensions: Iterable[str] = (), quiesced: bool = False) -> PostgreSQLLogicalBackup:
         """Create a custom-format schema dump and checksum manifest after an explicit quiesce gate."""

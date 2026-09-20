@@ -35,7 +35,7 @@ class StateStoreMaintenanceOperations:
         "snapshot-prune", "update-snapshot", "claw-snapshot", "approvals-suggest", "doctor",
     })
 
-    _postgresql_capabilities = frozenset({"sessions-prune", "sessions-archive", "sessions-clean-markers"})
+    _postgresql_capabilities = frozenset({"sessions-prune", "sessions-archive", "sessions-clean-markers", "sessions-optimize"})
 
     @classmethod
     def resolve(
@@ -83,6 +83,10 @@ class StateStoreMaintenanceOperations:
         backup = operations.backup(output_directory, quiesced=quiesced)
         verification = operations.restore_and_verify(backup.backup_directory)
         return backup, verification
+
+    def optimize(self, config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        """Run the selected tenant's bounded native PostgreSQL maintenance pass."""
+        return self._postgresql_operations(config).optimize()
 
     def _postgresql_operations(self, config: Mapping[str, Any] | None) -> Any:
         if self.selected_backend != "postgresql" or not self.tenant_schema:

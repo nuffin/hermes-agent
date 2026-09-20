@@ -133,7 +133,7 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         "bare number of days, or ISO timestamp)")
 
     sessions_subparsers.add_parser(
-        "optimize", help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)")
+        "optimize", help="Optimize the selected session store (SQLite FTS/VACUUM or bounded PostgreSQL VACUUM ANALYZE)")
 
     sessions_clean_markers = sessions_subparsers.add_parser("clean-markers",
         help="Permanently clear stale tool-call marker content left by sessions from before #78148",
