@@ -35,6 +35,8 @@ class StateStoreMaintenanceOperations:
         "snapshot-prune", "update-snapshot", "claw-snapshot",
     })
 
+    _postgresql_capabilities = frozenset({"sessions-prune", "sessions-archive", "sessions-clean-markers"})
+
     @classmethod
     def resolve(
         cls, config: Mapping[str, Any] | None = None, *, home: Path | None = None,
@@ -54,10 +56,11 @@ class StateStoreMaintenanceOperations:
         return cls(report.selected_backend, Path(report.profile_home), report.profile_name, report.tenant_schema)
 
     def require(self, capability: str) -> None:
-        if capability not in self._sqlite_capabilities:
+        supported = self._sqlite_capabilities if self.selected_backend == "sqlite" else self._postgresql_capabilities
+        if capability not in supported:
+            if capability in self._sqlite_capabilities or capability in self._postgresql_capabilities:
+                raise StateStoreMaintenanceCapabilityError(capability, self.profile_home)
             raise ValueError(f"Unknown state-store maintenance capability: {capability}")
-        if self.selected_backend == "postgresql":
-            raise StateStoreMaintenanceCapabilityError(capability, self.profile_home)
 
     def doctor(self, config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         """Observe the selected PostgreSQL tenant without SQLite access or mutation."""

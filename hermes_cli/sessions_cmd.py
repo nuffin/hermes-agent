@@ -1038,12 +1038,19 @@ def cmd_sessions(args, sessions_parser=None):
             return 2
         return pre(args)
     if selected_store.backend == "postgresql":
-        if action not in {"list", "stats", "export", "delete", "rename", "pin", "unpin", "pinned", "retitle-skills", "browse"}:
+        if action not in {"list", "stats", "export", "delete", "rename", "pin", "unpin", "pinned", "retitle-skills", "browse", "prune", "archive", "clean-markers"}:
             print(
                 f"PostgreSQL session history does not support `hermes sessions {action}` yet; "
                 "no SQLite fallback is permitted."
             )
             return 2
+        if action in {"prune", "archive", "clean-markers"}:
+            from state_store_maintenance import StateStoreMaintenanceError, require_state_store_maintenance
+            try:
+                require_state_store_maintenance(f"sessions-{action}", config)
+            except StateStoreMaintenanceError as e:
+                print(e)
+                return 2
         if action == "export":
             error = _postgresql_export_capability_error(args)
             if error:
@@ -1052,7 +1059,7 @@ def cmd_sessions(args, sessions_parser=None):
         from cli_session_store import open_cli_session_store
         try:
             db = open_cli_session_store(
-                config, read_only=action not in {"delete", "rename", "pin", "unpin", "retitle-skills"},
+                config, read_only=action not in {"delete", "rename", "pin", "unpin", "retitle-skills", "prune", "archive", "clean-markers"},
             )
         except Exception as e:
             print(f"Could not open your PostgreSQL session history: {e}")
