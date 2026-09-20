@@ -618,6 +618,34 @@ def test_sqlite_and_postgresql_token_usage_transport_parity(monkeypatch, tmp_pat
             store.close()
 
 
+def test_postgresql_token_usage_transport_uses_source_for_first_durable_session(monkeypatch, tmp_path):
+    monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
+    store = open_state_store(_config())
+    session_id = f"usage-source-{uuid.uuid4()}"
+    try:
+        store.queue_token_counts(
+            session_id, source="cli", input_tokens=17, output_tokens=5, api_call_count=1,
+            model="source-model", billing_provider="source-provider", billing_base_url="source-url",
+            billing_mode="source-mode",
+        )
+        assert store.flush_token_counts()
+        assert not (tmp_path / "state.db").exists()
+        raw_store = cast(Any, store)
+        with raw_store._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT source, model, input_tokens, output_tokens, api_call_count "
+                f"FROM {_SCHEMA}.sessions WHERE id=%s", (session_id,),
+            )
+            assert cursor.fetchone() == ("cli", "source-model", 17, 5, 1)
+            cursor.execute(
+                f"SELECT model, billing_provider, billing_base_url, billing_mode, input_tokens, output_tokens, api_call_count "
+                f"FROM {_SCHEMA}.session_model_usage WHERE session_id=%s", (session_id,),
+            )
+            assert cursor.fetchone() == ("source-model", "source-provider", "source-url", "source-mode", 17, 5, 1)
+    finally:
+        store.close()
+
+
 def test_postgresql_token_usage_delta_rolls_back_summary_when_attribution_fails(monkeypatch):
     monkeypatch.setenv(_DSN_ENV, "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test")
     store = open_state_store(_config())
