@@ -187,6 +187,73 @@ class PostgreSQLCLISessionStore:
         with self._store._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"UPDATE {self._store._schema}.sessions SET ended_at=NULL, end_reason=NULL WHERE id=%s", (session_id,))
     def end_session(self, session_id: str, reason: str): return self._store.end_session(session_id, reason)
+    def list_sessions_rich(
+        self, source: str | None = None, sources: list[str] | None = None,
+        exclude_sources: list[str] | None = None, cwd_prefix: str | None = None,
+        limit: int = 20, offset: int = 0, include_children: bool = False,
+        min_message_count: int = 0, project_compression_tips: bool = True,
+        order_by_last_active: bool = False, include_archived: bool = False,
+        archived_only: bool = False, id_query: str | None = None,
+        search_query: str | None = None, compact_rows: bool = False,
+        include_pinned: bool = False, session_key: str | None = None,
+        include_hidden: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Project PostgreSQL summary rows into the bounded CLI listing contract.
+
+        The state-store owns the canonical source/archive/hidden filters and MRU
+        order.  This facade adds only SessionDB's presentation and local CLI
+        filters, then resolves compression heads to their resumable descendants.
+        """
+        if sources is not None or cwd_prefix is not None or min_message_count or id_query is not None:
+            raise PostgreSQLCLISessionCapabilityError(
+                "PostgreSQL CLI session listing does not support these filters")
+        if limit < 0 or offset < 0:
+            raise ValueError("session list limit and offset must be non-negative")
+        # Fetch a bounded candidate window from the store before applying
+        # SessionDB-only title/id and workspace predicates. The interactive
+        # callers ask for a small page; the larger window prevents an excluded
+        # candidate from consuming it while preserving state-store MRU ordering.
+        rows = self._store.list_session_summaries(
+            source=source, exclude_sources=tuple(exclude_sources or ()),
+            limit=max(limit + offset, 1000), offset=0,
+            include_archived=include_archived, archived_only=archived_only,
+            include_hidden=include_hidden, include_pinned=include_pinned,
+        )
+        search = (search_query or "").strip().lower()
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for summary in rows:
+            original_id = str(summary["id"])
+            session_id = self._store.get_compression_tip(original_id) if project_compression_tips and not include_children else original_id
+            if session_id in seen:
+                continue
+            session = self._store.get_session(session_id)
+            if session is None:
+                continue
+            title = str(session.get("title") or "")
+            if search and search not in session_id.lower() and search not in title.lower():
+                continue
+            if session_key and session.get("git_repo_root") != session_key and session.get("cwd") != session_key:
+                continue
+            messages = self._store.get_message_records(session_id)
+            preview_raw = next((row.get("content") for row in messages if row.get("role") == "user" and row.get("content") is not None), "")
+            from hermes_state_sessions import _shape_preview
+            preview = _shape_preview(preview_raw)
+            row = {**session, **summary, "id": session_id, "preview": preview,
+                   "last_active": session.get("last_active", summary.get("last_active")),
+                   "message_count": len(messages)}
+            seen.add(session_id)
+            result.append(row)
+        if order_by_last_active or search:
+            result.sort(key=lambda row: (row.get("last_active") or 0, row.get("started_at") or 0, row["id"]), reverse=True)
+        else:
+            result.sort(key=lambda row: (row.get("started_at") or 0, row["id"]), reverse=True)
+        return result[offset:offset + limit]
+
+    def resolve_resume_session_id(self, session_id: str) -> str:
+        """Return the PostgreSQL compression tip that existing resume APIs read."""
+        return self._store.get_compression_tip(session_id)
+
     def search_sessions(self, source: str | None = None, limit: int = 20, offset: int = 0,
                         workspace_key: str | None = None, **kwargs: Any):
         if kwargs:
