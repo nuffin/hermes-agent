@@ -125,8 +125,12 @@ def sqlite_source(tmp_path: Path) -> Path:
             ),
         )
         connection.execute(
-            """INSERT INTO messages (id, session_id, role, content, tool_calls, timestamp, observed, active, compacted, display_metadata)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            "INSERT INTO session_topics (id, session_id, title, summary, state, message_count, created_at, last_active_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "session-a", "fixture topic", None, "active", 1, 100.0, 101.0),
+        )
+        connection.execute(
+            """INSERT INTO messages (id, session_id, role, content, tool_calls, timestamp, observed, active, compacted, display_metadata, topic_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 41,
                 "session-a",
@@ -138,6 +142,7 @@ def sqlite_source(tmp_path: Path) -> Path:
                 1,
                 0,
                 '{"kind":"fixture"}',
+                1,
             ),
         )
         connection.execute(
@@ -199,6 +204,7 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
     assert result.object_counts == {
         "system_prompts": 1,
         "sessions": 1,
+        "session_topics": 1,
         "messages": 1,
         "session_model_usage": 1,
         "conversation_generations": 1,
@@ -214,6 +220,10 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
     with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT id, search_document IS NOT NULL FROM {schema}.messages")
         assert cursor.fetchone() == (41, True)
+        cursor.execute(f"SELECT id, title, message_count FROM {schema}.session_topics")
+        assert cursor.fetchone() == (1, "fixture topic", 1)
+        cursor.execute(f"SELECT topic_id FROM {schema}.messages WHERE id=41")
+        assert cursor.fetchone() == (1,)
     target.execute(
         f"INSERT INTO \"{schema}\".messages (session_id, role, content, created_at) VALUES ('session-a', 'user', 'next', 102)"
     )
