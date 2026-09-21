@@ -1273,7 +1273,8 @@ class SessionMessagesMixin:
             # _read_retrying_ioerr: mode=ro pooled readers see a transient IOERR mid-checkpoint (#100871).
             rows = self._read_retrying_ioerr(
                 lambda conn: self._display_rows_from_conn(
-                    conn, session_id, limit=limit, offset=offset, latest=latest, topic_id=topic_id))        elif include_compacted:
+                    conn, session_id, limit=limit, offset=offset, latest=latest, topic_id=topic_id))
+        elif include_compacted:
             # Read-only legacy stores cannot persist display identities; keep only fixed-width
             # identities and representative ids while scanning, then fetch the selected payloads.
             rows = self._legacy_display_page(
