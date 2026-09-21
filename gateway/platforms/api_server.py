@@ -1731,6 +1731,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
         """Cached SessionDB for ``home`` (shared by both ``_ensure_session_db*``). Never writes
         ``self._session_db`` (explicit override only), so no profile pins later requests."""
+        # ``home`` is captured on the loop thread and is the authoritative target: inside the
+        # ``to_thread`` worker the per-profile scope that redirects ``get_hermes_home()`` is
+        # invisible, so a selected-PostgreSQL foreign profile must be refused HERE, with the
+        # exact target home, before acquire — not left to SessionDB's own launch-home guard.
+        from state_store_runtime_readiness import require_legacy_state_db_runtime
+        require_legacy_state_db_runtime(home=home)
         from hermes_state_registry import acquire
         key = str(home)
         with self._session_db_cache_lock:
