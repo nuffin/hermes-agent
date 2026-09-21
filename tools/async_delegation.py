@@ -145,10 +145,32 @@ def _selected_async_delegation_ledger():
     """Resolve the runtime async-delegation ledger, or None when SQLite is selected.
 
     None keeps the legacy state.db module path below. A selected-PG profile with a
-    missing or unreachable DSN raises typed here (never a silent SQLite fallback);
-    the result is cached per Hermes home inside the resolver."""
+    missing or unreachable DSN raises the typed ``PostgreSQLRuntimeActivationError``
+    here (never a raw driver error, never a silent SQLite fallback); the result is
+    cached per Hermes home inside the resolver."""
     from tools.async_delegation_ledger_adapter import selected_async_delegation_ledger
-    return selected_async_delegation_ledger()
+    try:
+        return selected_async_delegation_ledger()
+    except Exception as exc:
+        # Keep the already-typed configuration errors (schema drift / missing psycopg /
+        # version too old) distinguishable from an activation failure.
+        from tools.async_delegation_ledger_postgresql import (
+            AsyncDelegationLedgerConfigurationError)
+        if isinstance(exc, AsyncDelegationLedgerConfigurationError):
+            raise
+        # Missing or unreachable DSN: surface the typed runtime-activation error with the
+        # readiness diagnostic, mirroring _postgresql_transcript_store. A raw psycopg
+        # OperationalError must never leak out of the dispatch path.
+        from hermes_cli.config import load_config
+        from state_store_runtime_readiness import (
+            PostgreSQLRuntimeActivationError, inspect_runtime_activation)
+        try:
+            config = load_config() or {}
+        except Exception:
+            config = {}
+        report = inspect_runtime_activation(
+            config, home=get_hermes_home(), include_inventory=True)
+        raise PostgreSQLRuntimeActivationError(report) from exc
 
 
 def _capture_routing_origin() -> Dict[str, Any]:
