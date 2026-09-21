@@ -4160,6 +4160,9 @@ class BasePlatformAdapter(ABC):
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
             if ledger is None:
+                from gateway.delivery_ledger_adapter import selected_delivery_ledger
+                ledger = selected_delivery_ledger()
+            if ledger is None:
                 from gateway.delivery_ledger_adapter import SqliteDeliveryLedger
                 ledger = SqliteDeliveryLedger()
             receipt = await asyncio.to_thread(
@@ -4186,6 +4189,9 @@ class BasePlatformAdapter(ABC):
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only
             ledger = self.delivery_ledger
+            if ledger is None:
+                from gateway.delivery_ledger_adapter import selected_delivery_ledger
+                ledger = selected_delivery_ledger()
             if ledger is None:
                 from gateway.delivery_ledger_adapter import SqliteDeliveryLedger
                 ledger = SqliteDeliveryLedger()
