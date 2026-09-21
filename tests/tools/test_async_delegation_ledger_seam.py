@@ -64,13 +64,12 @@ def test_sqlite_home_keeps_legacy_state_db_path(tmp_path, monkeypatch):
 
 
 def test_unreachable_pg_fails_typed_without_state_db(tmp_path, monkeypatch):
-    import psycopg
-    from state_store import StateStoreConfigurationError
-    from state_store_runtime_readiness import trap_state_db_opens
+    from state_store_runtime_readiness import (
+        PostgreSQLRuntimeActivationError, trap_state_db_opens)
 
     home = _pg_home(tmp_path, monkeypatch, dsn_value="postgresql://fixture/only")
     with trap_state_db_opens(home) as events:
-        with pytest.raises((StateStoreConfigurationError, psycopg.Error, ValueError)):
+        with pytest.raises(PostgreSQLRuntimeActivationError):
             ad._persist_dispatch(_record("pg-fail"))
     assert events == []
     assert not (home / "state.db").exists()
