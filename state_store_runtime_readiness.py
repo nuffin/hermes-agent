@@ -230,10 +230,10 @@ def inspect_runtime_activation(
             "contextual-session-search-contract",
             "gateway-session-routing-transcript",
             "acp-session-transcript-lifecycle",
-        ),
-        missing_capabilities=(
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
+        ),
+        missing_capabilities=(
             "cron-session-transcript-lifecycle",
             "tui-api-session-runtime",
         ),
