@@ -411,6 +411,10 @@ def _workdir_owner_db(session: dict, fail_log: str):
     db, close_db = None, False
     if profile_home := session.get("profile_home"):
         try:
+            # Refuse a selected-PostgreSQL target profile BEFORE acquire: SessionDB's own
+            # guard reads the launch home, not this foreign profile's config realm.
+            from state_store_runtime_readiness import require_legacy_state_db_runtime
+            require_legacy_state_db_runtime(home=Path(profile_home))
             from hermes_state_registry import acquire
             db, close_db = acquire(Path(profile_home) / "state.db"), True
         except Exception as exc:
