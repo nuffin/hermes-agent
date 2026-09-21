@@ -52,11 +52,12 @@ class SessionPersistenceMixin:
 
         require_legacy_state_db_runtime()
 
-    def _postgresql_route_store(self):
-        """Return the tenant-bound route authority only when PostgreSQL is selected.
+    def _postgresql_state_store(self):
+        """The tenant-bound PostgreSQLStateStore when selected, else None.
 
-        This must be consulted before any legacy SessionDB resolver.  Transcript
-        methods retain their separate fail-closed guards.
+        Shared by the route adapter and the transcript mixin; resolved per call so
+        a multiplexed profile scope reaches its own tenant.  Never falls back to
+        a legacy SessionDB: connection failures propagate to the caller.
         """
         from hermes_cli.config import load_config
         from state_store import open_state_store, resolve_state_store_config
@@ -64,14 +65,34 @@ class SessionPersistenceMixin:
         config = load_config() or {}
         if resolve_state_store_config(config).backend != "postgresql":
             return None
+        cached = getattr(self, "_pg_state_store", None)
+        if cached is not None:
+            return cached
+        cached = open_state_store(config)
+        self._pg_state_store = cached
+        return cached
+
+    def _postgresql_route_store(self):
+        """Return the tenant-bound route authority only when PostgreSQL is selected.
+
+        This must be consulted before any legacy SessionDB resolver.  Transcript
+        methods retain their separate fail-closed guards.
+        """
+        state_store = self._postgresql_state_store()
+        if state_store is None:
+            return None
         cached = getattr(self, "_pg_route_store", None)
         if cached is not None:
             return cached
         from gateway.session_route_store import PostgreSQLSessionRouteStore
-        from state_store import postgresql_tenant_schema
+
+        def _fallback_tenant_schema():
+            from state_store import postgresql_tenant_schema
+            return postgresql_tenant_schema()
 
         cached = PostgreSQLSessionRouteStore(
-            open_state_store(config), tenant_namespace=postgresql_tenant_schema())
+            state_store, tenant_namespace=getattr(
+                state_store, "tenant_schema", None) or _fallback_tenant_schema())
         self._pg_route_store = cached
         return cached
 
