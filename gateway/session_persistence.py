@@ -37,17 +37,37 @@ def _is_live_system_guard(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "live-system guard" in str(exc)
 
 
+def _selected_postgresql_backend() -> bool:
+    """Lightweight selected-backend probe: True when the resolved backend is postgresql.
+
+    No DB connection and no ``state.db``/``sessions.json`` side effect. Resolution
+    errors propagate so fail-closed callers can let them raise rather than silently
+    treating a config error as a SQLite selection.
+    """
+    from hermes_cli.config import load_config
+    from state_store import resolve_state_store_config
+
+    return resolve_state_store_config(load_config() or {}).backend == "postgresql"
+
+
 class SessionPersistenceMixin:
     """SessionStore storage plumbing: SessionDB handle resolution and routing-index load/save."""
 
     @staticmethod
     def _require_legacy_gateway_session_routing_runtime() -> None:
-        """Reject selected PostgreSQL before gateway routing creates a legacy artifact.
+        """Gate legacy gateway routing/transcript runtime on the selected backend.
 
-        PostgreSQL lacks the coupled route, peer, transcript, dedupe, rewind,
-        recovery, and shutdown contracts. Activation must not become a
-        sessions.json or JSONL fallback.
+        PostgreSQL is authoritative for gateway session routing and transcript
+        persistence: the route and transcript mixins dispatch PG-first and return
+        before any legacy path, so a selected PostgreSQL backend must NOT trip the
+        legacy guard (no sessions.json or JSONL fallback may be created). Backend
+        resolution failures still fail closed through the legacy guard.
         """
+        try:
+            if _selected_postgresql_backend():
+                return
+        except Exception:
+            pass  # config error: fail closed via the legacy guard below
         from state_store_runtime_readiness import require_legacy_state_db_runtime
 
         require_legacy_state_db_runtime()
@@ -330,6 +350,18 @@ class SessionPersistenceMixin:
         self._require_legacy_gateway_session_routing_runtime()
         if self._loaded:
             self._reconcile_recovered_routing_locked()
+            return
+        try:
+            selected_postgresql = _selected_postgresql_backend()
+        except Exception:
+            selected_postgresql = False  # unreachable: the guard above already raised
+        if selected_postgresql:
+            # Routes live in the PostgreSQL gateway_session_routes table (v24); the
+            # in-memory legacy index stays empty and no sessions_dir / sessions.json /
+            # state.db artifact is created or read.
+            self._loaded = True
+            self._routing_db_loaded = True
+            self._routing_fallback_baseline = None
             return
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         db_load_succeeded = self._load_routing_rows_locked()

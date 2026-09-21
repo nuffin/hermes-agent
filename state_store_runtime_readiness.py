@@ -228,14 +228,14 @@ def inspect_runtime_activation(
             "narrow-state-store", "profile-derived-tenant-schema",
             "cli-fresh-resume-session-contract",
             "contextual-session-search-contract",
+            "gateway-session-routing-transcript",
+            "acp-session-transcript-lifecycle",
         ),
         missing_capabilities=(
-            "gateway-session-routing-transcript",
             "gateway-delivery-ledger-routing",
             "async-delegation-ledger-routing",
             "cron-session-transcript-lifecycle",
             "tui-api-session-runtime",
-            "acp-session-transcript-lifecycle",
         ),
         raw_state_db_openers=inventory,
     )
