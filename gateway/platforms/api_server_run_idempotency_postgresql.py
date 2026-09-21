@@ -110,9 +110,9 @@ class PostgreSQLRunIdempotencyStore:
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (f"{self._schema}:run-idempotency-migration",))
                 cur.execute("SHOW server_version_num")
-                if int(cur.fetchone()[0]) < 180000:
+                if int(cur.fetchone()[0]) < 140000:
                     raise RunIdempotencyStoreConfigurationError(
-                        "PostgreSQL run-idempotency store requires PostgreSQL 18 or newer")
+                        "PostgreSQL run-idempotency store requires PostgreSQL 14 or newer")
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
                 cur.execute(
                     f"CREATE TABLE IF NOT EXISTS {self._schema}.run_idempotency_schema_migrations "
