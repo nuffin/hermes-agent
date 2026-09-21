@@ -113,7 +113,14 @@ def _expand_acp_enabled_toolsets(toolsets: List[str] | None = None,
 
 
 def _parse_model_config(mc: Any) -> dict:
-    """Decode a persisted model_config JSON blob; ``{}`` when absent/invalid/non-dict."""
+    """Decode a persisted model_config blob; ``{}`` when absent/invalid/non-dict.
+
+    Accepts the JSON string SQLite stores and the jsonb mapping PostgreSQL
+    projects (psycopg decodes ``jsonb`` to a dict), so restore/list behave the
+    same on either backend.
+    """
+    if isinstance(mc, dict):
+        return mc
     try:
         meta = json.loads(mc) if mc else None
     except (json.JSONDecodeError, TypeError):
@@ -168,6 +175,7 @@ class SessionManager:
         self._restore_lock = threading.Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        self._pg_store_instance = None  # selected-PostgreSQL facade; lazy like _db_instance
 
     # ---- public API ---------------------------------------------------------
 
@@ -283,23 +291,65 @@ class SessionManager:
             self._persist(state)
         return state
 
-    def _require_legacy_session_runtime(self) -> None:
-        """Reject selected PostgreSQL before ACP session or provider side effects.
+    def _selected_postgresql(self) -> bool:
+        """True when the active profile selected the PostgreSQL state store.
 
-        ACP's persistence contract still depends on SessionDB features that the
-        bounded PostgreSQL state store does not implement. Do not turn that
-        explicit selection into an in-memory or SQLite-backed ACP session.
+        Resolves the same merged config ``_make_agent`` loads, so an override
+        home is honored. Reads never open ``state.db``; a misconfigured
+        state-store section raises ``StateStoreConfigurationError`` (fail-closed)
+        rather than degrading to SQLite.
         """
+        from hermes_cli.config import load_config
+        from state_store import resolve_state_store_config
+
+        # Fail-closed: a malformed state_store section raises rather than
+        # degrading to the SQLite path. An injected SessionDB does not override
+        # the check — the refusal boundary must not depend on call order.
+        return resolve_state_store_config(load_config() or {}).backend == "postgresql"
+
+    def _selected_store(self):
+        """Open the CLI session-store facade once for a selected PostgreSQL runtime.
+
+        Cached exactly like ``_db_instance``: acquisition is not free, and ACP
+        must hold one store handle per process instead of reopening per turn.
+        The facade is the same bounded contract the CLI uses — it implements
+        the ACP persistence surface (ensure/create_session, get_session,
+        update_session_meta, replace_messages(active_only=...),
+        get_messages_as_conversation(repair_alternation=...)) or rejects
+        loudly; it never falls back to opening SQLite ``state.db``.
+        """
+        if self._pg_store_instance is None:
+            from cli_session_store import open_cli_session_store
+            from hermes_cli.config import load_config
+
+            self._pg_store_instance = open_cli_session_store(load_config() or {})
+        return self._pg_store_instance
+
+    def _require_legacy_session_runtime(self) -> bool:
+        """Bound the persistence boundary by backend.
+
+        Legacy SQLite runtime: unchanged — the typed refusal guard runs before
+        any session or provider side effect, and the caller proceeds on the
+        shared SessionDB. Selected PostgreSQL (ACP S2): the guard is skipped and
+        the manager dispatches to the PostgreSQL CLI session-store facade
+        instead of refusing; ``True`` tells the call sites to route there.
+        """
+        if self._selected_postgresql():
+            return True
         require_legacy_state_db_runtime(home=get_hermes_home())
+        return False
 
     def _get_db(self):
-        """Lazily acquire the process-shared SessionDB in a legacy SQLite runtime.
+        """Lazily acquire the persistence handle for the active backend.
 
-        A selected PostgreSQL profile is a typed refusal, never an in-memory
-        continuation or a fallback ``state.db`` opener.  The registry handle is
-        the one in-process tools also acquire, so ACP keeps one state-db writer.
+        Selected PostgreSQL dispatches to the CLI session-store facade
+        (``_selected_store``); a selected profile must never open or create a
+        fallback ``state.db``. Legacy SQLite keeps the process-shared registry
+        handle — the one in-process tools also acquire, so ACP keeps one
+        state-db writer.
         """
-        self._require_legacy_session_runtime()
+        if self._require_legacy_session_runtime():
+            return self._selected_store()
         if self._db_instance is None:
             try:
                 from hermes_state_registry import acquire
