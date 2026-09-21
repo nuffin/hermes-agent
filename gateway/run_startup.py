@@ -37,6 +37,17 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("gateway.run")
 
 
+def _selected_delivery_ledger_or_none() -> Any:
+    """Resolve the runtime-selected delivery ledger, or None when SQLite is selected or the
+    selection is unavailable (best-effort: callers fall back to the SQLite module path)."""
+    try:
+        from gateway.delivery_ledger_adapter import selected_delivery_ledger
+        return selected_delivery_ledger()
+    except Exception:
+        logger.debug("selected delivery ledger unavailable", exc_info=True)
+        return None
+
+
 class GatewayStartupMixin:
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
@@ -313,8 +324,10 @@ class GatewayStartupMixin:
                 _deliverable_targets.update((_pval(p), None) for p in self.adapters)
             for _profile, _adapters in _profile_adapters.items():
                 _deliverable_targets.update((_pval(p), _profile) for p in _adapters)
+            _ledger = _selected_delivery_ledger_or_none()
+            _sweep = _ledger.sweep_recoverable if _ledger is not None else sweep_recoverable
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None,
+                _sweep, None,
                 deliverable_platforms={platform for platform, _ in _deliverable_targets},
                 deliverable_targets=_deliverable_targets,
             )
@@ -336,9 +349,13 @@ class GatewayStartupMixin:
         flood-refused row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the
         release re-stamps ``updated_at``, so it waits the platform's figure once more); else
         ``send_path_degraded``."""
-        from gateway.delivery_ledger import release_runtime_claim
+        _ledger = _selected_delivery_ledger_or_none()
         try:
-            await asyncio.to_thread(release_runtime_claim, receipt, error)
+            if _ledger is not None:
+                await asyncio.to_thread(_ledger.release_runtime_claim, receipt, error)
+            else:
+                from gateway.delivery_ledger import release_runtime_claim
+                await asyncio.to_thread(release_runtime_claim, receipt, error)
         except Exception:
             logger.debug(log_fmt, getattr(receipt, "obligation_id", receipt), exc_info=True)
 
@@ -391,8 +408,13 @@ class GatewayStartupMixin:
 
     async def _arm_flood_timers_for_waiting_rows(self) -> None:
         """Recover adopted, newly refused/rejected and unsent released rows without blocking the loop."""
-        from gateway.delivery_ledger import pending_retries
-        for row in await asyncio.to_thread(pending_retries):
+        _ledger = _selected_delivery_ledger_or_none()
+        if _ledger is not None:
+            _pending = _ledger.pending_retries
+        else:
+            from gateway.delivery_ledger import pending_retries
+            _pending = pending_retries
+        for row in await asyncio.to_thread(_pending):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
@@ -406,6 +428,9 @@ class GatewayStartupMixin:
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
+        _ledger = _selected_delivery_ledger_or_none()
+        _mark_delivered = _ledger.mark_delivered if _ledger is not None else mark_delivered
+        _mark_failed = _ledger.mark_failed if _ledger is not None else mark_failed
         redelivered = 0
         for row in claimed:
             if row.get("adopted"):
@@ -426,7 +451,7 @@ class GatewayStartupMixin:
                 result = None
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["receipt"])
+                    await asyncio.to_thread(_mark_delivered, row["receipt"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
@@ -434,7 +459,7 @@ class GatewayStartupMixin:
                     )
                 else:
                     await asyncio.to_thread(
-                        mark_failed, row["receipt"], str(getattr(result, "error", "") or "send failed")
+                        _mark_failed, row["receipt"], str(getattr(result, "error", "") or "send failed")
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
@@ -484,7 +509,9 @@ class GatewayStartupMixin:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
+            _ledger = _selected_delivery_ledger_or_none()
+            _sweep = _ledger.sweep_failed_for_runtime if _ledger is not None else sweep_failed_for_runtime
+            claimed = await asyncio.to_thread(_sweep, platform.value, profile=profile)
         except Exception:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,

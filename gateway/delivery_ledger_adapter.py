@@ -1,11 +1,16 @@
-"""Backend-neutral gateway delivery-ledger port and explicit factories.
+"""Backend-neutral gateway delivery-ledger port, factories, and runtime selector.
 
-Nothing imports this module merely because ``state_store.backend`` is PostgreSQL.
-Callers must explicitly inject the returned ledger into the one bounded final
-delivery consumer; gateway startup/session routing remains deliberately untouched.
+``selected_delivery_ledger`` resolves the active state-store backend and returns the
+matching ledger: ``None`` for SQLite (the gateway keeps its legacy module path), or a
+configured PostgreSQL ledger otherwise. A PostgreSQL selection with a missing/unreachable
+DSN raises instead of silently degrading to SQLite. Every other entry point here is an
+explicit factory whose caller controls lifetime and injection; importing this module
+never opens a database.
 """
 from __future__ import annotations
 from typing import Any, Protocol, cast, runtime_checkable
+
+from hermes_constants import get_hermes_home
 
 
 @runtime_checkable
@@ -57,6 +62,33 @@ def open_configured_delivery_ledger(config: dict[str, Any], *, secret_lookup=Non
             pool_max_size=resolved.postgresql.pool_max_size,
         ), **kwargs,
     ))
+
+
+_SELECTED_LEDGER_CACHE: dict[str, DeliveryLedger | None] = {}
+
+
+def selected_delivery_ledger() -> DeliveryLedger | None:
+    """Resolve the runtime delivery ledger from the selected state-store backend.
+
+    ``None`` means SQLite is selected and the gateway keeps its legacy module path.
+    Otherwise the configured PostgreSQL ledger is opened (and cached per Hermes home),
+    raising on a missing or unreachable DSN rather than degrading to SQLite.
+    """
+    home = str(get_hermes_home())
+    if home in _SELECTED_LEDGER_CACHE:
+        return _SELECTED_LEDGER_CACHE[home]
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except Exception:
+        config = {}
+    from state_store import resolve_state_store_config
+    if resolve_state_store_config(config).backend == "sqlite":
+        result: DeliveryLedger | None = None
+    else:
+        result = open_configured_delivery_ledger(config)
+    _SELECTED_LEDGER_CACHE[home] = result
+    return result
 
 
 class SqliteDeliveryLedger:
