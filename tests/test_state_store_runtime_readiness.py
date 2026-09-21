@@ -93,8 +93,10 @@ def test_selected_postgresql_profile_fails_before_state_db_open_and_reports_tena
     assert "contextual-session-search-contract" not in report.missing_capabilities
     assert "gateway-session-routing-transcript" in report.supported_capabilities
     assert "acp-session-transcript-lifecycle" in report.supported_capabilities
+    assert "gateway-delivery-ledger-routing" in report.supported_capabilities
+    assert "async-delegation-ledger-routing" in report.supported_capabilities
     assert "tui-api-session-runtime" in report.missing_capabilities
-    assert "gateway-delivery-ledger-routing" in report.missing_capabilities
+    assert "cron-session-transcript-lifecycle" in report.missing_capabilities
     assert report.raw_state_db_openers
     assert events == []
     assert not (profile_home / "state.db").exists()
@@ -125,7 +127,7 @@ def test_selected_postgresql_async_dispatch_refuses_before_runner_or_state_db_si
                     goal="must not run", context=None, toolsets=None, role="leaf", model=None,
                     session_key="", runner=lambda: runner_calls.append("called") or {"status": "completed"},
                 )
-        assert "async-delegation-ledger-routing" in caught.value.report.missing_capabilities
+        assert "async-delegation-ledger-routing" in caught.value.report.supported_capabilities
         assert runner_calls == []
         assert events == []
         assert not (home / "state.db").exists()
