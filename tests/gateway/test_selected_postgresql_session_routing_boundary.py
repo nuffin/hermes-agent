@@ -44,17 +44,24 @@ def _assert_no_gateway_artifacts(home: Path, sessions_dir: Path) -> None:
     assert list(sessions_dir.glob("*.jsonl")) == [] if sessions_dir.exists() else True
 
 
-def test_selected_postgresql_session_store_refuses_before_route_or_durable_artifacts(tmp_path, monkeypatch):
+def test_selected_postgresql_session_store_succeeds_then_fails_closed_on_route(tmp_path, monkeypatch):
     home = _selected_pg_home(tmp_path, monkeypatch)
     sessions_dir = home / "sessions"
 
+    # The constructor must succeed under selected PG without probing or opening
+    # a root/profile state.db: the legacy SessionDB open is skipped.
     with trap_state_db_opens(home) as opens:
-        with pytest.raises(PostgreSQLRuntimeActivationError) as caught:
-            SessionStore(sessions_dir, GatewayConfig())
+        store = SessionStore(sessions_dir, GatewayConfig())
+        assert opens == []
 
-    assert "gateway-session-routing-transcript" in caught.value.report.missing_capabilities
-    assert caught.value.report.profile_home == str(home.resolve())
-    assert "postgresql://" not in str(caught.value)
+    # Route resolution connects to the selected PG store; an unreachable server
+    # fails closed with the typed connection error instead of a SQLite fallback.
+    from psycopg import OperationalError
+
+    with trap_state_db_opens(home) as opens:
+        with pytest.raises(OperationalError):
+            store.get_or_create_session(_source())
+
     assert opens == []
     _assert_no_gateway_artifacts(home, sessions_dir)
 
@@ -115,8 +122,10 @@ def test_selected_named_profile_never_falls_back_to_root_sqlite_when_postgresql_
                 store.rewrite_transcript("must-not-rewrite", [])
             with pytest.raises(PostgreSQLRuntimeActivationError):
                 store.rewind_session("must-not-rewind")
-            with pytest.raises(PostgreSQLRuntimeActivationError):
-                store.recover_interrupted_turns()
+            # Lifecycle recovery walks the legacy in-memory index, which is empty
+            # under selected PG (routes live in the PG table): a clean no-op with
+            # zero state.db/sessions.json side effects.
+            assert store.recover_interrupted_turns() == 0
     finally:
         reset_hermes_home_override(token)
 
