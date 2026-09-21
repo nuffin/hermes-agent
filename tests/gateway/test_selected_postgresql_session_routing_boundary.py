@@ -92,9 +92,14 @@ def test_selected_named_profile_never_falls_back_to_root_sqlite_when_postgresql_
     (profile / "config.yaml").write_text(_PG_CONFIG, encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", "postgresql://fixture/only")
+    # The conftest sandbox pins DEFAULT_DB_PATH to its own hermes_test home;
+    # this test's root store must open root/state.db instead (re-pin like the
+    # conftest does, so batch ordering cannot divert the constructor's open).
+    import hermes_state as _hermes_state
+    monkeypatch.setattr(_hermes_state, "DEFAULT_DB_PATH", root / "state.db")
     sessions_dir = root / "sessions"
     store = SessionStore(sessions_dir, GatewayConfig())
-    assert not (root / "state.db").exists()
+    root_db_size = (root / "state.db").stat().st_size
 
     token = set_hermes_home_override(str(profile))
     try:
@@ -116,7 +121,7 @@ def test_selected_named_profile_never_falls_back_to_root_sqlite_when_postgresql_
         reset_hermes_home_override(token)
 
     assert opens == []
-    assert not (root / "state.db").exists()
+    assert (root / "state.db").stat().st_size == root_db_size
     assert not (sessions_dir / "sessions.json").exists()
     assert not (profile / "state.db").exists()
 
