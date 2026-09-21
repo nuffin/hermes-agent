@@ -2,7 +2,7 @@
 
 ## Status
 
-This is the approved target architecture. The first functional session/message slice now provides a backend-selected factory, an unchanged SQLite adapter, and a PostgreSQL 18 integration implementation with a bounded internal pool, migration metadata, and capability probe. SQLite remains the default and existing installations continue to use it unchanged. PostgreSQL cannot be selected for production until phases 6–13 have supplied complete schema, consumer, migration, rollback, and runtime evidence.
+This is the approved target architecture. The first functional session/message slice now provides a backend-selected factory, an unchanged SQLite adapter, and a PostgreSQL 14+ integration implementation with a bounded internal pool, migration metadata, and capability probe. SQLite remains the default and existing installations continue to use it unchanged. PostgreSQL cannot be selected for production until phases 6–13 have supplied complete schema, consumer, migration, rollback, and runtime evidence.
 
 ## Boundary
 
@@ -29,7 +29,7 @@ There is no global-to-profile inheritance beyond Hermes’s existing profile con
 
 ## PostgreSQL topology and semantics
 
-The initial support target is PostgreSQL 18 with pgvector image `pgvector/pgvector:pg18`; `pg_trgm` and `vector` are capability-probed extensions. `vector` is available for future semantic indexes but is not a substitute for FTS semantics. `pg_trgm` is optional and its absence must select a documented bounded fallback rather than silently claim CJK/substring equivalence.
+The minimum supported server is PostgreSQL 14; the integration fixture targets PostgreSQL 18 with pgvector image `pgvector/pgvector:pg18`; `pg_trgm` and `vector` are capability-probed extensions. `vector` is available for future semantic indexes but is not a substitute for FTS semantics. `pg_trgm` is optional and its absence must select a documented bounded fallback rather than silently claim CJK/substring equivalence.
 
 Hermes uses one PostgreSQL instance. The active `HERMES_HOME` is resolved once with the canonical `profile_name_for_home()` resolver; the fixed legacy `hermes_state_store_slice` schema is the root/default compatibility namespace, and every named profile maps to a deterministic `hermes_state_store_tenant_<sha256>` schema derived from its canonical home and canonical profile identity. These schemas are logical namespaces and accidental-mixing protection, not mandatory product authorization barriers. Default calls remain profile-local. An explicit user-directed target-profile resolver may deliberately select and read that profile's namespace. Existing shared fixed-schema rows are not attributed or backfilled: operators must explicitly audit/export them before moving a formerly shared target to named-profile namespace routing.
 

@@ -175,8 +175,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{self._schema}:migration",))
                 cursor.execute("SHOW server_version_num")
                 version = int(cursor.fetchone()[0])
-                if version < 180000:
-                    raise StateStoreConfigurationError("PostgreSQL State Store requires PostgreSQL 18 or newer")
+                if version < 140000:
+                    raise StateStoreConfigurationError("PostgreSQL State Store requires PostgreSQL 14 or newer")
 
                 cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
