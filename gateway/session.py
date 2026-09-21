@@ -835,7 +835,18 @@ class SessionStore(
         except Exception:
             self._routing_home = None
         # Selected PostgreSQL route authority must not probe or create legacy state.db.
-        if self._postgresql_route_store() is None:
+        # Resolve via the lightweight backend check, not the full route-store open:
+        # opening the PG store would connect to the server, which __init__ must not
+        # require (an unreachable PG server is a per-route failure, not a constructor
+        # failure — and probing it here made named-profile tests open root state.db
+        # via the fallback path when the connection raised).
+        try:
+            from hermes_cli.config import load_config
+            from state_store import resolve_state_store_config
+            _selected_postgresql = resolve_state_store_config(load_config() or {}).backend == "postgresql"
+        except Exception:
+            _selected_postgresql = False
+        if not _selected_postgresql:
             self._open_session_db_for_active_scope()
 
     def _lazy(self, name: str, factory):
