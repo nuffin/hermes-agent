@@ -177,6 +177,88 @@ class PostgreSQLDeliveryLedger:
                 if new: claimed.append({'obligation_id':oid,'receipt':common.DeliveryReceipt(oid,int(new[0])),'session_key':sk,'platform':platform,'chat_id':chat,'thread_id':thread,'content':content,'profile':profile,'attempts':attempts+1,'needs_marker':state!='pending'})
         return claimed
 
+    def pending_retries(self, now: float | None = None) -> list[dict[str, Any]]:
+        """This process's failed rows that still await redelivery, one entry per adapter identity
+        with the earliest deadline (``not_before``), mirroring the SQLite runtime timer's list."""
+        now = now if now is not None else time.time()
+        installation, host, generation, pid, started = self._owner()
+        if started is None:
+            return []
+        with self._transaction() as cur:
+            cur.execute("""SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
+                FROM delivery_obligations
+                WHERE state='failed' AND owner_installation_id=%s AND owner_host=%s AND owner_generation=%s
+                  AND owner_pid=%s AND owner_started_at IS NOT DISTINCT FROM %s""",
+                (installation, host, generation, pid, started))
+            rows = cur.fetchall()
+        earliest: dict[tuple[str, str], float] = {}
+        for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
+            if common.is_reconnect_only(last_error):
+                continue
+            due = common.retry_not_before(updated_at, last_error, attempts)
+            if due is None or attempts >= common.MAX_ATTEMPTS or (now - created_at) > common.STALE_AFTER_SECONDS:
+                continue
+            key = (platform, adapter_profile or "default")
+            if key not in earliest or due < earliest[key]:
+                earliest[key] = due
+        return [{"platform": platform, "profile": profile, "not_before": due}
+                for (platform, profile), due in sorted(earliest.items())]
+
+    def sweep_failed_for_runtime(self, platform: str, now: float | None = None, *,
+                                 profile: str | None = None) -> list[dict[str, Any]]:
+        """Claim this process's failed rows due for another send on one adapter, mirroring the
+        SQLite runtime reconnect sweep (``None`` profile = default/primary adapter)."""
+        now = now if now is not None else time.time()
+        installation, host, generation, pid, started = self._owner()
+        if started is None:
+            return []
+        expected_profile = "default" if not profile or profile == "default" else str(profile)
+        claimed: list[dict[str, Any]] = []
+        with self._transaction() as cur:
+            cur.execute("""SELECT obligation_id, session_key, platform, chat_id, thread_id, content,
+                          attempts, created_at, last_error, adapter_profile, updated_at, delivery_fence
+                   FROM delivery_obligations
+                   WHERE state='failed' AND platform=%s AND owner_installation_id=%s AND owner_host=%s
+                     AND owner_generation=%s AND owner_pid=%s AND owner_started_at IS NOT DISTINCT FROM %s""",
+                (platform, installation, host, generation, pid, started))
+            for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
+                 last_error, adapter_profile, updated_at, fence) in cur.fetchall():
+                if adapter_profile != expected_profile:
+                    continue
+                due = common.retry_not_before(updated_at, last_error, attempts)
+                if due is None:
+                    continue
+                if attempts >= common.MAX_ATTEMPTS or (now - created_at) > common.STALE_AFTER_SECONDS:
+                    cur.execute("""UPDATE delivery_obligations SET state='abandoned',
+                        updated_at=extract(epoch from clock_timestamp())
+                        WHERE obligation_id=%s AND state='failed' AND delivery_fence=%s
+                          AND owner_installation_id=%s AND owner_host=%s AND owner_generation=%s
+                          AND owner_pid=%s AND owner_started_at IS NOT DISTINCT FROM %s""",
+                        (oid, fence, installation, host, generation, pid, started))
+                    continue
+                if now < due:
+                    continue
+                cur.execute("""UPDATE delivery_obligations SET state='attempting', attempts=attempts+1,
+                    delivery_fence=delivery_fence+1, updated_at=extract(epoch from clock_timestamp()),
+                    last_error=NULL, lease_expires_at=extract(epoch from clock_timestamp())+%s
+                    WHERE obligation_id=%s AND state='failed' AND delivery_fence=%s
+                      AND owner_installation_id=%s AND owner_host=%s AND owner_generation=%s
+                      AND owner_pid=%s AND owner_started_at IS NOT DISTINCT FROM %s
+                    RETURNING delivery_fence""",
+                    (self._settings.lease_seconds, oid, fence, installation, host, generation, pid, started))
+                new = cur.fetchone()
+                if new:
+                    marker = common.FLOOD_MARKER if common.is_flood_error(last_error) else common.RECONNECTED_MARKER
+                    row = {'obligation_id': oid, 'receipt': common.DeliveryReceipt(oid, int(new[0])),
+                           'session_key': session_key, 'platform': row_platform, 'chat_id': chat_id,
+                           'thread_id': thread_id, 'content': content, 'needs_marker': True,
+                           'marker': marker, 'profile': adapter_profile or 'default',
+                           'runtime_recovery': True, 'attempts': attempts + 1}
+                    if last_error:
+                        row['last_error'] = last_error
+                    claimed.append(row)
+        return claimed
+
     def prune(self, now: float | None=None) -> None:
         with self._transaction() as cur:
             cur.execute("DELETE FROM delivery_obligations WHERE state IN ('delivered','abandoned') AND updated_at < extract(epoch from clock_timestamp())-%s", (common._RETENTION_SECONDS,))
