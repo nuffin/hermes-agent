@@ -31,6 +31,7 @@ _ISOLATED_SCHEMA_RE = re.compile(r"^hermes_state_store_tenant_[0-9a-f]{32}$")
 _SUPPORTED_OBJECTS = (
     "system_prompts",
     "sessions",
+    "session_topics",
     "messages",
     "session_model_usage",
     "conversation_generations",
@@ -553,6 +554,14 @@ class SQLitePostgreSQLSandboxImporter:
             )
         if fail_after == "sessions":
             raise RuntimeError("injected interruption")
+        topic_columns = (
+            "id", "session_id", "title", "summary", "state", "message_count", "created_at", "last_active_at",
+        )
+        for row in self._rows(source, "session_topics"):
+            cursor.execute(
+                f"INSERT INTO {qschema}.session_topics ({', '.join(topic_columns)}) OVERRIDING SYSTEM VALUE VALUES ({', '.join(['%s'] * len(topic_columns))})",
+                [row[column] for column in topic_columns],
+            )
         message_columns = (
             "id",
             "session_id",
@@ -578,6 +587,7 @@ class SQLitePostgreSQLSandboxImporter:
             "api_content",
             "display_kind",
             "display_metadata",
+            "topic_id",
         )
         for row in self._rows(source, "messages"):
             values = [
@@ -656,6 +666,14 @@ class SQLitePostgreSQLSandboxImporter:
             f"SELECT setval(%s::regclass, COALESCE((SELECT max(id) FROM {qschema}.messages), 1), (SELECT count(*) > 0 FROM {qschema}.messages))",
             (sequence,),
         )
+        cursor.execute(
+            f"SELECT pg_get_serial_sequence(%s, 'id')", (f"{self._schema}.session_topics",)
+        )
+        topic_sequence = cursor.fetchone()[0]
+        cursor.execute(
+            f"SELECT setval(%s::regclass, COALESCE((SELECT max(id) FROM {qschema}.session_topics), 1), (SELECT count(*) > 0 FROM {qschema}.session_topics))",
+            (topic_sequence,),
+        )
 
     def import_source(
         self,
@@ -720,6 +738,13 @@ class SQLitePostgreSQLSandboxImporter:
                     if int(cursor.fetchone()[0]):
                         raise SQLitePostgreSQLImportError(
                             "SQLite import invariant failed: orphan messages"
+                        )
+                    cursor.execute(
+                        f"SELECT count(*) FROM {_quote(self._schema)}.messages m LEFT JOIN {_quote(self._schema)}.session_topics t ON t.id=m.topic_id WHERE m.topic_id IS NOT NULL AND t.id IS NULL"
+                    )
+                    if int(cursor.fetchone()[0]):
+                        raise SQLitePostgreSQLImportError(
+                            "SQLite import invariant failed: orphan topics"
                         )
                     cursor.execute(
                         f"SELECT count(*) FROM {_quote(self._schema)}.session_model_usage u LEFT JOIN {_quote(self._schema)}.sessions s ON s.id=u.session_id WHERE s.id IS NULL"
