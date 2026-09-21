@@ -30,10 +30,10 @@ _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 _REQUIRED_TABLES = (
     "schema_migrations", "sessions", "messages", "system_prompts", "session_model_usage",
     "conversation_generations", "session_runtime_owners", "session_runtime_turns",
-    "compression_locks", "session_turn_leases",
+    "compression_locks", "session_turn_leases", "session_topics",
 )
-# Tracks the state_store_postgresql schema ledger through _GATEWAY_TRANSCRIPT_SCHEMA_VERSION (25).
-_REQUIRED_MIGRATIONS = tuple(range(1, 26))
+# Tracks the state_store_postgresql schema ledger through _SESSION_TOPICS_SCHEMA_VERSION (26).
+_REQUIRED_MIGRATIONS = tuple(range(1, 27))
 _OPTIMIZE_TABLES = _REQUIRED_TABLES
 _OPTIMIZE_STATEMENT_TIMEOUT_MS = 30_000
 _OPTIMIZE_LOCK_TIMEOUT_MS = 2_000
