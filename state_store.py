@@ -74,6 +74,7 @@ class MessageRecord:
     api_content: str | None = None
     display_kind: str | None = None
     display_metadata: dict[str, Any] | None = None
+    topic_id: int | None = None
 
 
 class ContextualSessionSearchStore(Protocol):
