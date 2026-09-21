@@ -114,9 +114,9 @@ class PostgreSQLAsyncDelegationLedger:
                 cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                             (f"{self._schema}:async-delegation-migration",))
                 cur.execute("SHOW server_version_num")
-                if int(cur.fetchone()[0]) < 180000:
+                if int(cur.fetchone()[0]) < 140000:
                     raise AsyncDelegationLedgerConfigurationError(
-                        "PostgreSQL async-delegation ledger requires PostgreSQL 18 or newer")
+                        "PostgreSQL async-delegation ledger requires PostgreSQL 14 or newer")
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
                 cur.execute(
                     f"CREATE TABLE IF NOT EXISTS {self._schema}.async_delegation_schema_migrations "

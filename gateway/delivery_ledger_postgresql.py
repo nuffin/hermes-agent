@@ -89,8 +89,8 @@ class PostgreSQLDeliveryLedger:
             with connection.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{self._schema}:delivery-migration",))
                 cur.execute("SHOW server_version_num")
-                if int(cur.fetchone()[0]) < 180000:
-                    raise DeliveryLedgerConfigurationError("PostgreSQL DeliveryLedger requires PostgreSQL 18 or newer")
+                if int(cur.fetchone()[0]) < 140000:
+                    raise DeliveryLedgerConfigurationError("PostgreSQL DeliveryLedger requires PostgreSQL 14 or newer")
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
                 cur.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.delivery_schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cur.execute(f"SELECT version FROM {self._schema}.delivery_schema_migrations")
