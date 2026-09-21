@@ -37,6 +37,7 @@ _RUNTIME_SOURCE_PATHS = (
     "cron/scheduler.py",
     "tui_gateway/server.py",
     "tui_gateway/methods_session.py",
+    "tui_gateway/methods_profiles.py",
     "tui_gateway/compute_host.py",
     "tui_gateway/session_workdir.py",
     "gateway/platforms/api_server.py",

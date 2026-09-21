@@ -83,6 +83,17 @@ def test_branch_build_agent_foreign_selected_pg_raises_typed(homes):
     assert not (foreign / "state.db").exists()
 
 
+def test_profiles_list_marks_selected_pg_sessions_unavailable(homes):
+    """Roster marks the selected-PG profile's session fields, never silent-empty."""
+    launch, foreign = homes
+    rows = srv._methods["profiles.list"](1, {})["result"]["profiles"]
+    row = next(p for p in rows if p["name"] == "selected-pg")
+    flagged = row.get("sessions_unavailable")
+    assert flagged, "selected-PG roster row must flag session fields unavailable"
+    assert "tui-api-session-runtime" in (flagged.get("missing_capabilities") or [])
+    assert not (foreign / "state.db").exists()
+
+
 def test_profiles_list_sqlite_profile_still_resolves(homes):
     """The guard is per-profile: the SQLite launch profile keeps full fields."""
     launch, _ = homes
