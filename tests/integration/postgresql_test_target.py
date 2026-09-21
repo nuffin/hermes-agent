@@ -18,6 +18,7 @@ import pytest
 TEST_DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
 _SCHEMA_PREFIX = "hermes_state_store_tenant_"
 _DELIVERY_PREFIX = "hermes_delivery_ledger_tenant_"
+_ASYNC_PREFIX = "hermes_async_delegation_tenant_"
 _MARKER_TABLE = "__hermes_owned_test_target"
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -63,7 +64,7 @@ class OwnedPostgreSQLTestTarget:
         return self
 
     def verify(self) -> None:
-        if self._closed or self.prefix not in {_SCHEMA_PREFIX, _DELIVERY_PREFIX} or len(self.identity) != 32:
+        if self._closed or self.prefix not in {_SCHEMA_PREFIX, _DELIVERY_PREFIX, _ASYNC_PREFIX} or len(self.identity) != 32:
             raise PostgreSQLTestTargetOwnershipError("target is not an active fixture-created UUID target")
         try:
             uuid.UUID(hex=self.identity)
@@ -124,6 +125,15 @@ def postgresql_test_target() -> Generator[OwnedPostgreSQLTestTarget, None, None]
 @pytest.fixture
 def postgresql_delivery_target() -> OwnedPostgreSQLTestTarget:
     target = OwnedPostgreSQLTestTarget(TEST_DSN, prefix=_DELIVERY_PREFIX).allocate()
+    try:
+        yield target
+    finally:
+        target.drop()
+
+
+@pytest.fixture
+def postgresql_async_delegation_target() -> OwnedPostgreSQLTestTarget:
+    target = OwnedPostgreSQLTestTarget(TEST_DSN, prefix=_ASYNC_PREFIX).allocate()
     try:
         yield target
     finally:
