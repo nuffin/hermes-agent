@@ -116,6 +116,24 @@ class PostgreSQLCLISessionStore:
                 "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(kwargs)))
         return self._store.append_message_records(session_id, [self._record(message) for message in messages])
 
+    def create_topic(self, session_id: str, title: str, summary: Any = None) -> int:
+        return self._store.create_topic(session_id, title, summary)
+
+    def get_topics(self, session_id: str) -> list[dict[str, Any]]:
+        return self._store.get_topics(session_id)
+
+    def get_active_topic(self, session_id: str) -> dict[str, Any] | None:
+        return self._store.get_active_topic(session_id)
+
+    def set_active_topic(self, session_id: str, topic_id: int) -> bool:
+        return self._store.set_active_topic(session_id, topic_id)
+
+    def update_topic_message_count(self, topic_id: int, count_delta: int = 1) -> None:
+        return self._store.update_topic_message_count(topic_id, count_delta)
+
+    def get_topic_messages(self, session_id: str, topic_id: int, include_inactive: bool = False) -> list[dict[str, Any]]:
+        return self._store.get_topic_messages(session_id, topic_id, include_inactive=include_inactive)
+
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
         """Replace the session's model config (and fill a missing model) after queued usage is durable.
 
