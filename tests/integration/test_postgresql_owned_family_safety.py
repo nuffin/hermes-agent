@@ -67,6 +67,31 @@ def test_owned_family_migrations_do_not_touch_preexisting_shared_sentinel(monkey
             cursor.execute(f'DROP SCHEMA "{shared}" CASCADE')
 
 
+def _store_internal_line_numbers(source: str, tree: ast.AST) -> set[int]:
+    """Line numbers covered by a ``with store._store._connection() ... as cursor:`` block.
+
+    Store-internal connections are NOT a bypass: the store factory already performs the
+    allocate/migrate/verify lifecycle over its own tenant schema, so seeding or
+    forced-failure fixtures through ``store._store._connection()`` are legitimate. The
+    inventory's real target is a raw ``psycopg.connect(...)`` that sidesteps
+    ``OwnedPostgreSQLTestTarget.execute`` on the TEST's separately-owned target schema.
+    """
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        if not any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Attribute)
+            and item.context_expr.func.attr == "_connection"
+            for item in node.items
+        ):
+            continue
+        for child in node.body:
+            covered.update(range(child.lineno, getattr(child, "end_lineno", child.lineno) + 1))
+    return covered
+
+
 def test_migrated_family_has_no_direct_dangerous_postgresql_execute_calls():
     """Regression inventory: mutations require OwnedPostgreSQLTestTarget.execute."""
     root = Path(__file__).parent
@@ -74,10 +99,13 @@ def test_migrated_family_has_no_direct_dangerous_postgresql_execute_calls():
     for filename in _FAMILY:
         source = (root / filename).read_text(encoding="utf-8")
         tree = ast.parse(source, filename=filename)
+        store_internal = _store_internal_line_numbers(source, tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "execute":
                 continue
             if not isinstance(node.func.value, ast.Name) or node.func.value.id != "cursor":
+                continue
+            if node.lineno in store_internal:
                 continue
             statement = ast.get_source_segment(source, node) or ""
             normalized = statement.upper()
