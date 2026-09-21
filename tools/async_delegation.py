@@ -125,6 +125,16 @@ def _transaction():
     return transaction(_connect())
 
 
+def _selected_async_delegation_ledger():
+    """Resolve the runtime async-delegation ledger, or None when SQLite is selected.
+
+    None keeps the legacy state.db module path below. A selected-PG profile with a
+    missing or unreachable DSN raises typed here (never a silent SQLite fallback);
+    the result is cached per Hermes home inside the resolver."""
+    from tools.async_delegation_ledger_adapter import selected_async_delegation_ledger
+    return selected_async_delegation_ledger()
+
+
 def _capture_routing_origin() -> Dict[str, Any]:
     """Snapshot scope_id/user_id/user_name on the PARENT thread (the daemon worker
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
@@ -137,6 +147,11 @@ def _capture_routing_origin() -> Dict[str, Any]:
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        ledger.persist_dispatch(record)
+        _prune_durable_records()
+        return
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -162,6 +177,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 def _prune_durable_records() -> None:
     """Bound terminal history, preferring delivered records for deletion."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.prune_durable_records()
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -186,6 +204,9 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.persist_completion(event, result)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
@@ -201,6 +222,10 @@ def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
     result at finalize); ``recover_abandoned_delegations`` replays it. Best-effort: a failed write costs recovery
     fidelity, never the live result."""
     try:
+        ledger = _selected_async_delegation_ledger()
+        if ledger is not None:
+            ledger.record_unit_child(delegation_id, entry)
+            return
         with _DB_LOCK, _transaction() as conn:
             row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state='running'",
                                (delegation_id,)).fetchone()
@@ -228,6 +253,9 @@ def _recovered_results(task: Dict[str, Any], result_json: Optional[str], error: 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
     recorded (``record_unit_child``) are replayed with their real results."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.recover_abandoned_delegations()
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
@@ -282,6 +310,9 @@ def restore_undelivered_completions(target_queue) -> int:
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
     (#64484).
     """
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.restore_undelivered_completions(target_queue)
     recover_abandoned_delegations()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
@@ -316,6 +347,9 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.mark_completion_delivered(delegation_id)
     now = time.time()
     return _update_delivery(
         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
@@ -324,6 +358,9 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.claim_completion_delivery(delegation_id, claim_id)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
@@ -360,6 +397,9 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Release a failed delivery claim so another consumer may retry. Attempts are
     counted at claim time; once the budget is exhausted the row converges to
     terminal ``dropped`` (only pending rows replay on restart)."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.release_completion_delivery(delegation_id, claim_id)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
@@ -381,6 +421,9 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Return an unadmitted completion to pending without spending a delivery attempt."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.defer_completion_delivery(delegation_id, claim_id)
     return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
                   delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
                   updated_at=?
@@ -393,6 +436,9 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     spawning session ended at an explicit user boundary such as /new or reset).
     ``dropped`` — not ``delivered`` — keeps the ack honest; not ``pending`` keeps
     restart recovery from replaying it into a fail-closed drop forever."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.drop_completion_delivery(delegation_id, claim_id)
     return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
@@ -402,6 +448,9 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.complete_completion_delivery(delegation_id, claim_id)
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                   delivered_at=?, updated_at=?, delivery_claim=NULL,
@@ -424,6 +473,9 @@ def _event_delivery(fn, evt: Dict[str, Any], claim_id: str) -> None:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.get_durable_delegation(delegation_id)
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
