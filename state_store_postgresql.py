@@ -2368,7 +2368,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata"
+            "active, compacted, api_content, display_kind, display_metadata, topic_id"
         )
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(f"SELECT {columns} FROM {self._schema}.messages WHERE session_id = %s AND active ORDER BY id", (session_id,))
@@ -2397,7 +2397,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata"
+            "active, compacted, api_content, display_kind, display_metadata, topic_id"
         )
         cursor.execute(
             f"SELECT {columns} FROM {self._schema}.messages "
