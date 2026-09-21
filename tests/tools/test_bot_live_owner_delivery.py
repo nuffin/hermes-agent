@@ -54,7 +54,7 @@ def test_selected_postgresql_mailbox_entrypoints_refuse_before_sqlite_or_receipt
         for entrypoint in entrypoints:
             with pytest.raises(PostgreSQLRuntimeActivationError) as caught:
                 entrypoint()
-            assert "gateway-delivery-ledger-routing" in caught.value.report.missing_capabilities
+            assert "tui-api-session-runtime" in caught.value.report.missing_capabilities
 
     assert opens == []
     assert not mailbox_root.exists()
