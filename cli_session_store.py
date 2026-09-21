@@ -108,12 +108,53 @@ class PostgreSQLCLISessionStore:
                 "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(kwargs)))
         return self._store.append_message_records(session_id, [self._record(message) for message in messages])
 
+    def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
+        """Replace the session's model config (and fill a missing model) after queued usage is durable.
+
+        ACP's persistence path calls this on every turn save
+        (acp_adapter/session.py:336) with ``json.dumps(meta)`` and the live model
+        string, so the passthrough must preserve the underlying argument shape.
+        """
+        return self._store.update_session_meta(session_id, model_config_json, model)
+
+    def replace_messages(self, session_id: str, messages: list[Mapping[str, Any]], *, active_only: bool = False,
+                         archive_dropped: bool = False, reject_active_turn_lease: bool = False,
+                         **kwargs: Any) -> None:
+        """Atomically replace the transcript, mirroring the PG adapter's controls.
+
+        ACP calls with ``active_only=True`` to preserve soft-archived rows
+        (acp_adapter/session.py:360): the non-owning agent replaces only the
+        active=1 set so pre-compaction archived rows survive the rewrite. Any
+        control outside the PostgreSQL contract is rejected before a write
+        rather than being silently ignored or falling back.
+        """
+        if kwargs:
+            raise PostgreSQLCLISessionCapabilityError(
+                "PostgreSQL CLI persistence does not support replace controls: " + ", ".join(sorted(kwargs)))
+        return self._store.replace_messages(session_id, messages, active_only=active_only,
+                                            archive_dropped=archive_dropped,
+                                            reject_active_turn_lease=reject_active_turn_lease)
+
     def get_messages_as_conversation(self, session_id: str, *, include_ancestors: bool = False,
                                      repair_alternation: bool = False, include_row_ids: bool = False,
                                      **kwargs: Any) -> list[dict[str, Any]]:
+        """Resume projection in OpenAI format.
+
+        ``repair_alternation`` is honored for live-replay callers (ACP resumes
+        this list as the agent's live conversation, acp_adapter/session.py:383):
+        a durable same-role pair would otherwise re-fire the per-request repair
+        on every call. The shared agent-side repair runs here on the already
+        projected list; the stored transcript is never mutated, and
+        ``include_ancestors``/``include_row_ids`` handling is unchanged.
+        """
         if kwargs:
             raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI resume does not support: " + ", ".join(sorted(kwargs)))
         restored, _display = self._store.get_resume_conversations(session_id)
+        if repair_alternation and restored:
+            # Lazy import: keeps agent-side tooling out of store-only import paths.
+            # The helper only mutates the list in place; its ``agent`` argument is unused.
+            from agent.agent_runtime_helpers import repair_message_sequence
+            repair_message_sequence(None, restored)
         if not include_row_ids:
             restored = [{key: value for key, value in message.items() if key != "_row_id"} for message in restored]
         if not include_ancestors:
