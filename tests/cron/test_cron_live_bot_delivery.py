@@ -91,7 +91,7 @@ def test_selected_postgresql_bot_chat_delivery_refuses_before_cli_or_mailbox(tmp
 
     assert result is not None
     assert "unverified" in result
-    assert "gateway-session-routing-transcript" in result
+    assert "cron-session-transcript-lifecycle" in result
     assert opens == []
     assert not (home / "runtime" / mailbox.DELIVERY_DIR_NAME).exists()
     assert not (home / "state.db").exists()
