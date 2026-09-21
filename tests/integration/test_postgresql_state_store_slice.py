@@ -354,7 +354,7 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
     try:
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 26))
+        assert _migration_versions(dsn) == list(range(1, 27))
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -379,14 +379,14 @@ def test_postgresql_fresh_migration_contract_is_linear_idempotent_and_catalog_co
             assert cursor.fetchall() == [("conversation_generations_pkey",)]
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 26))
-        _target().execute(f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (26, 0)")
+        assert _migration_versions(dsn) == list(range(1, 27))
+        _target().execute(f"INSERT INTO {_SCHEMA}.schema_migrations (version, applied_at) VALUES (27, 0)")
         with pytest.raises(
             StateStoreConfigurationError,
-            match=r"Unsupported PostgreSQL State Store schema migration versions: \[26\]",
+            match=r"Unsupported PostgreSQL State Store schema migration versions: \[27\]",
         ):
             open_state_store(_config())
-        _target().execute(f"DELETE FROM {_SCHEMA}.schema_migrations WHERE version=26")
+        _target().execute(f"DELETE FROM {_SCHEMA}.schema_migrations WHERE version=27")
         _target().execute(f"ALTER TABLE {_SCHEMA}.conversation_generations DROP CONSTRAINT conversation_generations_pkey")
         _target().execute(f"ALTER TABLE {_SCHEMA}.conversation_generations ADD CONSTRAINT conversation_generations_pkey PRIMARY KEY (session_key, source)")
         with pytest.raises(StateStoreConfigurationError, match="primary key must be"):
@@ -407,14 +407,14 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         assert session is not None
         assert session["source"] == "fixture"
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 26))
+        assert _migration_versions(dsn) == list(range(1, 27))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 3, 4))
         _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 26))
+        assert _migration_versions(dsn) == list(range(1, 27))
 
         _reset_schema(dsn)
         _seed_v2_schema(dsn, (1, 2, 5))
@@ -425,7 +425,7 @@ def test_postgresql_upgrade_migrations_accept_v2_and_legacy_v5_ledgers(monkeypat
         _target().execute(f"ALTER TABLE {_SCHEMA}.sessions ADD CONSTRAINT sessions_parent_session_id_fkey FOREIGN KEY (parent_session_id) REFERENCES {_SCHEMA}.sessions(id) NOT VALID")
         store = open_state_store(_config())
         store.close()
-        assert _migration_versions(dsn) == list(range(1, 26))
+        assert _migration_versions(dsn) == list(range(1, 27))
         _target().execute(f"DROP INDEX {_SCHEMA}.sessions_title_unique")
         with pytest.raises(StateStoreConfigurationError, match="sessions_title_unique"):
             open_state_store(_config())
@@ -710,7 +710,7 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
         postgresql = cast(Any, stores[1])
         with postgresql._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT version FROM {_SCHEMA}.schema_migrations ORDER BY version")
-            assert [row[0] for row in cursor.fetchall()][-5:] == [21, 22, 23, 24, 25]
+            assert [row[0] for row in cursor.fetchall()][-5:] == [22, 23, 24, 25, 26]
     finally:
         for store in stores:
             store.close()

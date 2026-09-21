@@ -130,10 +130,10 @@ def test_pg18_namespace_isolation_release_fence_and_catalog_rollback():
             cursor.execute("SELECT version FROM schema_migrations ORDER BY version")
             # The selected-PG compression facade adds the v20 atomic
             # parent/child publication receipt migration.  Keep this direct
-            # ownership test coupled to the current catalog (the v25 gateway
-            # transcript migration is the latest here), not the v19 precursor
-            # that introduced the ownership tables.
-            assert [int(row[0]) for row in cursor.fetchall()][-1] == 25
+            # ownership test coupled to the current catalog (v26 session_topics
+            # is the latest), not the v19 precursor that introduced the
+            # ownership tables.
+            assert [int(row[0]) for row in cursor.fetchall()][-1] == 26
     finally:
         store.close()
 
