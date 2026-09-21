@@ -73,7 +73,7 @@ def test_selected_postgresql_reaction_refuses_before_sqlite_acquisition_or_emit(
 
     assert payload["error_type"] == "postgresql_runtime_activation"
     assert "legacy session runtime support" in payload["error"]
-    assert "gateway-delivery-ledger-routing" in payload["missing_capabilities"]
+    assert "tui-api-session-runtime" in payload["missing_capabilities"]
     assert "postgresql://" not in json.dumps(payload)
     assert opens == []
     assert open_session_db.call_count == 0
