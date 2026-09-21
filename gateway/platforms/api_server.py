@@ -128,6 +128,23 @@ from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
     validate_media_delivery_path)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+
+
+def _selected_run_store_factory():
+    """Build the run-idempotency store for the selected state-store backend.
+
+    Defaults to the module-global ``RunIdempotencyStore`` (SQLite) so the existing
+    constructor monkeypatch keeps working; a selected PostgreSQL backend opens a fresh
+    PostgreSQL store and fails closed on a missing/unreachable DSN.
+    """
+    from gateway.platforms.api_server_run_idempotency_adapter import (
+        selected_run_idempotency_store_factory)
+    factory = selected_run_idempotency_store_factory()
+    if factory is None:
+        return RunIdempotencyStore()
+    return factory()
+
+
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -1200,7 +1217,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        _api_runs._initialize_run_state(self, store_factory=RunIdempotencyStore)
+        _api_runs._initialize_run_state(self, store_factory=_selected_run_store_factory)
         self._session_db: Optional[Any] = None  # explicit override (tests/manual wiring)
         self._session_dbs: Dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
