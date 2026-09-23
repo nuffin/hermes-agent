@@ -57,6 +57,10 @@ class StateStoreInterface(Protocol):
         """Set an automatic title; False when a higher-authority title holds the row."""
         ...
 
+    def refresh_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        """Refresh an automatic title only when its current provenance matches source."""
+        ...
+
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
         """Normalize a title (strip control chars, collapse whitespace); None when empty."""
