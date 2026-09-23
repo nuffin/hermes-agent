@@ -62,6 +62,7 @@ _STATE_META_SCHEMA_VERSION = 27
 _MESSAGE_REACTIONS_SCHEMA_VERSION = 28
 _GATEWAY_PARITY_SCHEMA_VERSION = 29
 _TELEGRAM_TOPIC_SCHEMA_VERSION = 30
+_STATS_COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION = 31
 _STATS_MAINTENANCE_SCHEMA_VERSION = 32
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
@@ -231,6 +232,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_MESSAGE_REACTIONS_SCHEMA_VERSION, self._apply_v28, self._validate_v28),
                     (_GATEWAY_PARITY_SCHEMA_VERSION, self._apply_v29, self._validate_v29),
                     (_TELEGRAM_TOPIC_SCHEMA_VERSION, self._apply_v30, self._validate_v30),
+                    (_STATS_COMPATIBILITY_CHECKPOINT_SCHEMA_VERSION, self._apply_v31, self._validate_v31),
                     (_STATS_MAINTENANCE_SCHEMA_VERSION, self._apply_v32, self._validate_v32),
                 )
                 for migration_version, apply, validate in migrations:
@@ -1234,6 +1236,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         if retire_donor and result in {"imported", "present"} and hasattr(donor_db, "delete_moved_session"):
             donor_db.delete_moved_session(session_id)
         return {"status": result, "session_id": session_id}
+    def _apply_v31(self, cursor: Any) -> None:
+        """Record the linear migration boundary before statistics maintenance."""
+        return None
+
+    def _validate_v31(self, cursor: Any) -> None:
+        self._validate_v30(cursor)
+
     def _apply_v32(self, cursor: Any) -> None:
         """Add durable expiry and gateway hygiene maintenance state."""
         cursor.execute(
@@ -1246,7 +1255,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         )
 
     def _validate_v32(self, cursor: Any) -> None:
-        self._validate_v26(cursor)
+        self._validate_v31(cursor)
         self._required_columns(cursor, "sessions", {"expiry_finalized"})
         self._required_columns(cursor, "gateway_hygiene_state", {"session_key", "failure_streak"})
 

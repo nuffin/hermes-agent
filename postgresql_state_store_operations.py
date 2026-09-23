@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from state_store import PostgreSQLStateStoreConfig
+from state_store_postgresql import _STATS_MAINTENANCE_SCHEMA_VERSION
 
 _MANIFEST_VERSION = 1
 _TARGET_DATABASE_RE = re.compile(r"^hermes_state_restore_[0-9a-f]{32}$")
@@ -32,8 +33,8 @@ _REQUIRED_TABLES = (
     "conversation_generations", "session_runtime_owners", "session_runtime_turns",
     "compression_locks", "session_turn_leases", "session_topics",
 )
-# Tracks the state_store_postgresql schema ledger through _SESSION_TOPICS_SCHEMA_VERSION (26).
-_REQUIRED_MIGRATIONS = tuple(range(1, 27))
+# Tracks the state_store_postgresql schema ledger through the current migration.
+_REQUIRED_MIGRATIONS = tuple(range(1, _STATS_MAINTENANCE_SCHEMA_VERSION + 1))
 _OPTIMIZE_TABLES = _REQUIRED_TABLES
 _OPTIMIZE_STATEMENT_TIMEOUT_MS = 30_000
 _OPTIMIZE_LOCK_TIMEOUT_MS = 2_000
