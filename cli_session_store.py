@@ -27,6 +27,14 @@ class PostgreSQLCLISessionStore:
     def __init__(self, store: Any) -> None:
         self._store = store
 
+    # StateStoreInterface conformance members (see state_store_interface.py).
+    TITLE_SOURCE_LLM = "llm"
+
+    @staticmethod
+    def sanitize_title(title: str | None) -> str | None:
+        from state_store_postgresql import PostgreSQLStateStore
+        return PostgreSQLStateStore.sanitize_title(title)
+
     @staticmethod
     def _record(message: Mapping[str, Any]) -> MessageRecord:
         fields = MessageRecord.__dataclass_fields__
@@ -286,6 +294,7 @@ class PostgreSQLCLISessionStore:
     def get_session_title_source(self, session_id: str): return self._store.get_session_title_source(session_id)
     def set_session_title_source(self, session_id: str, source: str): return self._store.set_session_title_source(session_id, source)
     def set_session_title(self, session_id: str, title: str): return self._store.set_session_title(session_id, title)
+    def set_auto_title(self, session_id: str, title: str, *, source: str): return self._store.set_auto_title(session_id, title, source=source)
     def set_session_pinned(self, session_id: str, pinned: bool): return self._store.set_session_pinned(session_id, pinned)
     def get_session_by_title(self, title: str): return self._store.get_session_by_title(title)
     def resolve_session_by_title(self, title: str): return self._store.resolve_session_by_title(title)
@@ -420,6 +429,7 @@ class PostgreSQLCLISessionStore:
     def flush_token_counts(self, timeout: float = 5.0): return self._store.flush_token_counts(timeout)
     def record_auxiliary_usage(self, session_id: str, task: str, **kwargs: Any): return self._store.record_auxiliary_usage(session_id, task, **kwargs)
     def update_system_prompt(self, session_id: str, prompt: str | None): return self._store.set_system_prompt(session_id, prompt)
+    def clear_stored_system_prompts(self): return self._store.clear_stored_system_prompts()
     def reopen_session(self, session_id: str) -> None:
         with self._store._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"UPDATE {self._store._schema}.sessions SET ended_at=NULL, end_reason=NULL WHERE id=%s", (session_id,))
