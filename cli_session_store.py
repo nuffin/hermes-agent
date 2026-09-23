@@ -775,6 +775,47 @@ class PostgreSQLCLISessionStore:
 
     def close(self): self._store.close()
 
+    def finalize_orphaned_compression_sessions(self):
+        return self._store.finalize_orphaned_compression_sessions()
+
+    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False):
+        return self._store.usage_totals(min_message_count=min_message_count, include_archived=include_archived)
+
+    def auxiliary_usage_by_task(self, session_id: str):
+        return self._store.auxiliary_usage_by_task(session_id)
+
+    def session_count_by_source(self, *, include_archived: bool = False, archived_only: bool = False,
+                                exclude_children: bool = False):
+        return self._store.session_count_by_source(
+            include_archived=include_archived, archived_only=archived_only, exclude_children=exclude_children)
+
+    def list_cron_job_runs(self, job_id: str, limit: int = 20, offset: int = 0):
+        return self._store.list_cron_job_runs(job_id, limit=limit, offset=offset)
+
+    def set_expiry_finalized(self, session_id: str, finalized: bool = True):
+        return self._store.set_expiry_finalized(session_id, finalized)
+
+    def increment_hygiene_failure_streak(self, session_key: str):
+        return self._store.increment_hygiene_failure_streak(session_key)
+
+    def reset_hygiene_failure_streak(self, session_key: str):
+        return self._store.reset_hygiene_failure_streak(session_key)
+
+    def declared_scope_identity(self, session_id: str):
+        return self._store.declared_scope_identity(session_id)
+
+    def distinct_session_cwds(self, include_archived: bool = False):
+        return self._store.distinct_session_cwds(include_archived)
+
+    def backfill_repo_roots(self, cwd_to_root: Mapping[str, str]):
+        return self._store.backfill_repo_roots(cwd_to_root)
+
+    def find_live_compression_child(self, parent_session_id: str):
+        return self._store.find_live_compression_child(parent_session_id)
+
+    def reopen_orphaned_compression_session(self, session_id: str):
+        return self._store.reopen_orphaned_compression_session(session_id)
+
     def __getattr__(self, name: str):
         raise PostgreSQLCLISessionCapabilityError(
             f"PostgreSQL CLI session store does not implement '{name}'; no SQLite fallback is permitted")

@@ -62,6 +62,7 @@ _STATE_META_SCHEMA_VERSION = 27
 _MESSAGE_REACTIONS_SCHEMA_VERSION = 28
 _GATEWAY_PARITY_SCHEMA_VERSION = 29
 _TELEGRAM_TOPIC_SCHEMA_VERSION = 30
+_STATS_MAINTENANCE_SCHEMA_VERSION = 32
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -196,7 +197,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _TELEGRAM_TOPIC_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _STATS_MAINTENANCE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -230,6 +231,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_MESSAGE_REACTIONS_SCHEMA_VERSION, self._apply_v28, self._validate_v28),
                     (_GATEWAY_PARITY_SCHEMA_VERSION, self._apply_v29, self._validate_v29),
                     (_TELEGRAM_TOPIC_SCHEMA_VERSION, self._apply_v30, self._validate_v30),
+                    (_STATS_MAINTENANCE_SCHEMA_VERSION, self._apply_v32, self._validate_v32),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -1232,6 +1234,21 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         if retire_donor and result in {"imported", "present"} and hasattr(donor_db, "delete_moved_session"):
             donor_db.delete_moved_session(session_id)
         return {"status": result, "session_id": session_id}
+    def _apply_v32(self, cursor: Any) -> None:
+        """Add durable expiry and gateway hygiene maintenance state."""
+        cursor.execute(
+            f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS "
+            "expiry_finalized boolean NOT NULL DEFAULT false"
+        )
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.gateway_hygiene_state ("
+            "session_key text PRIMARY KEY, failure_streak bigint NOT NULL DEFAULT 0)"
+        )
+
+    def _validate_v32(self, cursor: Any) -> None:
+        self._validate_v26(cursor)
+        self._required_columns(cursor, "sessions", {"expiry_finalized"})
+        self._required_columns(cursor, "gateway_hygiene_state", {"session_key", "failure_streak"})
 
     @staticmethod
     def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -4403,6 +4420,287 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(f"SELECT id, source, started_at, ended_at, end_reason, title, title_source, hidden, archived, pinned, git_branch, git_metadata_generation, {', '.join(_SESSION_METADATA_COLUMNS)} FROM {self._schema}.sessions WHERE title = %s", (title,))
             return cursor.fetchone()
+
+    # Statistics, cron history, and maintenance operations kept in parity with
+    # the corresponding SessionDB mixins.  These methods intentionally use
+    # tenant-qualified SQL and never open the legacy SQLite store.
+    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> dict[str, float]:
+        self.flush_token_counts()
+        archived = "" if include_archived else " AND NOT s.archived"
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""SELECT COALESCE(SUM(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0)), 0),
+                           COALESCE(SUM(COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0)), 0)
+                    FROM {self._schema}.sessions s
+                   WHERE s.parent_session_id IS NULL
+                     AND (SELECT COUNT(*) FROM {self._schema}.messages m WHERE m.session_id = s.id) >= %s
+                     {archived}""",
+                (min_message_count,),
+            )
+            row = cursor.fetchone()
+        return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}
+
+    def auxiliary_usage_by_task(self, session_id: str) -> dict[str, dict[str, float]]:
+        if not session_id:
+            return {}
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"""WITH RECURSIVE chain(id, parent_session_id, depth, model_config) AS (
+                           SELECT id, parent_session_id, 0, model_config
+                             FROM {self._schema}.sessions WHERE id = %s
+                           UNION ALL
+                           SELECT parent.id, parent.parent_session_id, chain.depth + 1, parent.model_config
+                             FROM chain
+                             JOIN {self._schema}.sessions child ON child.id = chain.id
+                             JOIN {self._schema}.sessions parent ON parent.id = child.parent_session_id
+                            WHERE chain.depth < 100
+                         )
+                         SELECT id, model_config FROM chain ORDER BY depth DESC""",
+                (session_id,),
+            )
+            chain_rows = list(cursor.fetchall())
+            ids = [str(row["id"]) for row in chain_rows]
+            for index in range(len(ids) - 1, -1, -1):
+                config = chain_rows[index].get("model_config")
+                if isinstance(config, Mapping) and config.get("_branched_from"):
+                    ids = ids[index:]
+                    break
+            if not ids:
+                return {}
+            cursor.execute(
+                f"""SELECT task,
+                           COALESCE(SUM(api_call_count), 0) AS api_calls,
+                           COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                           COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                           COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                           COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                           COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                      FROM {self._schema}.session_model_usage
+                     WHERE session_id = ANY(%s) AND task <> ''
+                     GROUP BY task""",
+                (ids,),
+            )
+            rows = list(cursor.fetchall())
+        return {
+            str(row["task"]): {key: row[key] for key in row.keys() if key != "task"}
+            for row in rows
+        }
+
+    def session_count_by_source(
+        self, *, include_archived: bool = False, archived_only: bool = False,
+        exclude_children: bool = False,
+    ) -> dict[str, int]:
+        clauses = []
+        params: list[Any] = []
+        if archived_only:
+            clauses.append("s.archived")
+        elif not include_archived:
+            clauses.append("NOT s.archived")
+        if exclude_children:
+            clauses.append(
+                "(s.parent_session_id IS NULL OR "
+                "COALESCE(s.model_config, '{}'::jsonb) ? '_branched_from' OR "
+                "COALESCE(s.model_config, '{}'::jsonb) ? '_reset_from' OR "
+                "EXISTS (SELECT 1 FROM " + self._schema + ".sessions p "
+                "WHERE p.id = s.parent_session_id AND p.end_reason IN "
+                "('session_reset','session_switch','idle','daily','suspended','resume_pending_expired') "
+                "AND COALESCE(s.session_key, '') <> '' AND s.session_key = p.session_key))"
+            )
+            clauses.append("NOT (COALESCE(s.model_config, '{}'::jsonb) ? '_delegate_from')")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count "
+                f"FROM {self._schema}.sessions s{where} "
+                "GROUP BY COALESCE(NULLIF(s.source, ''), 'cli') ORDER BY count DESC",
+                params,
+            )
+            rows = cursor.fetchall()
+        return {str(row[0]): int(row[1] or 0) for row in rows}
+
+    def list_cron_job_runs(self, job_id: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        prefix = f"cron_{job_id}_"
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"""SELECT s.*, sp.prompt AS _system_prompt_resolved,
+                           COALESCE((SELECT m.content FROM {self._schema}.messages m
+                                      WHERE m.session_id = s.id AND m.role = 'user'
+                                        AND m.content IS NOT NULL
+                                        AND COALESCE(m.display_kind, '') <> 'hidden'
+                                      ORDER BY m.created_at, m.id LIMIT 1), '') AS _preview_raw,
+                           COALESCE((SELECT MAX(m.created_at) FROM {self._schema}.messages m
+                                     WHERE m.session_id = s.id), s.last_activity_at, s.started_at) AS last_active
+                      FROM {self._schema}.sessions s
+                      LEFT JOIN {self._schema}.system_prompts sp ON sp.hash = s.system_prompt_hash
+                     WHERE s.source = 'cron' AND s.id LIKE %s ESCAPE '\\'
+                     ORDER BY s.started_at DESC, s.id DESC LIMIT %s OFFSET %s""",
+                (pattern, int(limit), int(offset)),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+        from hermes_state_common import _shape_preview
+        for row in rows:
+            resolved = row.pop("_system_prompt_resolved", None)
+            if "system_prompt" in row:
+                row["system_prompt"] = resolved
+            row["preview"] = _shape_preview(row.pop("_preview_raw", ""))
+        return rows
+
+    def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
+        if not session_id:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET expiry_finalized = %s WHERE id = %s",
+                (bool(finalized), session_id),
+            )
+
+    def increment_hygiene_failure_streak(self, session_key: str) -> int:
+        if not session_key:
+            return 1
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.gateway_hygiene_state (session_key, failure_streak)
+                    VALUES (%s, 1)
+                    ON CONFLICT (session_key) DO UPDATE
+                    SET failure_streak = {self._schema}.gateway_hygiene_state.failure_streak + 1
+                    RETURNING failure_streak""",
+                (session_key,),
+            )
+            row = cursor.fetchone()
+        return int(row[0])
+
+    def reset_hygiene_failure_streak(self, session_key: str) -> None:
+        if not session_key:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_hygiene_state WHERE session_key = %s", (session_key,))
+
+    def declared_scope_identity(self, session_id: str) -> tuple[bool, str]:
+        session = self.get_session(session_id)
+        if not session:
+            return False, ""
+        parent_id = session.get("parent_session_id")
+        config = session.get("model_config")
+        if isinstance(config, Mapping):
+            markers = (config.get("_branched_from"), config.get("_delegate_from"))
+            is_fork = session.get("source") == "tool" or any(parent_id and parent_id == marker for marker in markers)
+        else:
+            is_fork = session.get("source") == "tool"
+        return bool(is_fork), str(session.get("source") or "").strip()
+
+    def distinct_session_cwds(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        archived = "" if include_archived else " AND NOT s.archived"
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"""SELECT s.cwd AS cwd, COUNT(*) AS sessions,
+                           MAX(COALESCE(s.ended_at, s.started_at, 0)) AS last_active
+                      FROM {self._schema}.sessions s
+                     WHERE s.cwd IS NOT NULL AND BTRIM(s.cwd) <> ''{archived}
+                     GROUP BY s.cwd"""
+            )
+            rows = cursor.fetchall()
+        return [
+            {"cwd": row["cwd"], "sessions": int(row["sessions"] or 0), "last_active": float(row["last_active"] or 0)}
+            for row in rows
+        ]
+
+    def backfill_repo_roots(self, cwd_to_root: dict[str, str]) -> None:
+        pairs = [(root, cwd) for cwd, root in cwd_to_root.items() if root and cwd]
+        if not pairs:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.executemany(
+                f"UPDATE {self._schema}.sessions SET git_repo_root = %s "
+                "WHERE cwd = %s AND COALESCE(git_repo_root, '') = ''",
+                pairs,
+            )
+
+    def find_live_compression_child(self, parent_session_id: str) -> dict[str, Any] | None:
+        if not parent_session_id:
+            return None
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT ended_at, end_reason FROM {self._schema}.sessions WHERE id = %s", (parent_session_id,))
+            ended = cursor.fetchone()
+            if ended is None or ended["ended_at"] is None or ended["end_reason"] != "compression":
+                return None
+            cursor.execute(
+                f"""SELECT s.*, sp.prompt AS _system_prompt_resolved
+                      FROM {self._schema}.sessions s
+                      LEFT JOIN {self._schema}.system_prompts sp ON sp.hash = s.system_prompt_hash
+                     WHERE s.parent_session_id = %s AND s.ended_at IS NULL
+                       AND COALESCE(s.model_config->>'_branched_from', '') <> %s
+                       AND COALESCE(s.model_config->>'_delegate_from', '') <> %s
+                       AND COALESCE(s.model_config->>'_reset_from', '') <> %s
+                       AND COALESCE(s.source, '') <> 'tool'
+                     ORDER BY s.started_at ASC LIMIT 2""",
+                (parent_session_id,) * 4,
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        resolved = row.pop("_system_prompt_resolved", None)
+        if "system_prompt" in row:
+            row["system_prompt"] = resolved
+        return row
+
+    def reopen_orphaned_compression_session(self, session_id: str) -> bool:
+        if not session_id:
+            return False
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT ended_at, end_reason FROM {self._schema}.sessions WHERE id = %s", (session_id,))
+            ended = cursor.fetchone()
+            if ended is None or ended["ended_at"] is None or ended["end_reason"] != "compression":
+                return False
+            cursor.execute(
+                f"""SELECT 1 FROM {self._schema}.sessions s
+                     WHERE s.parent_session_id = %s
+                       AND COALESCE(s.model_config->>'_branched_from', '') <> %s
+                       AND COALESCE(s.model_config->>'_delegate_from', '') <> %s
+                       AND COALESCE(s.model_config->>'_reset_from', '') <> %s
+                       AND COALESCE(s.source, '') <> 'tool' LIMIT 1""",
+                (session_id,) * 4,
+            )
+            if cursor.fetchone() is not None:
+                return False
+            now = time.time()
+            cursor.execute(f"SELECT holder, expires_at FROM {self._schema}.compression_locks WHERE session_id = %s", (session_id,))
+            lock = cursor.fetchone()
+            if lock is not None:
+                if lock["expires_at"] is None or float(lock["expires_at"]) >= now:
+                    return False
+                cursor.execute(
+                    f"DELETE FROM {self._schema}.compression_locks WHERE session_id = %s AND holder = %s AND expires_at = %s",
+                    (session_id, lock["holder"], lock["expires_at"]),
+                )
+                if cursor.rowcount != 1:
+                    return False
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = %s AND ended_at IS NOT NULL AND end_reason = 'compression'",
+                (session_id,),
+            )
+            return cursor.rowcount == 1
+
+    def finalize_orphaned_compression_sessions(self) -> int:
+        cutoff = time.time() - 604800
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""UPDATE {self._schema}.sessions AS child
+                       SET ended_at = %s, end_reason = 'orphaned_compression'
+                     WHERE child.api_call_count = 0 AND child.end_reason IS NULL
+                       AND child.ended_at IS NULL AND child.started_at < %s
+                       AND child.parent_session_id IS NOT NULL
+                       AND EXISTS (SELECT 1 FROM {self._schema}.sessions p
+                                   WHERE p.id = child.parent_session_id
+                                     AND p.end_reason = 'compression' AND p.ended_at IS NOT NULL)
+                       AND EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id = child.id)
+                     RETURNING child.id""",
+                (time.time(), cutoff),
+            )
+            return len(cursor.fetchall())
 
     def resolve_session_by_title(self, title: str) -> str | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
