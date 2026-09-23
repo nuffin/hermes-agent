@@ -58,6 +58,7 @@ _FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION = 23
 _GATEWAY_SESSION_ROUTE_SCHEMA_VERSION = 24
 _GATEWAY_TRANSCRIPT_SCHEMA_VERSION = 25
 _SESSION_TOPICS_SCHEMA_VERSION = 26
+_STATE_META_SCHEMA_VERSION = 27
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -192,7 +193,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _SESSION_TOPICS_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _STATE_META_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -222,6 +223,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_GATEWAY_SESSION_ROUTE_SCHEMA_VERSION, self._apply_v24, self._validate_v24),
                     (_GATEWAY_TRANSCRIPT_SCHEMA_VERSION, self._apply_v25, self._validate_v25),
                     (_SESSION_TOPICS_SCHEMA_VERSION, self._apply_v26, self._validate_v26),
+                    (_STATE_META_SCHEMA_VERSION, self._apply_v27, self._validate_v27),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -785,6 +787,58 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._require_index(cursor, "session_topics_session_last_active")
         self._require_index(cursor, "messages_topic_id")
         self._require_foreign_key(cursor, "session_topics_session_id_fkey", "session_topics", "sessions")
+
+    def _apply_v27(self, cursor: Any) -> None:
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._schema}.state_meta ("
+            "key text PRIMARY KEY, value text NOT NULL)"
+        )
+        cursor.execute(
+            f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS last_read_at double precision"
+        )
+
+    def _validate_v27(self, cursor: Any) -> None:
+        self._validate_v26(cursor)
+        self._required_columns(cursor, "state_meta", {"key", "value"})
+        self._required_columns(cursor, "sessions", {"last_read_at"})
+
+    def get_meta(self, key: str) -> str | None:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT value FROM {self._schema}.state_meta WHERE key=%s", (key,))
+            row = cursor.fetchone()
+        return None if row is None else str(row[0])
+
+    def set_meta(self, key: str, value: str, *, cursor: Any = None) -> None:
+        sql = (
+            f"INSERT INTO {self._schema}.state_meta (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"
+        )
+        if cursor is not None:
+            cursor.execute(sql, (key, value))
+            return
+        with self._connection() as connection, connection.cursor() as db_cursor:
+            db_cursor.execute(sql, (key, value))
+
+    def list_meta_prefix(self, prefix: str) -> list[tuple[str, str]]:
+        if not prefix:
+            return []
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT key, value FROM {self._schema}.state_meta "
+                "WHERE key LIKE %s ESCAPE '\\' ORDER BY key",
+                (_escape_like(prefix) + "%",),
+            )
+            return [(str(row[0]), str(row[1])) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _apply_model_config_patch(config: Any, patch: Mapping[str, Any]) -> dict[str, Any]:
+        merged = PostgreSQLStateStore._model_config_object(config)
+        for key, value in patch.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        return merged
 
     @staticmethod
     def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -2099,6 +2153,110 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     self._record_params(session_id, record),
                 )
 
+    def archive_and_compact(
+        self, session_id: str, compacted_messages: list[dict[str, Any]], topic_id: int | None = None,
+        model_config_patch: Mapping[str, Any] | None = None, watermark: int | None = None,
+        lock_holder: str | None = None, tail_count: int = 0,
+    ) -> int:
+        """Atomically archive active transcript rows and publish compacted rows.
+
+        Rows arriving after ``watermark`` are copied after the summary with fresh
+        ids, while protected carried-tail rows remain visible only once.  This is
+        the PostgreSQL equivalent of SessionDB's non-destructive compaction path.
+        """
+        from hermes_state_errors import SessionCompressionInProgressError
+        if not session_id:
+            return 0
+        insert_columns = ("session_id", "role", "content", "created_at", *_MESSAGE_RECORD_WRITE_COLUMNS, "active", "compacted")
+        source_columns = ("role", "content", "created_at", *_MESSAGE_RECORD_WRITE_COLUMNS)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._transcript_write_guards(
+                cursor, session_id,
+                reject_active_compression_lock=lock_holder is not None,
+                compression_lock_holder=lock_holder,
+            )
+            if lock_holder is not None:
+                cursor.execute(
+                    f"SELECT holder, expires_at FROM {self._schema}.compression_locks WHERE session_id=%s FOR UPDATE",
+                    (session_id,),
+                )
+                lock = cursor.fetchone()
+                if lock is None or lock["holder"] != lock_holder or float(lock["expires_at"]) <= time.time():
+                    raise SessionCompressionInProgressError(f"Compression lease for {session_id!r} lost before commit")
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                raise ValueError(f"session not found: {session_id}")
+            where = "session_id=%s AND active"
+            params: list[Any] = [session_id]
+            if topic_id is not None:
+                where += " AND topic_id=%s"
+                params.append(topic_id)
+            tail_ids: list[int] = []
+            tail_tool_calls = 0
+            if watermark is not None:
+                cursor.execute(
+                    f"SELECT id, tool_calls FROM {self._schema}.messages WHERE {where} AND id>%s ORDER BY id",
+                    (*params, int(watermark)),
+                )
+                tail_rows = cursor.fetchall()
+                tail_ids = [int(row["id"]) for row in tail_rows]
+                tail_tool_calls = sum(1 for row in tail_rows if row["tool_calls"] is not None)
+            rewind_ids: list[int] = []
+            if tail_count > 0:
+                bound = " AND id<=%s" if watermark is not None else ""
+                rewind_params = [*params, int(watermark)] if watermark is not None else [*params]
+                cursor.execute(
+                    f"SELECT id FROM {self._schema}.messages WHERE {where}{bound} ORDER BY id DESC LIMIT %s",
+                    (*rewind_params, int(tail_count)),
+                )
+                rewind_ids = [int(row["id"]) for row in cursor.fetchall()]
+            rewind_ids.extend(tail_ids)
+            if rewind_ids:
+                cursor.execute(
+                    f"UPDATE {self._schema}.messages SET active=false, compacted=false WHERE id=ANY(%s)",
+                    (rewind_ids,),
+                )
+                cursor.execute(
+                    f"UPDATE {self._schema}.messages SET active=false, compacted=true WHERE {where} AND NOT (id=ANY(%s))",
+                    (*params, rewind_ids),
+                )
+            else:
+                cursor.execute(f"UPDATE {self._schema}.messages SET active=false, compacted=true WHERE {where}", params)
+            inserted = 0
+            tool_calls = 0
+            for payload in compacted_messages:
+                record = MessageRecord(**{name: payload[name] for name in MessageRecord.__dataclass_fields__ if name in payload})
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.messages ({', '.join(insert_columns)}) "
+                    f"VALUES ({', '.join('%s' for _ in range(len(insert_columns)))})",
+                    (*self._record_params(session_id, record), True, False),
+                )
+                inserted += 1
+                tool_calls += int(record.tool_calls is not None)
+            if tail_ids:
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.messages ({', '.join(insert_columns)}) "
+                    f"SELECT %s, {', '.join(source_columns)}, true, false FROM {self._schema}.messages WHERE id=ANY(%s) ORDER BY id",
+                    (session_id, tail_ids),
+                )
+                inserted += len(tail_ids)
+                tool_calls += tail_tool_calls
+            config_value = None
+            if model_config_patch is not None:
+                cursor.execute(f"SELECT model_config FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+                current = cursor.fetchone()
+                current_value = current[0] if current is not None else None
+                config_value = self._apply_model_config_patch(current_value, model_config_patch)
+                cursor.execute(
+                    f"UPDATE {self._schema}.sessions SET model_config=%s WHERE id=%s",
+                    (self._psycopg.types.json.Jsonb(config_value) if config_value else None, session_id),
+                )
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET last_activity_at=GREATEST(COALESCE(last_activity_at, started_at), %s) WHERE id=%s",
+                (time.time(), session_id),
+            )
+            return inserted
+
     def get_messages_as_conversation(self, session_id: str, include_inactive: bool = False,
                                      include_row_ids: bool = False) -> list[dict[str, Any]]:
         """Load messages in OpenAI format, mirroring the SQLite oracle projection.
@@ -2983,7 +3141,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(
                 f"SELECT s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.title, s.title_source, s.hidden, s.archived, s.pinned, "
                 f"s.system_prompt_hash, s.git_branch, s.git_metadata_generation, s.last_activity_at, s.last_activity_description, s.last_activity_provenance, "
-                f"s.compression_failure_cooldown_until, s.compression_failure_error, s.compression_fallback_streak, s.compression_ineffective_count, s.compression_recovery_deadline, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
+                f"s.compression_failure_cooldown_until, s.compression_failure_error, s.compression_fallback_streak, s.compression_ineffective_count, s.compression_recovery_deadline, s.last_read_at, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
                 f"FROM {self._schema}.sessions s LEFT JOIN {self._schema}.system_prompts p ON p.hash = s.system_prompt_hash WHERE s.id = %s", (session_id,),
             )
             return cursor.fetchone()
@@ -3142,6 +3300,176 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 )
             return changed
 
+    def set_session_read(self, session_id: str, read: bool = True) -> bool:
+        return self._set_lineage_column("last_read_at", session_id, time.time() if read else 0.0)
+
+    @staticmethod
+    def session_unread(session_row: Mapping[str, Any] | None) -> bool:
+        if not session_row or session_row.get("last_read_at") is None:
+            return False
+        last_active = session_row.get("last_active") or session_row.get("last_activity_at") or session_row.get("started_at")
+        return float(last_active or 0) > float(session_row["last_read_at"])
+
+    def set_session_yolo(self, session_id: str, enabled: bool) -> None:
+        if not session_id:
+            return
+        self.patch_session_model_config(session_id, {"yolo_mode": bool(enabled)})
+
+    @staticmethod
+    def session_yolo_enabled(session_meta: Mapping[str, Any] | None) -> bool:
+        if not session_meta:
+            return False
+        return bool(PostgreSQLStateStore._model_config_object(session_meta.get("model_config")).get("yolo_mode"))
+
+    def is_explicit_fork_child(self, session_id: str) -> bool:
+        session = self.get_session(session_id)
+        return bool(session and self._is_explicit_branch(session))
+
+    def reopen_if_explicitly_closed(self, session_id: str, *, provenance: str, patience_s: float | None = None) -> str | None:
+        del provenance, patience_s
+        if not session_id:
+            return None
+        automatic = set(_RECOVERABLE_END_REASONS) | {"tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict"}
+        boundary = set(_RESET_END_REASONS) | {"new_session"}
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT ended_at, end_reason FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            row = cursor.fetchone()
+            if row is None or row[0] is None or row[1] in automatic or row[1] == "compression" or row[1] in boundary:
+                return None
+            cursor.execute(
+                f"SELECT 1 FROM {self._schema}.sessions WHERE parent_session_id=%s "
+                "AND NOT (COALESCE(model_config, '{}'::jsonb) ? '_branched_from') "
+                "AND NOT (COALESCE(model_config, '{}'::jsonb) ? '_delegate_from') "
+                "AND source <> 'tool' LIMIT 1", (session_id,))
+            if cursor.fetchone() is not None:
+                return None
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET ended_at=NULL,end_reason=NULL "
+                "WHERE id=%s AND ended_at=%s AND end_reason=%s",
+                (session_id, row[0], row[1]),
+            )
+            return str(row[1]) if cursor.rowcount else None
+
+    def get_compression_chain(self, session_id: str) -> list[str]:
+        if not session_id:
+            return []
+        chain, current, seen = [session_id], session_id, {session_id}
+        for _ in range(100):
+            with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+                cursor.execute(
+                    f"SELECT child.id, child.model_config, child.source FROM {self._schema}.sessions child "
+                    f"JOIN {self._schema}.sessions parent ON parent.id=child.parent_session_id "
+                    "WHERE child.parent_session_id=%s AND parent.end_reason='compression' "
+                    "ORDER BY child.started_at ASC, child.id ASC", (current,))
+                rows = cursor.fetchall()
+            next_row = next((row for row in rows if not self._is_explicit_fork(row) and row["source"] != "tool"), None)
+            if next_row is None or next_row["id"] in seen:
+                break
+            current = str(next_row["id"])
+            seen.add(current)
+            chain.append(current)
+        return chain
+
+    def archive_stale_sessions(self, idle_days: float, *, exclude_pinned: bool = True) -> int:
+        if idle_days is None or idle_days < 0:
+            return 0
+        cutoff = time.time() - float(idle_days) * 86400.0
+        pin = " AND NOT s.pinned" if exclude_pinned else ""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT s.id FROM {self._schema}.sessions s WHERE NOT s.archived "
+                "AND COALESCE(s.end_reason,'') <> 'compression' AND NOT (s.hidden AND s.title=%s) "
+                f"{pin} AND COALESCE(s.last_activity_at,(SELECT MAX(m.created_at) FROM {self._schema}.messages m WHERE m.session_id=s.id),s.started_at) < %s",
+                (_CANONICAL_BOT_CHAT_TITLE, cutoff),
+            )
+            ids = [str(row[0]) for row in cursor.fetchall()]
+        for session_id in ids:
+            self.set_session_archived(session_id, True)
+        return len(ids)
+
+    def unarchive_recoverable_session(self, session_id: str) -> bool:
+        if not session_id:
+            return False
+        reasons = list(_RECOVERABLE_END_REASONS)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET archived=false WHERE id=%s AND archived AND end_reason=ANY(%s)",
+                (session_id, reasons),
+            )
+            return cursor.rowcount == 1
+
+    def prune_empty_ghost_sessions(self, sessions_dir: Any = None) -> int:
+        del sessions_dir
+        cutoff = time.time() - 86400
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"DELETE FROM {self._schema}.sessions s WHERE s.source='tui' AND s.title IS NULL AND s.ended_at IS NOT NULL AND s.started_at < %s "
+                f"AND NOT EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id=s.id)",
+                (cutoff,),
+            )
+            return int(cursor.rowcount)
+
+    def sweep_orphaned_sessions(self, *, max_idle_seconds: float, sources: tuple[str, ...] = ("tui", "desktop", "subagent"), exclude_ids: tuple[str, ...] = (), exclude_pinned: bool = False, **kwargs: Any) -> list[str]:
+        del kwargs
+        if max_idle_seconds <= 0 or not sources:
+            return []
+        cutoff = time.time() - float(max_idle_seconds)
+        pin = " AND NOT pinned" if exclude_pinned else ""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.sessions WHERE ended_at IS NULL AND source=ANY(%s) {pin} "
+                f"AND id <> ALL(%s) AND started_at < %s AND COALESCE(last_activity_at,(SELECT MAX(m.created_at) FROM {self._schema}.messages m WHERE m.session_id=sessions.id),started_at) < %s",
+                (list(sources), list(exclude_ids), cutoff, cutoff),
+            )
+            ids = [str(row[0]) for row in cursor.fetchall()]
+            if ids:
+                cursor.execute(f"UPDATE {self._schema}.sessions SET ended_at=%s,end_reason='startup_orphan_reap' WHERE id=ANY(%s) AND ended_at IS NULL", (time.time(), ids))
+            return ids
+
+    def maybe_auto_archive(self, idle_days: float = 3, min_interval_hours: int = 24, exclude_pinned: bool = True) -> dict[str, Any]:
+        marker = self.get_meta("last_auto_archive")
+        now = time.time()
+        if marker is not None:
+            try:
+                if now - float(marker) < float(min_interval_hours) * 3600:
+                    return {"skipped": True, "archived": 0}
+            except ValueError:
+                pass
+        count = self.archive_stale_sessions(idle_days, exclude_pinned=exclude_pinned)
+        self.set_meta("last_auto_archive", str(now))
+        return {"skipped": False, "archived": count}
+
+    def maybe_auto_prune_and_vacuum(self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True, sessions_dir: Any = None, **kwargs: Any) -> dict[str, Any]:
+        del vacuum, sessions_dir, kwargs
+        marker = self.get_meta("last_auto_prune")
+        now = time.time()
+        if marker is not None:
+            try:
+                if now - float(marker) < float(min_interval_hours) * 3600:
+                    return {"skipped": True, "pruned": 0, "closed": 0, "vacuumed": False}
+            except ValueError:
+                pass
+        closed = self.sweep_orphaned_sessions(max_idle_seconds=float(retention_days) * 86400, sources=("cli", "cron", "kanban", "subagent"), exclude_pinned=True)
+        self.set_meta("last_auto_prune", str(now))
+        return {"skipped": False, "pruned": 0, "closed": len(closed), "vacuumed": False}
+
+    def adopt_orphaned_gateway_session(self, orphan_id: str, donor_id: str) -> bool:
+        if not orphan_id or not donor_id or orphan_id == donor_id:
+            return False
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT session_key,chat_id,chat_type,thread_id,user_id,origin_json,display_name,source FROM {self._schema}.sessions WHERE id=%s", (donor_id,))
+            donor = cursor.fetchone()
+            cursor.execute(f"SELECT session_key,source FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (orphan_id,))
+            orphan = cursor.fetchone()
+            if donor is None or orphan is None or not donor["session_key"] or orphan["session_key"] or donor["source"] != orphan["source"]:
+                return False
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET session_key=%s,chat_id=COALESCE(chat_id,%s),chat_type=COALESCE(chat_type,%s),thread_id=COALESCE(thread_id,%s),user_id=COALESCE(user_id,%s),origin_json=COALESCE(origin_json,%s),display_name=COALESCE(display_name,%s),parent_session_id=COALESCE(parent_session_id,%s) WHERE id=%s AND session_key IS NULL",
+                (donor["session_key"], donor["chat_id"], donor["chat_type"], donor["thread_id"], donor["user_id"], donor["origin_json"], donor["display_name"], donor_id, orphan_id),
+            )
+            cursor.execute(f"UPDATE {self._schema}.sessions SET ended_at=COALESCE(ended_at,%s),end_reason='superseded_by_repair' WHERE id=%s", (time.time(), donor_id))
+            return True
+
     def list_recent_sessions_bounded(
         self, *, limit: int = 20, exclude_sources: list[str] | None = None,
         timeout_seconds: float = 3.0, candidate_limit: int | None = None,
@@ -3281,7 +3609,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         projection = (
             "s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.parent_session_id, s.title, "
-            "s.title_source, s.hidden, s.archived, s.pinned, "
+            "s.title_source, s.hidden, s.archived, s.pinned, s.last_read_at, "
             "COALESCE(MAX(m.created_at), s.started_at) AS last_active, COUNT(m.id)::integer AS message_count"
         )
         grouped = f" FROM {self._schema}.sessions s LEFT JOIN {self._schema}.messages m ON m.session_id = s.id{where} GROUP BY s.id"
@@ -3294,6 +3622,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 pinned_where = where + (" AND s.pinned" if where else " WHERE s.pinned")
                 cursor.execute(f"SELECT {projection} FROM {self._schema}.sessions s LEFT JOIN {self._schema}.messages m ON m.session_id = s.id{pinned_where} GROUP BY s.id{order}", params)
                 rows.extend(row for row in cursor.fetchall() if row["id"] not in seen)
+            for row in rows:
+                row["unread"] = self.session_unread(row)
             return rows
 
     def session_lifecycle_statuses(self, session_ids: list[str]) -> dict[str, str]:
@@ -3384,6 +3714,37 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
 
     def set_session_title(self, session_id: str, title: str) -> bool:
         return self._set_session_title(session_id, title, source="user")
+
+    def refresh_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        if source not in {"derived", "llm"}:
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        cleaned = _sanitize_title(title)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT title, title_source FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            current = cursor.fetchone()
+            if current is None or current["title_source"] != source:
+                return False
+            if cleaned:
+                cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE title=%s AND id<>%s", (cleaned, session_id))
+                conflict = cursor.fetchone()
+                if conflict:
+                    conflict_id = str(conflict["id"])
+                    cursor.execute(
+                        f"WITH RECURSIVE ancestors(id) AS (SELECT %s UNION SELECT parent.id FROM ancestors child "
+                        f"JOIN {self._schema}.sessions current ON current.id=child.id "
+                        f"JOIN {self._schema}.sessions parent ON parent.id=current.parent_session_id "
+                        "WHERE parent.end_reason='compression') SELECT 1 FROM ancestors WHERE id=%s",
+                        (session_id, conflict_id),
+                    )
+                    if cursor.fetchone() is not None:
+                        cursor.execute(f"UPDATE {self._schema}.sessions SET title=NULL,title_source=NULL WHERE id=%s", (conflict_id,))
+                    else:
+                        raise ValueError(f"Title '{cleaned}' is already in use by session {conflict_id}")
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET title=%s,title_source=%s WHERE id=%s AND title IS NOT DISTINCT FROM %s AND title_source IS NOT DISTINCT FROM %s",
+                (cleaned, source if cleaned else None, session_id, current["title"], current["title_source"]),
+            )
+            return cursor.rowcount > 0
 
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
         return self._set_session_title(session_id, title, source=source)
