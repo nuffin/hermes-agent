@@ -21,7 +21,7 @@ from typing import Any, Collection, Optional
 
 from hermes_cli.timefmt import coerce_epoch
 from agent.session_activity import bound_activity_description, normalize_activity_provenance
-from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS
+from hermes_state_common import _RECOVERABLE_END_REASONS, _RESET_END_REASONS, TITLE_SOURCE_LLM as _TITLE_SOURCE_LLM
 from hermes_state_ids import new_session_id
 from hermes_state_runtime_ownership import RuntimeOwner, RuntimeOwnershipReceipt, SessionRuntimeOwnershipMixin, TurnState
 from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreConfigurationError
@@ -120,6 +120,15 @@ class GatewayRouteContentionError(RuntimeError):
 
 class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     """Thread-safe bounded psycopg connection pool for session/message persistence."""
+
+    # StateStoreInterface conformance: the automatic-title source a titler writes with.
+    TITLE_SOURCE_LLM = _TITLE_SOURCE_LLM
+
+    @staticmethod
+    def sanitize_title(title: str | None) -> str | None:
+        """Same normalization as the SQLite store: strip control/zero-width/bidi
+        chars, collapse whitespace, normalize empty to None, ValueError past the cap."""
+        return _sanitize_title(title)
 
     def __init__(self, settings: PostgreSQLStateStoreConfig, dsn: str, *, schema: str) -> None:
         try:
@@ -3050,6 +3059,28 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     def get_system_prompt(self, session_id: str) -> str | None:
         row = self.get_session(session_id)
         return None if row is None else row.get("system_prompt")
+
+    def clear_stored_system_prompts(self) -> dict[str, Any]:
+        """Invalidate every stored system-prompt snapshot (StateStoreInterface).
+
+        The PG schema is always out-of-line (``sessions.system_prompt_hash`` FK →
+        ``system_prompts.hash``), so in one transaction the references are NULLed
+        first — the same never-dangle-FK ordering as the SQLite store — and the
+        now-unreferenced snapshot rows are deleted. ``system_prompts`` is
+        referenced only by that FK (creation is the sole REFERENCES in the DDL),
+        so truncating it after the UPDATE cannot orphan anything. Session rows
+        are never removed. Idempotent: a schema with nothing stored (or already
+        cleared) reports ``cleared == 0``. ``cleared`` counts affected sessions,
+        matching the SQLite implementation's UPDATE rowcount semantics.
+        """
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET system_prompt_hash = NULL "
+                "WHERE system_prompt_hash IS NOT NULL"
+            )
+            cleared = cursor.rowcount
+            cursor.execute(f"DELETE FROM {self._schema}.system_prompts")
+        return {"cleared": cleared, "storage_mode": "out-of-line"}
 
     def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
         return self._set_lineage_column("hidden", session_id, hidden)
