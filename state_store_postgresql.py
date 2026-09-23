@@ -59,6 +59,7 @@ _GATEWAY_SESSION_ROUTE_SCHEMA_VERSION = 24
 _GATEWAY_TRANSCRIPT_SCHEMA_VERSION = 25
 _SESSION_TOPICS_SCHEMA_VERSION = 26
 _STATE_META_SCHEMA_VERSION = 27
+_MESSAGE_REACTIONS_SCHEMA_VERSION = 28
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -193,7 +194,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _STATE_META_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _MESSAGE_REACTIONS_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -224,6 +225,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_GATEWAY_TRANSCRIPT_SCHEMA_VERSION, self._apply_v25, self._validate_v25),
                     (_SESSION_TOPICS_SCHEMA_VERSION, self._apply_v26, self._validate_v26),
                     (_STATE_META_SCHEMA_VERSION, self._apply_v27, self._validate_v27),
+                    (_MESSAGE_REACTIONS_SCHEMA_VERSION, self._apply_v28, self._validate_v28),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -801,6 +803,22 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._validate_v26(cursor)
         self._required_columns(cursor, "state_meta", {"key", "value"})
         self._required_columns(cursor, "sessions", {"last_read_at"})
+
+    def _apply_v28(self, cursor: Any) -> None:
+        """Record message/reaction parity and add the persisted tool-name list.
+
+        Reactions use the existing ``messages.display_metadata`` JSONB field,
+        exactly like SQLite's ``reactions`` metadata entry; no second source of
+        truth is introduced.  The tool-name list is a nullable JSON text value,
+        matching the SessionDB column's wire shape.
+        """
+        cursor.execute(
+            f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS tool_names text"
+        )
+
+    def _validate_v28(self, cursor: Any) -> None:
+        self._validate_v27(cursor)
+        self._required_columns(cursor, "sessions", {"tool_names"})
 
     def get_meta(self, key: str) -> str | None:
         with self._connection() as connection, connection.cursor() as cursor:
@@ -2316,6 +2334,248 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             messages.append(msg)
         return _strip_stale_tool_call_markers(_strip_background_review_harness(messages))
 
+    def _reaction_list(self, metadata: Any) -> list[dict[str, Any]]:
+        reactions = (metadata or {}).get("reactions") if isinstance(metadata, Mapping) else None
+        return [dict(reaction) for reaction in reactions if isinstance(reaction, Mapping)] if isinstance(reactions, list) else []
+
+    def _reaction_row_query(self, session_id: str, message_row_id: int) -> tuple[str, tuple[Any, ...]]:
+        lineage = self._resume_lineage_ids(session_id)
+        if not lineage:
+            return "SELECT display_metadata FROM messages WHERE false", ()
+        placeholders = ", ".join("%s" for _ in lineage)
+        return (
+            f"SELECT display_metadata FROM {self._schema}.messages "
+            f"WHERE id=%s AND session_id IN ({placeholders}) AND (active OR compacted)",
+            (int(message_row_id), *lineage),
+        )
+
+    def set_message_reaction(
+        self, session_id: str, message_row_id: int, emoji: str | None, *, author: str = "user",
+    ) -> list[dict[str, Any]] | None:
+        """Set or toggle one author's reaction in ``display_metadata``."""
+        if not session_id or message_row_id is None:
+            return None
+        sql, params = self._reaction_row_query(session_id, message_row_id)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            metadata = self._record_json(row["display_metadata"], object_only=True) or {}
+            existing = self._reaction_list(metadata)
+            previous = next((item for item in existing if item.get("author") == author), None)
+            reactions = [item for item in existing if item.get("author") != author]
+            if emoji and (previous is None or previous.get("emoji") != emoji):
+                reactions.append({"emoji": str(emoji), "author": author, "at": time.time()})
+            if reactions:
+                metadata["reactions"] = reactions
+            else:
+                metadata.pop("reactions", None)
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET display_metadata=%s WHERE id=%s",
+                (self._psycopg.types.json.Jsonb(metadata) if metadata else None, int(message_row_id)),
+            )
+            return reactions
+
+    def get_message_reactions(self, session_id: str, message_row_id: int) -> list[dict[str, Any]]:
+        if not session_id or message_row_id is None:
+            return []
+        sql, params = self._reaction_row_query(session_id, message_row_id)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+        return [] if row is None else self._reaction_list(self._record_json(row["display_metadata"], object_only=True))
+
+    def take_unseen_reactions(self, session_id: str, *, author: str = "user") -> list[dict[str, Any]]:
+        if not session_id:
+            return []
+        lineage = self._resume_lineage_ids(session_id)
+        if not lineage:
+            return []
+        placeholders = ", ".join("%s" for _ in lineage)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT id, role, content, display_metadata FROM {self._schema}.messages "
+                f"WHERE session_id IN ({placeholders}) AND (active OR compacted) "
+                "AND display_metadata->'reactions' IS NOT NULL ORDER BY id",
+                lineage,
+            )
+            pending: list[dict[str, Any]] = []
+            for row in cursor.fetchall():
+                metadata = self._record_json(row["display_metadata"], object_only=True) or {}
+                reactions = self._reaction_list(metadata)
+                changed = False
+                for reaction in reactions:
+                    if reaction.get("author") != author or reaction.get("seen"):
+                        continue
+                    reaction["seen"] = True
+                    changed = True
+                    content = self._decode_content(row["content"])
+                    pending.append({
+                        "row_id": int(row["id"]), "role": row["role"],
+                        "emoji": reaction.get("emoji") or "",
+                        "text": content if isinstance(content, str) else "",
+                    })
+                if changed:
+                    metadata["reactions"] = reactions
+                    cursor.execute(
+                        f"UPDATE {self._schema}.messages SET display_metadata=%s WHERE id=%s",
+                        (self._psycopg.types.json.Jsonb(metadata), row["id"]),
+                    )
+            return pending
+
+    def get_message_role(self, session_id: str, row_id: int) -> str | None:
+        if not session_id:
+            return None
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT role FROM {self._schema}.messages WHERE id=%s AND session_id=%s AND active",
+                (int(row_id), session_id),
+            )
+            row = cursor.fetchone()
+        return None if row is None else str(row[0])
+
+    def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
+        if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+            return 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET content=%s "
+                "WHERE id=%s AND session_id=%s AND role='user' AND active",
+                (self._encode_content(content), row_id, session_id),
+            )
+            return cursor.rowcount
+
+    def set_latest_matching_message_display_kind(
+        self, session_id: str, *, role: str, content: str, display_kind: str,
+        display_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        if not session_id or not content or not display_kind:
+            return False
+        encoded = self._encode_content(content)
+        metadata = self._record_json(display_metadata, object_only=True)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET display_kind=%s, display_metadata=%s "
+                f"WHERE id=(SELECT id FROM {self._schema}.messages WHERE session_id=%s AND role=%s "
+                "AND content=%s AND active ORDER BY id DESC LIMIT 1)",
+                (display_kind, self._psycopg.types.json.Jsonb(metadata) if metadata else None,
+                 session_id, role, encoded),
+            )
+            return cursor.rowcount > 0
+
+    def update_session_tool_names(self, session_id: str, tool_names: list[str] | None) -> None:
+        payload = json.dumps(list(tool_names)) if tool_names is not None else None
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET tool_names=%s WHERE id=%s", (payload, session_id))
+
+    def clear_messages(self, session_id: str) -> None:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.messages WHERE session_id=%s", (session_id,))
+            # PostgreSQL keeps the activity projection separately so clearing the
+            # physical transcript must not leave a stale last-active timestamp.
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET last_activity_at=started_at WHERE id=%s",
+                (session_id,),
+            )
+
+    def list_recent_user_messages(
+        self, session_id: str, limit: int = 20, include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not session_id or int(limit) <= 0:
+            return []
+        active_clause = "" if include_inactive else " AND active"
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT id, created_at AS timestamp, content FROM {self._schema}.messages "
+                f"WHERE session_id=%s AND role='user'{active_clause} "
+                "AND (display_kind IS NULL OR display_kind='' OR display_kind='steer') "
+                "ORDER BY id DESC LIMIT %s",
+                (session_id, int(limit) * 2 + 5),
+            )
+            rows = list(cursor.fetchall())
+        from agent.context_compressor import ContextCompressor
+        from agent.skill_commands import describe_skill_invocation
+        from hermes_state_search import _flatten_text
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if len(result) >= int(limit):
+                break
+            decoded = self._decode_content(row["content"])
+            if ContextCompressor._is_context_summary_content(decoded):
+                continue
+            preview = describe_skill_invocation(decoded) if isinstance(decoded, str) else None
+            preview = preview or (decoded if isinstance(decoded, str) else _flatten_text(decoded))
+            preview = " ".join(preview.split())
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            result.append({"id": int(row["id"]), "timestamp": row["timestamp"], "preview": preview})
+        return result
+
+    def find_pr_url_messages(self, session_ids: list[str]) -> list[dict[str, Any]]:
+        ids = [session_id for session_id in session_ids if session_id]
+        if not ids:
+            return []
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT session_id, content FROM {self._schema}.messages "
+                "WHERE session_id=ANY(%s) AND role='tool' AND content LIKE %s ORDER BY id ASC",
+                (ids, "%/pull/%"),
+            )
+            return [
+                {"session_id": row["session_id"], "content": self._decode_content(row["content"])}
+                for row in cursor.fetchall()
+            ]
+
+    def search_sessions_by_id(
+        self, query: str, limit: int = 20, include_archived: bool = True, source: str | None = None,
+        sources: list[str] | None = None, exclude_sources: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        needle = (query or "").strip().lower()
+        if not needle or limit <= 0:
+            return []
+        clauses = ["TRUE"]
+        params: list[Any] = []
+        if not include_archived:
+            clauses.append("NOT archived")
+        if source is not None:
+            clauses.append("source=%s"); params.append(source)
+        if sources is not None:
+            if not sources:
+                return []
+            clauses.append("source=ANY(%s)"); params.append(sources)
+        if exclude_sources:
+            clauses.append("NOT (source=ANY(%s))"); params.append(exclude_sources)
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"SELECT * FROM {self._schema}.sessions WHERE {' AND '.join(clauses)} "
+                "ORDER BY started_at DESC, id DESC",
+                params,
+            )
+            candidates = [dict(row) for row in cursor.fetchall()]
+        ranked: list[tuple[int, int, dict[str, Any]]] = []
+        seen_roots: set[str] = set()
+        for index, row in enumerate(candidates):
+            row_id = str(row.get("id") or "")
+            lineage = self.get_compression_lineage(row_id)
+            root_id = lineage[0] if lineage else row_id
+            normalized = [row_id.lower(), str(root_id).lower()]
+            if needle not in normalized[0] and needle not in normalized[1]:
+                continue
+            score = 0 if needle in normalized and needle == normalized[0] else (1 if any(value.startswith(needle) for value in normalized) else 2)
+            if root_id in seen_roots:
+                continue
+            seen_roots.add(root_id)
+            row["_lineage_root_id"] = root_id if root_id != row_id else None
+            ranked.append((score, index, row))
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        return [row for _, _, row in ranked[:int(limit)]]
+
+    def count_messages_all(self, session_id: str) -> int:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM {self._schema}.messages WHERE session_id=%s", (session_id,))
+            row = cursor.fetchone()
+        return int(row[0]) if row else 0
     def latest_message_row_id(self, session_id: str, *, role: str = "user", offset: int = 0,
                               require_text: bool = True) -> int | None:
         """Row id of the most recent active *role* message, or ``None`` (oracle parity)."""
@@ -3141,7 +3401,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(
                 f"SELECT s.id, s.source, s.started_at, s.ended_at, s.end_reason, s.title, s.title_source, s.hidden, s.archived, s.pinned, "
                 f"s.system_prompt_hash, s.git_branch, s.git_metadata_generation, s.last_activity_at, s.last_activity_description, s.last_activity_provenance, "
-                f"s.compression_failure_cooldown_until, s.compression_failure_error, s.compression_fallback_streak, s.compression_ineffective_count, s.compression_recovery_deadline, s.last_read_at, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
+                f"s.compression_failure_cooldown_until, s.compression_failure_error, s.compression_fallback_streak, s.compression_ineffective_count, s.compression_recovery_deadline, s.last_read_at, s.tool_names, p.prompt AS system_prompt, {', '.join('s.' + column for column in _SESSION_METADATA_COLUMNS)} "
                 f"FROM {self._schema}.sessions s LEFT JOIN {self._schema}.system_prompts p ON p.hash = s.system_prompt_hash WHERE s.id = %s", (session_id,),
             )
             return cursor.fetchone()

@@ -343,6 +343,24 @@ class PostgreSQLCLISessionStore:
     # AIAgent.  These are the complete read-only contextual primitives already
     # implemented by its selected PostgreSQL store, not SQLite emulation.
     def get_messages(self, session_id: str): return self._store.get_messages(session_id)
+    def get_message_role(self, session_id: str, row_id: int): return self._store.get_message_role(session_id, row_id)
+    def get_message_reactions(self, session_id: str, message_row_id: int): return self._store.get_message_reactions(session_id, message_row_id)
+    def set_message_reaction(self, session_id: str, message_row_id: int, emoji: str | None, *, author: str = "user"):
+        return self._store.set_message_reaction(session_id, message_row_id, emoji, author=author)
+    def take_unseen_reactions(self, session_id: str, *, author: str = "user"):
+        return self._store.take_unseen_reactions(session_id, author=author)
+    def set_user_message_content(self, session_id: str, row_id: int, content: Any):
+        return self._store.set_user_message_content(session_id, row_id, content)
+    def set_latest_matching_message_display_kind(self, session_id: str, **kwargs: Any):
+        return self._store.set_latest_matching_message_display_kind(session_id, **kwargs)
+    def update_session_tool_names(self, session_id: str, tool_names: list[str] | None):
+        return self._store.update_session_tool_names(session_id, tool_names)
+    def clear_messages(self, session_id: str): return self._store.clear_messages(session_id)
+    def list_recent_user_messages(self, session_id: str, limit: int = 20, include_inactive: bool = False):
+        return self._store.list_recent_user_messages(session_id, limit=limit, include_inactive=include_inactive)
+    def find_pr_url_messages(self, session_ids: list[str]): return self._store.find_pr_url_messages(session_ids)
+    def search_sessions_by_id(self, query: str, **kwargs: Any): return self._store.search_sessions_by_id(query, **kwargs)
+    def count_messages_all(self, session_id: str): return self._store.count_messages_all(session_id)
     def get_messages_around(self, session_id: str, around_message_id: int, *, window: int = 5): return self._store.get_messages_around(session_id, around_message_id, window=window)
     def get_anchored_view(self, session_id: str, around_message_id: int, *, window: int, bookend: int): return self._store.get_anchored_view(session_id, around_message_id, window=window, bookend=bookend)
     def get_message_storage_state(self, message_id: int): return self._store.get_message_storage_state(message_id)
