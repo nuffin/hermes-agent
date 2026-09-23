@@ -280,6 +280,35 @@ class PostgreSQLCLISessionStore:
             row = cursor.fetchone()
         return int(row[0]) if row else 0
 
+    def append_delegation_delivery(self, session_id: str, content: str, metadata: Mapping[str, Any]):
+        return self._store.append_delegation_delivery(session_id, content, metadata)
+    def has_archived_messages(self, session_id: str) -> bool:
+        return self._store.has_archived_messages(session_id)
+    def set_topic_session_title(self, session_id: str):
+        return self._store.set_topic_session_title(session_id)
+    def acquire_session_runtime_ownership(self, *args: Any, **kwargs: Any): return self._store.acquire_session_runtime_ownership(*args, **kwargs)
+    def begin_session_runtime_turn(self, *args: Any, **kwargs: Any): return self._store.begin_session_runtime_turn(*args, **kwargs)
+    def get_ancestor_display_prefix(self, *args: Any, **kwargs: Any): return self._store.get_ancestor_display_prefix(*args, **kwargs)
+    def get_resume_message_count(self, *args: Any, **kwargs: Any): return self._store.get_resume_message_count(*args, **kwargs)
+    def has_gateway_input_owner(self, *args: Any, **kwargs: Any): return self._store.has_gateway_input_owner(*args, **kwargs)
+    def has_platform_message_id(self, *args: Any, **kwargs: Any): return self._store.has_platform_message_id(*args, **kwargs)
+    def latest_conversation_boundary(self, *args: Any, **kwargs: Any): return self._store.latest_conversation_boundary(*args, **kwargs)
+    def latest_conversation_role(self, *args: Any, **kwargs: Any): return self._store.latest_conversation_role(*args, **kwargs)
+    def latest_message_row_id(self, *args: Any, **kwargs: Any): return self._store.latest_message_row_id(*args, **kwargs)
+    def promote_to_session_reset(self, *args: Any, **kwargs: Any): return self._store.promote_to_session_reset(*args, **kwargs)
+    def publish_session_git_metadata(self, *args: Any, **kwargs: Any): return self._store.publish_session_git_metadata(*args, **kwargs)
+    def release_session_runtime_ownership(self, *args: Any, **kwargs: Any): return self._store.release_session_runtime_ownership(*args, **kwargs)
+    def renew_session_runtime_ownership(self, *args: Any, **kwargs: Any): return self._store.renew_session_runtime_ownership(*args, **kwargs)
+    def resolve_session_runtime_turn(self, *args: Any, **kwargs: Any): return self._store.resolve_session_runtime_turn(*args, **kwargs)
+    def set_latest_user_api_content(self, *args: Any, **kwargs: Any): return self._store.set_latest_user_api_content(*args, **kwargs)
+    def set_message_api_content(self, *args: Any, **kwargs: Any): return self._store.set_message_api_content(*args, **kwargs)
+    def set_session_archived(self, *args: Any, **kwargs: Any): return self._store.set_session_archived(*args, **kwargs)
+    def set_session_hidden(self, *args: Any, **kwargs: Any): return self._store.set_session_hidden(*args, **kwargs)
+    def supports_session_runtime_handoff_capability(self, *args: Any, **kwargs: Any): return self._store.supports_session_runtime_handoff_capability(*args, **kwargs)
+    def update_session_cwd(self, *args: Any, **kwargs: Any): return self._store.update_session_cwd(*args, **kwargs)
+    def update_session_model(self, *args: Any, **kwargs: Any): return self._store.update_session_model(*args, **kwargs)
+    def update_token_counts(self, *args: Any, **kwargs: Any): return self._store.update_token_counts(*args, **kwargs)
+
     def export_session(self, session_id: str) -> dict[str, Any] | None:
         """Project one complete active PostgreSQL segment into SessionDB export shape."""
         session = self._store.get_session(session_id)
