@@ -26,7 +26,7 @@ Scope and intent:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Mapping, Optional, Protocol, runtime_checkable
 
 __all__ = ["StateStoreInterface"]
 
@@ -95,4 +95,16 @@ class StateStoreInterface(Protocol):
         references), ``"inline"`` (prompt column on sessions), or
         ``"unknown"`` (neither layout detected).
         """
+        ...
+
+    def append_delegation_delivery(self, session_id: str, content: str, metadata: Mapping[str, Any]) -> int:
+        """Append one idempotent detached delegation delivery."""
+        ...
+
+    def has_archived_messages(self, session_id: str) -> bool:
+        """Return whether a session contains soft-archived transcript rows."""
+        ...
+
+    def set_topic_session_title(self, session_id: str) -> Optional[str]:
+        """Set a session title from its first topic and return the title."""
         ...

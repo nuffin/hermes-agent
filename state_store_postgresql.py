@@ -2029,6 +2029,55 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             )
             return int(message_id)
 
+    def append_delegation_delivery(self, session_id: str, content: str, metadata: Mapping[str, Any]) -> int:
+        """Append one idempotent detached-delegation delivery across compression lineage."""
+        delegation_id = metadata.get("delegation_id")
+        if not delegation_id:
+            raise ValueError("Delegation delivery requires a stable delegation_id")
+        display_kind = "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete"
+        display_metadata = dict(metadata)
+        delivery_notice = str(metadata.get("delivery_notice", ""))
+        record = MessageRecord(
+            role="user", content=content, display_kind=display_kind,
+            display_metadata=display_metadata,
+        )
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(
+                f"""WITH RECURSIVE lineage(id) AS (
+                    SELECT %s
+                    UNION
+                    SELECT parent.parent_session_id
+                    FROM {self._schema}.sessions child
+                    JOIN lineage current ON child.id = current.id
+                    JOIN {self._schema}.sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression' AND child.parent_session_id IS NOT NULL
+                )
+                SELECT m.id FROM {self._schema}.messages m
+                JOIN lineage l ON l.id = m.session_id
+                WHERE m.display_kind IN ('async_delegation_complete', 'hidden')
+                  AND m.display_metadata->>'delegation_id' = %s
+                  AND COALESCE(m.display_metadata->>'delivery_notice', '') = %s
+                LIMIT 1""",
+                (session_id, str(delegation_id), delivery_notice),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                return int(existing["id"] if isinstance(existing, Mapping) else existing[0])
+            self._transcript_write_guards(cursor, session_id, reject_active_turn_lease=True)
+            cursor.execute(
+                f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
+                f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id, created_at",
+                self._record_params(session_id, record),
+            )
+            row = cursor.fetchone()
+            message_id = row["id"] if isinstance(row, Mapping) else row[0]
+            created_at = row["created_at"] if isinstance(row, Mapping) else row[1]
+            cursor.execute(
+                f"UPDATE {self._schema}.sessions SET last_activity_at = GREATEST(COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
+                (created_at, session_id),
+            )
+            return int(message_id)
+
     def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int:
         if not records:
             return 0
@@ -2063,6 +2112,16 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 (session_id,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def set_topic_session_title(self, session_id: str) -> str | None:
+        topics = self.get_topics(session_id)
+        if not topics:
+            return None
+        first = str(topics[0]["title"])
+        total = len(topics)
+        title = first if total == 1 else f"{first} (+{total - 1} topics)"
+        self.set_session_title(session_id, title)
+        return title
 
     def get_active_topic(self, session_id: str) -> Optional[dict[str, Any]]:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
@@ -2879,6 +2938,14 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 f"UPDATE {self._schema}.sessions SET last_activity_at=started_at WHERE id=%s",
                 (session_id,),
             )
+
+    def has_archived_messages(self, session_id: str) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT 1 FROM {self._schema}.messages WHERE session_id=%s AND active=false LIMIT 1",
+                (session_id,),
+            )
+            return cursor.fetchone() is not None
 
     def list_recent_user_messages(
         self, session_id: str, limit: int = 20, include_inactive: bool = False,
