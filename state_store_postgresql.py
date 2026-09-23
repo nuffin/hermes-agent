@@ -60,6 +60,8 @@ _GATEWAY_TRANSCRIPT_SCHEMA_VERSION = 25
 _SESSION_TOPICS_SCHEMA_VERSION = 26
 _STATE_META_SCHEMA_VERSION = 27
 _MESSAGE_REACTIONS_SCHEMA_VERSION = 28
+_GATEWAY_PARITY_SCHEMA_VERSION = 29
+_TELEGRAM_TOPIC_SCHEMA_VERSION = 30
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -194,7 +196,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _MESSAGE_REACTIONS_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _TELEGRAM_TOPIC_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -226,6 +228,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_SESSION_TOPICS_SCHEMA_VERSION, self._apply_v26, self._validate_v26),
                     (_STATE_META_SCHEMA_VERSION, self._apply_v27, self._validate_v27),
                     (_MESSAGE_REACTIONS_SCHEMA_VERSION, self._apply_v28, self._validate_v28),
+                    (_GATEWAY_PARITY_SCHEMA_VERSION, self._apply_v29, self._validate_v29),
+                    (_TELEGRAM_TOPIC_SCHEMA_VERSION, self._apply_v30, self._validate_v30),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -820,6 +824,53 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._validate_v27(cursor)
         self._required_columns(cursor, "sessions", {"tool_names"})
 
+    def _apply_v29(self, cursor: Any) -> None:
+        """Gateway coordination parity: handoff state, routing index, and heartbeats."""
+        for column, type_name in {
+            "system_prompt": "text", "message_count": "bigint NOT NULL DEFAULT 0",
+            "tool_call_count": "bigint NOT NULL DEFAULT 0", "handoff_state": "text",
+            "handoff_platform": "text", "handoff_error": "text", "expiry_finalized": "boolean NOT NULL DEFAULT false",
+        }.items():
+            cursor.execute(f"ALTER TABLE {self._schema}.sessions ADD COLUMN IF NOT EXISTS {column} {type_name}")
+        cursor.execute(f"""CREATE TABLE IF NOT EXISTS {self._schema}.gateway_routing (
+            scope text NOT NULL DEFAULT '', session_key text NOT NULL, entry_json text NOT NULL,
+            updated_at double precision NOT NULL, PRIMARY KEY (scope, session_key))""")
+        cursor.execute(f"""CREATE TABLE IF NOT EXISTS {self._schema}.gateway_heartbeats (
+            backend_id text PRIMARY KEY, pid bigint NOT NULL, started_at double precision NOT NULL,
+            last_heartbeat double precision NOT NULL, profile text NOT NULL DEFAULT '', host text NOT NULL DEFAULT '')""")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS gateway_heartbeats_last_heartbeat ON {self._schema}.gateway_heartbeats (last_heartbeat)")
+
+    def _validate_v29(self, cursor: Any) -> None:
+        self._validate_v28(cursor)
+        self._required_columns(cursor, "sessions", {"system_prompt", "message_count", "tool_call_count", "handoff_state", "handoff_platform", "handoff_error", "expiry_finalized"})
+        self._required_columns(cursor, "gateway_routing", {"scope", "session_key", "entry_json", "updated_at"})
+        self._required_columns(cursor, "gateway_heartbeats", {"backend_id", "pid", "started_at", "last_heartbeat", "profile", "host"})
+        self._require_index(cursor, "gateway_heartbeats_last_heartbeat")
+
+    def _apply_v30(self, cursor: Any) -> None:
+        cursor.execute(f"""CREATE TABLE IF NOT EXISTS {self._schema}.telegram_dm_topic_mode (
+            profile_name text NOT NULL DEFAULT 'default', chat_id text NOT NULL, user_id text NOT NULL,
+            enabled boolean NOT NULL DEFAULT true, activated_at double precision NOT NULL,
+            updated_at double precision NOT NULL, has_topics_enabled boolean,
+            allows_users_to_create_topics boolean, capability_checked_at double precision,
+            intro_message_id text, pinned_message_id text, PRIMARY KEY (profile_name, chat_id))""")
+        cursor.execute(f"""CREATE TABLE IF NOT EXISTS {self._schema}.telegram_dm_topic_bindings (
+            profile_name text NOT NULL DEFAULT 'default', chat_id text NOT NULL, thread_id text NOT NULL,
+            user_id text NOT NULL, session_key text NOT NULL, session_id text NOT NULL
+            REFERENCES {self._schema}.sessions(id) ON DELETE CASCADE, managed_mode text NOT NULL DEFAULT 'auto',
+            linked_at double precision NOT NULL, updated_at double precision NOT NULL,
+            PRIMARY KEY (profile_name, chat_id, thread_id))""")
+        cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS telegram_dm_topic_bindings_session ON {self._schema}.telegram_dm_topic_bindings (session_id)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS telegram_dm_topic_bindings_user ON {self._schema}.telegram_dm_topic_bindings (profile_name, user_id, chat_id)")
+
+    def _validate_v30(self, cursor: Any) -> None:
+        self._validate_v29(cursor)
+        self._required_columns(cursor, "telegram_dm_topic_mode", {"profile_name", "chat_id", "user_id", "enabled", "activated_at", "updated_at", "has_topics_enabled", "allows_users_to_create_topics", "capability_checked_at", "intro_message_id", "pinned_message_id"})
+        self._required_columns(cursor, "telegram_dm_topic_bindings", {"profile_name", "chat_id", "thread_id", "user_id", "session_key", "session_id", "managed_mode", "linked_at", "updated_at"})
+        self._require_index(cursor, "telegram_dm_topic_bindings_session")
+        self._require_index(cursor, "telegram_dm_topic_bindings_user")
+        self._require_foreign_key(cursor, "telegram_dm_topic_bindings_session_id_fkey", "telegram_dm_topic_bindings", "sessions")
+
     def get_meta(self, key: str) -> str | None:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT value FROM {self._schema}.state_meta WHERE key=%s", (key,))
@@ -849,6 +900,147 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             return [(str(row[0]), str(row[1])) for row in cursor.fetchall()]
 
     @staticmethod
+    def _gateway_runtime_from_meta(session_meta: Mapping[str, Any] | None) -> dict[str, Any]:
+        raw = (session_meta or {}).get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        if not isinstance(raw, Mapping):
+            raw = {}
+        runtime = raw.get("gateway_runtime")
+        if isinstance(runtime, Mapping) and runtime.get("provider"):
+            return {k: v for k, v in runtime.items() if v is not None}
+        top = {k: raw.get(k) for k in ("provider", "base_url", "api_mode") if raw.get(k)}
+        if top:
+            return top
+        provider = str((session_meta or {}).get("billing_provider") or "").strip()
+        return {"provider": provider} if provider and provider.lower() not in {"auto", "custom"} else {}
+
+    session_gateway_runtime = staticmethod(_gateway_runtime_from_meta)
+
+    def request_handoff(self, session_id: str, platform: str) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET handoff_state='pending', handoff_platform=%s, handoff_error=NULL WHERE id=%s AND (handoff_state IS NULL OR handoff_state IN ('completed','failed'))", (platform, session_id))
+            return cursor.rowcount > 0
+
+    def get_handoff_state(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT handoff_state, handoff_platform, handoff_error FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+            row = cursor.fetchone()
+            return None if row is None else {"state": row["handoff_state"], "platform": row["handoff_platform"], "error": row["handoff_error"]}
+
+    def list_pending_handoffs(self) -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT * FROM {self._schema}.sessions WHERE handoff_state='pending' ORDER BY started_at ASC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def claim_handoff(self, session_id: str) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET handoff_state='running' WHERE id=%s AND handoff_state='pending'", (session_id,))
+            return cursor.rowcount > 0
+
+    def has_pending_handoffs(self) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE handoff_state='pending' LIMIT 1")
+            return cursor.fetchone() is not None
+
+    def complete_handoff(self, session_id: str) -> None:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET handoff_state='completed', handoff_error=NULL WHERE id=%s", (session_id,))
+
+    def fail_handoff(self, session_id: str, error: str, *, only_states: tuple[str, ...] | None = None) -> bool:
+        states = tuple(only_states or ())
+        clause = " AND handoff_state IN (" + ",".join("%s" for _ in states) + ")" if states else ""
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET handoff_state='failed', handoff_error=%s WHERE id=%s{clause}", (str(error)[:500], session_id, *states))
+            return cursor.rowcount > 0
+
+    def reclaim_stale_running_handoffs(self, error: str) -> list[str]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET handoff_state='failed', handoff_error=%s WHERE handoff_state='running' RETURNING id", (str(error)[:500],))
+            return [str(row[0]) for row in cursor.fetchall()]
+
+    def register_backend_heartbeat(self, *, backend_id: str, pid: int, started_at: float, last_heartbeat: float | None = None, profile: str = "", host: str = "") -> None:
+        if not backend_id:
+            return
+        ts = time.time() if last_heartbeat is None else float(last_heartbeat)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"INSERT INTO {self._schema}.gateway_heartbeats (backend_id,pid,started_at,last_heartbeat,profile,host) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (backend_id) DO UPDATE SET pid=EXCLUDED.pid,started_at=EXCLUDED.started_at,last_heartbeat=EXCLUDED.last_heartbeat,profile=EXCLUDED.profile,host=EXCLUDED.host", (str(backend_id), int(pid), float(started_at), ts, str(profile), str(host)))
+
+    def list_backend_heartbeats(self) -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT backend_id,pid,started_at,last_heartbeat,profile,host FROM {self._schema}.gateway_heartbeats ORDER BY last_heartbeat DESC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def clear_backend_heartbeat(self, backend_id: str) -> bool:
+        if not backend_id:
+            return False
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_heartbeats WHERE backend_id=%s", (str(backend_id),))
+            return cursor.rowcount > 0
+
+    def prune_stale_heartbeats(self, *, max_age_seconds: float) -> list[str]:
+        if max_age_seconds <= 0:
+            return []
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_heartbeats WHERE last_heartbeat < %s RETURNING backend_id", (time.time() - float(max_age_seconds),))
+            return [str(row[0]) for row in cursor.fetchall()]
+
+    def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
+        if not session_key or not entry_json:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"INSERT INTO {self._schema}.gateway_routing (scope,session_key,entry_json,updated_at) VALUES (%s,%s,%s,%s) ON CONFLICT (scope,session_key) DO UPDATE SET entry_json=EXCLUDED.entry_json,updated_at=EXCLUDED.updated_at", (scope, session_key, entry_json, time.time()))
+
+    def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT session_key,entry_json FROM {self._schema}.gateway_routing WHERE scope=%s", (scope,))
+            return {str(row[0]): str(row[1]) for row in cursor.fetchall()}
+
+    def replace_gateway_routing_entries(self, entries: dict[str, str], *, scope: str = "") -> None:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_routing WHERE scope=%s", (scope,))
+            for key, value in entries.items():
+                if key and value:
+                    cursor.execute(f"INSERT INTO {self._schema}.gateway_routing (scope,session_key,entry_json,updated_at) VALUES (%s,%s,%s,%s)", (scope, key, value, time.time()))
+
+    def list_gateway_routing_rows(self) -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT scope,session_key,entry_json,updated_at FROM {self._schema}.gateway_routing ORDER BY scope,session_key")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_gateway_routing_rows(self, rows: Any) -> int:
+        pairs = list(rows or [])
+        with self._connection() as connection, connection.cursor() as cursor:
+            count = 0
+            for scope, key in pairs:
+                cursor.execute(f"DELETE FROM {self._schema}.gateway_routing WHERE scope=%s AND session_key=%s", (scope, key))
+                count += cursor.rowcount
+            return count
+
+    def insert_gateway_routing_rows_if_absent(self, rows: Any) -> int:
+        records = list(rows or [])
+        with self._connection() as connection, connection.cursor() as cursor:
+            count = 0
+            for row in records:
+                cursor.execute(f"INSERT INTO {self._schema}.gateway_routing (scope,session_key,entry_json,updated_at) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", row)
+                count += cursor.rowcount
+            return count
+
+    def gateway_routing_entry_for_session(self, session_id: str) -> dict[str, Any] | None:
+        import json as _json
+        for row in self.list_gateway_routing_rows():
+            try:
+                entry = _json.loads(row["entry_json"] or "{}")
+            except Exception:
+                continue
+            if isinstance(entry, dict) and entry.get("session_id") == session_id:
+                return entry
+        return None
+
+    @staticmethod
     def _apply_model_config_patch(config: Any, patch: Mapping[str, Any]) -> dict[str, Any]:
         merged = PostgreSQLStateStore._model_config_object(config)
         for key, value in patch.items():
@@ -857,6 +1049,189 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             else:
                 merged[key] = value
         return merged
+
+    def apply_telegram_topic_migration(self) -> None:
+        """Migration v30 is applied at store open; retained as an idempotent API."""
+        return None
+
+    @staticmethod
+    def _topic_profile(profile_name: str) -> str:
+        return str(profile_name or "default").strip() or "default"
+
+    def enable_telegram_topic_mode(self, *, chat_id: str, user_id: str, profile_name: str = "default", has_topics_enabled: bool | None = None, allows_users_to_create_topics: bool | None = None) -> None:
+        profile = self._topic_profile(profile_name); now = time.time()
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"INSERT INTO {self._schema}.telegram_dm_topic_mode (profile_name,chat_id,user_id,enabled,activated_at,updated_at,has_topics_enabled,allows_users_to_create_topics,capability_checked_at) VALUES (%s,%s,%s,true,%s,%s,%s,%s,%s) ON CONFLICT (profile_name,chat_id) DO UPDATE SET user_id=EXCLUDED.user_id,enabled=true,updated_at=EXCLUDED.updated_at,has_topics_enabled=EXCLUDED.has_topics_enabled,allows_users_to_create_topics=EXCLUDED.allows_users_to_create_topics,capability_checked_at=EXCLUDED.capability_checked_at", (profile, str(chat_id), str(user_id), now, now, has_topics_enabled, allows_users_to_create_topics, now))
+
+    def disable_telegram_topic_mode(self, *, chat_id: str, profile_name: str = "default", clear_bindings: bool = True) -> None:
+        profile = self._topic_profile(profile_name)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_mode SET enabled=false,updated_at=%s WHERE profile_name=%s AND chat_id=%s", (time.time(), profile, str(chat_id)))
+            if clear_bindings:
+                cursor.execute(f"DELETE FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s AND chat_id=%s", (profile, str(chat_id)))
+
+    def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str, profile_name: str = "default") -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT enabled FROM {self._schema}.telegram_dm_topic_mode WHERE profile_name=%s AND chat_id=%s AND user_id=%s", (self._topic_profile(profile_name), str(chat_id), str(user_id)))
+            row = cursor.fetchone(); return bool(row[0]) if row else False
+
+    def get_telegram_topic_binding(self, *, chat_id: str, thread_id: str, profile_name: str = "default") -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT * FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s AND chat_id=%s AND thread_id=%s", (self._topic_profile(profile_name), str(chat_id), str(thread_id)))
+            row = cursor.fetchone(); return None if row is None else dict(row)
+
+    def get_telegram_topic_binding_by_session(self, *, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT * FROM {self._schema}.telegram_dm_topic_bindings WHERE session_id=%s", (str(session_id),))
+            row = cursor.fetchone(); return None if row is None else dict(row)
+
+    def list_telegram_topic_bindings_for_chat(self, *, chat_id: str, profile_name: str = "default") -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT * FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s AND chat_id=%s ORDER BY updated_at DESC", (self._topic_profile(profile_name), str(chat_id)))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def bind_telegram_topic(self, *, chat_id: str, thread_id: str, user_id: str, session_key: str, session_id: str, managed_mode: str = "auto", profile_name: str = "default") -> None:
+        profile = self._topic_profile(profile_name); now = time.time()
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT profile_name,chat_id,thread_id FROM {self._schema}.telegram_dm_topic_bindings WHERE session_id=%s", (str(session_id),))
+            row = cursor.fetchone()
+            if row and tuple(map(str, row)) != (profile, str(chat_id), str(thread_id)):
+                raise ValueError("session is already linked to another Telegram topic")
+            cursor.execute(f"INSERT INTO {self._schema}.telegram_dm_topic_bindings (profile_name,chat_id,thread_id,user_id,session_key,session_id,managed_mode,linked_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (profile_name,chat_id,thread_id) DO UPDATE SET user_id=EXCLUDED.user_id,session_key=EXCLUDED.session_key,session_id=EXCLUDED.session_id,managed_mode=EXCLUDED.managed_mode,updated_at=EXCLUDED.updated_at", (profile, str(chat_id), str(thread_id), str(user_id), str(session_key), str(session_id), str(managed_mode), now, now))
+
+    def delete_telegram_topic_binding(self, *, chat_id: str, thread_id: str, profile_name: str = "default") -> int:
+        profile = self._topic_profile(profile_name)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s AND chat_id=%s AND thread_id=%s", (profile, str(chat_id), str(thread_id)))
+            deleted = cursor.rowcount
+            if deleted:
+                cursor.execute(f"SELECT 1 FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s AND chat_id=%s LIMIT 1", (profile, str(chat_id)))
+                if cursor.fetchone() is None:
+                    cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_mode SET enabled=false,updated_at=%s WHERE profile_name=%s AND chat_id=%s", (time.time(), profile, str(chat_id)))
+            return deleted
+
+    def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.telegram_dm_topic_bindings WHERE session_id=%s LIMIT 1", (str(session_id),)); return cursor.fetchone() is not None
+
+    def list_unlinked_telegram_sessions_for_user(self, *, chat_id: str, user_id: str, profile_name: str = "default", limit: int = 10) -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT s.* FROM {self._schema}.sessions s WHERE s.source='telegram' AND s.chat_id=%s AND s.user_id=%s AND COALESCE(s.profile_name,'default')=%s AND NOT EXISTS (SELECT 1 FROM {self._schema}.telegram_dm_topic_bindings b WHERE b.session_id=s.id) ORDER BY COALESCE(s.last_activity_at,s.started_at) DESC LIMIT %s", (str(chat_id), str(user_id), self._topic_profile(profile_name), int(limit)))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def find_profile_less_telegram_topic_rows(self) -> list[dict[str, Any]]:
+        rows = []
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT chat_id,thread_id,session_key FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name='default' ORDER BY chat_id,thread_id")
+            for row in cursor.fetchall():
+                parts = str(row["session_key"]).split(":")
+                if len(parts) >= 3 and parts[0] == "agent" and parts[1] != "main":
+                    rows.append({**dict(row), "key_profile": parts[1]})
+        return rows
+
+    def relabel_telegram_topic_rows(self, rows: Any) -> dict[str, int]:
+        counts = {"bindings_relabelled": 0, "bindings_duplicates_removed": 0, "mode_rows_relabelled": 0}
+        with self._connection() as connection, connection.cursor() as cursor:
+            for row in list(rows or []):
+                target = row.get("key_profile")
+                if not target or target == "default":
+                    continue
+                chat, thread = str(row["chat_id"]), str(row["thread_id"])
+                cursor.execute(f"SELECT 1 FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s AND chat_id=%s AND thread_id=%s", (target, chat, thread))
+                if cursor.fetchone():
+                    cursor.execute(f"DELETE FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name='default' AND chat_id=%s AND thread_id=%s", (chat, thread)); counts["bindings_duplicates_removed"] += cursor.rowcount
+                else:
+                    cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_bindings SET profile_name=%s WHERE profile_name='default' AND chat_id=%s AND thread_id=%s", (target, chat, thread)); counts["bindings_relabelled"] += cursor.rowcount
+                cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_mode SET profile_name=%s WHERE profile_name='default' AND chat_id=%s AND NOT EXISTS (SELECT 1 FROM {self._schema}.telegram_dm_topic_mode m2 WHERE m2.profile_name=%s AND m2.chat_id=%s)", (target, chat, target, chat)); counts["mode_rows_relabelled"] += cursor.rowcount
+        return counts
+
+    def record_gateway_session_peer(self, session_id: str, *, source: str, user_id: str = None, session_key: str = None, chat_id: str = None, chat_type: str = None, thread_id: str = None, display_name: str = None, origin_json: str = None, include_compression_ancestors: bool = False, transport_profile: str = None) -> None:
+        if not session_id or not session_key:
+            return
+        self.ensure_session(session_id, source=source, metadata={"session_key": session_key, "user_id": user_id, "chat_id": chat_id, "chat_type": chat_type, "thread_id": thread_id, "display_name": display_name, "origin_json": origin_json, "transport_profile": transport_profile})
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET session_key=%s,source=%s,user_id=%s,chat_id=%s,chat_type=%s,thread_id=%s,display_name=COALESCE(%s,display_name),origin_json=COALESCE(%s,origin_json),transport_profile=COALESCE(%s,transport_profile) WHERE id=%s", (session_key, source, user_id, chat_id, chat_type, thread_id, display_name, origin_json, transport_profile, session_id))
+
+    def find_latest_gateway_session_for_peer(self, *, source: str, user_id: str = None, session_key: str = None, chat_id: str = None, chat_type: str = None, thread_id: str = None) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            if session_key:
+                cursor.execute(f"SELECT * FROM {self._schema}.sessions WHERE session_key=%s AND source=%s ORDER BY COALESCE(last_activity_at,started_at) DESC,started_at DESC LIMIT 1", (session_key, source))
+                row = cursor.fetchone()
+                if row is not None:
+                    return dict(row)
+            if chat_id is None or chat_type is None:
+                return None
+            cursor.execute(f"SELECT * FROM {self._schema}.sessions WHERE source=%s AND user_id IS NOT DISTINCT FROM %s AND chat_id=%s AND chat_type=%s AND thread_id IS NOT DISTINCT FROM %s AND session_key IS NOT NULL ORDER BY COALESCE(last_activity_at,started_at) DESC,started_at DESC LIMIT 1", (source, user_id, str(chat_id), str(chat_type), None if thread_id is None else str(thread_id)))
+            row = cursor.fetchone(); return None if row is None else dict(row)
+
+    def find_orphaned_gateway_sessions(self, *, max_gap_s: float | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT s.* FROM {self._schema}.sessions s WHERE s.session_key IS NULL AND EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id=s.id) ORDER BY s.started_at")
+            return [{"orphan_id": row["id"], "source": row["source"], "message_count": row.get("message_count", 0), "started_at": row["started_at"], "last_active": row.get("last_activity_at"), "donor_id": None, "session_key": None, "evidence": "", "adoptable": False, "reason": "no keyed predecessor"} for row in cursor.fetchall()]
+
+    def update_session_runtime_lock(self, session_id: str, *, model: str = None, provider: str = None, model_options: dict[str, Any] = None, route_source: str = None, confirmed: bool = False) -> None:
+        lock = {"provider": provider or "", "model": model or "", "model_options": model_options or {}, "route_source": route_source or "", "confirmed": bool(confirmed), "updated_at": time.time()}
+        self.patch_session_model_config(session_id, {"browser_model_lock": lock})
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET model=COALESCE(%s,model),system_prompt=NULL,system_prompt_hash=NULL WHERE id=%s", (model, session_id))
+
+    def session_count_ge(self, n: int = 1) -> bool:
+        if n <= 0:
+            return True
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions LIMIT %s", (int(n),)); return len(cursor.fetchall()) >= int(n)
+
+    def get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> dict[str, Any] | None:
+        return self.get_session(session_id)
+
+    def key_profiles_for_chat(self, platform: str, chat_id: str) -> set[str]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT DISTINCT session_key FROM {self._schema}.sessions WHERE source=%s AND chat_id=%s AND session_key LIKE 'agent:%%'", (platform, str(chat_id)))
+            result = set()
+            for row in cursor.fetchall():
+                parts = str(row[0]).split(":")
+                if len(parts) >= 3:
+                    result.add("default" if parts[1] == "main" else parts[1])
+            return result
+
+    def list_never_active_keyed_sessions(self, *, older_than_days: float) -> list[dict[str, Any]]:
+        cutoff = time.time() - float(older_than_days) * 86400.0
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT s.id,s.session_key,s.source,s.chat_id,s.chat_type,s.user_id,s.started_at FROM {self._schema}.sessions s WHERE s.session_key IS NOT NULL AND s.ended_at IS NULL AND s.title IS NULL AND s.last_activity_at IS NULL AND COALESCE(s.message_count,0)=0 AND COALESCE(s.tool_call_count,0)=0 AND COALESCE(s.input_tokens,0)=0 AND COALESCE(s.output_tokens,0)=0 AND NOT EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id=s.id) AND s.started_at < %s ORDER BY s.started_at", (cutoff,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def prune_never_active_keyed_sessions(self, *, older_than_days: float, sessions_dir: Any = None) -> tuple[int, int]:
+        candidates = self.list_never_active_keyed_sessions(older_than_days=older_than_days)
+        ids = [row["id"] for row in candidates]
+        if not ids:
+            return (0, 0)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_routing WHERE entry_json::jsonb->>'session_id' = ANY(%s)", (ids,))
+            routing_deleted = cursor.rowcount
+            cursor.execute(f"DELETE FROM {self._schema}.sessions WHERE id = ANY(%s)", (ids,))
+            return (cursor.rowcount, routing_deleted)
+
+    def acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, wait_seconds: float = 0.0, poll_interval_seconds: float = 1.0, on_wait=None, wait_notice_interval_seconds: float = 15.0, should_abort=None, **_: Any) -> bool:
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        while True:
+            if should_abort and should_abort():
+                return False
+            if self.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            if on_wait:
+                on_wait(0.0)
+            time.sleep(min(max(0.01, float(poll_interval_seconds)), max(0.01, deadline - time.monotonic())))
+
+    def adopt_session_lineage_from(self, donor_db: Any, session_id: str, *, retire_donor: bool = True) -> dict[str, Any]:
+        payload = donor_db.export_session_for_move(session_id) if hasattr(donor_db, "export_session_for_move") else None
+        if not payload:
+            return {"status": "missing", "session_id": session_id}
+        result = self.import_moved_session(payload, profile_name=payload.get("session", {}).get("profile_name") or "default") if hasattr(self, "import_moved_session") else {"status": "unsupported", "session_id": session_id}
+        if retire_donor and result in {"imported", "present"} and hasattr(donor_db, "delete_moved_session"):
+            donor_db.delete_moved_session(session_id)
+        return {"status": result, "session_id": session_id}
 
     @staticmethod
     def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
