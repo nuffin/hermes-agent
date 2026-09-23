@@ -4425,6 +4425,486 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         numbers = [int(match.group(2)) for row in rows if (match := _NUMBERED_TITLE_RE.match(row["title"]))]
         return f"{base} #{max([1, *numbers]) + 1}"
 
+    # ── Administrative / maintenance parity ────────────────────────────────
+
+    @staticmethod
+    def _admin_session_key_profile(session_key: Any) -> str | None:
+        value = str(session_key or "")
+        if not value.startswith("agent:"):
+            return None
+        tail = value[6:]
+        profile = tail.split(":", 1)[0]
+        return profile or None
+
+    @staticmethod
+    def _admin_export_timings(messages: list[Mapping[str, Any]], session_id: str) -> dict[str, Any]:
+        from hermes_state_portability import _export_timings
+        return _export_timings([dict(message) for message in messages], session_id)
+
+    def _admin_export_message_rows(self, cursor: Any, session_id: str, *, active_only: bool) -> list[dict[str, Any]]:
+        predicate = " AND active" if active_only else ""
+        cursor.execute(
+            f"SELECT * FROM {self._schema}.messages WHERE session_id=%s{predicate} ORDER BY id",
+            (session_id,),
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            if "content" in row:
+                row["content"] = self._decode_content(row["content"])
+            if "timestamp" not in row and "created_at" in row:
+                row["timestamp"] = row["created_at"]
+        return rows
+
+    def _admin_export_session(self, cursor: Any, session_id: str, *, active_only: bool = True) -> dict[str, Any] | None:
+        cursor.execute(f"SELECT * FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+        session = cursor.fetchone()
+        if session is None:
+            return None
+        result = dict(session)
+        cursor.execute(f"SELECT p.prompt FROM {self._schema}.sessions s LEFT JOIN {self._schema}.system_prompts p ON p.hash=s.system_prompt_hash WHERE s.id=%s", (session_id,))
+        prompt_row = cursor.fetchone()
+        result["system_prompt"] = None if prompt_row is None else prompt_row["prompt"]
+        messages = self._admin_export_message_rows(cursor, session_id, active_only=active_only)
+        result["messages"] = messages
+        result["message_count"] = len(messages)
+        result["timings"] = self._admin_export_timings(messages, session_id)
+        return result
+
+    def export_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            return self._admin_export_session(cursor, session_id)
+
+    def export_session_lineage(self, session_id: str) -> dict[str, Any] | None:
+        lineage = self.get_compression_lineage(session_id)
+        if not lineage:
+            return None
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            segments = [item for item in (self._admin_export_session(cursor, sid) for sid in lineage) if item]
+        if not segments:
+            return None
+        messages = [message for segment in segments for message in segment.get("messages", [])]
+        return {
+            **segments[-1], "segments": segments,
+            "lineage_session_ids": [segment["id"] for segment in segments],
+            "message_count": len(messages), "messages": messages,
+            "timings": self._admin_export_timings(messages, session_id),
+        }
+
+    def export_all(self, source: str | None = None) -> list[dict[str, Any]]:
+        clauses, params = ([("source=%s", [source])] if source is not None else ([], []))
+        where = f" WHERE {clauses[0][0]}" if clauses else ""
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions{where} ORDER BY started_at, id", params)
+            ids = [str(row["id"]) for row in cursor.fetchall()]
+            return [item for item in (self._admin_export_session(cursor, sid) for sid in ids) if item]
+
+    def assert_export_safe(self, session_id: str, max_messages: int | None = None) -> int:
+        from hermes_state import SessionExportTooLargeError, resolved_max_export_messages
+        if max_messages is None:
+            max_messages = resolved_max_export_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        if max_messages == 0:
+            return 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM (SELECT 1 FROM {self._schema}.messages WHERE session_id=%s AND active LIMIT %s) AS bounded",
+                (session_id, max_messages + 1),
+            )
+            count = int(cursor.fetchone()[0])
+        if count > max_messages:
+            raise SessionExportTooLargeError(session_id, count, max_messages)
+        return count
+
+    def export_session_for_move(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT * FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+            session = cursor.fetchone()
+            if session is None:
+                return None
+            cursor.execute(f"SELECT prompt FROM {self._schema}.system_prompts WHERE hash=%s", (session["system_prompt_hash"],))
+            prompt = (cursor.fetchone() or {}).get("prompt") if session.get("system_prompt_hash") else None
+            messages = self._admin_export_message_rows(cursor, session_id, active_only=False)
+            cursor.execute(f"SELECT * FROM {self._schema}.session_model_usage WHERE session_id=%s", (session_id,))
+            usage = [dict(row) for row in cursor.fetchall()]
+            return {"session": dict(session), "system_prompt": prompt, "messages": messages, "usage": usage}
+
+    @staticmethod
+    def _admin_jsonb_value(value: Any) -> Any:
+        return value
+
+    def import_moved_session(self, payload: Mapping[str, Any], *, profile_name: str) -> str:
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("session"), Mapping):
+            raise ValueError("moved session payload requires a session object")
+        session = dict(payload["session"])
+        session_id = str(session.get("id") or "")
+        if not session_id:
+            raise ValueError("moved session payload requires an id")
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+            if cursor.fetchone() is not None:
+                return "present"
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE id=%s", (session.get("parent_session_id"),))
+            if not session.get("parent_session_id") or cursor.fetchone() is None:
+                session["parent_session_id"] = None
+            session["profile_name"] = profile_name
+            prompt = payload.get("system_prompt")
+            prompt_hash = None
+            if prompt is not None:
+                prompt_hash = hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.system_prompts (hash,prompt) VALUES (%s,%s) ON CONFLICT (hash) DO NOTHING",
+                    (prompt_hash, str(prompt)),
+                )
+            session["system_prompt_hash"] = prompt_hash
+            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name='sessions'", (self._schema,))
+            columns = {str(row["column_name"]) for row in cursor.fetchall()} - {"search_document"}
+            names = [name for name in session if name in columns and name != "system_prompt"]
+            values = []
+            for name in names:
+                value = session[name]
+                if name in {"model_config", "origin_json"} and value is not None:
+                    value = self._psycopg.types.json.Jsonb(value if not isinstance(value, str) else json.loads(value))
+                values.append(value)
+            cursor.execute(
+                f"INSERT INTO {self._schema}.sessions ({', '.join(names)}) VALUES ({', '.join('%s' for _ in names)})",
+                values,
+            )
+            message_columns = {"session_id", "role", "content", "created_at", *_MESSAGE_RECORD_WRITE_COLUMNS}
+            for raw in payload.get("messages") or []:
+                message = dict(raw)
+                message.pop("id", None)
+                names = [name for name in message if name in message_columns and name not in {"active", "compacted", "display_identity"}]
+                vals = []
+                for name in names:
+                    value = message[name]
+                    if name in {"tool_calls", "display_metadata"} and value is not None:
+                        value = self._psycopg.types.json.Jsonb(value if not isinstance(value, str) else json.loads(value))
+                    vals.append(value)
+                if "session_id" not in names:
+                    names.insert(0, "session_id"); vals.insert(0, session_id)
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.messages ({', '.join(names)}) VALUES ({', '.join('%s' for _ in names)})",
+                    vals,
+                )
+            for raw in payload.get("usage") or []:
+                usage = {key: value for key, value in dict(raw).items() if key != "session_id"}
+                usage["session_id"] = session_id
+                names = [name for name in usage if name in {"session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task", "api_call_count", *_USAGE_COUNTERS, "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source", "first_seen", "last_seen"}]
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.session_model_usage ({', '.join(names)}) VALUES ({', '.join('%s' for _ in names)}) ON CONFLICT DO NOTHING",
+                    [usage[name] for name in names],
+                )
+            return "imported"
+
+    def import_sessions(self, sessions: list[Mapping[str, Any]]) -> dict[str, Any]:
+        if not isinstance(sessions, list):
+            raise ValueError("sessions must be a list")
+        if len(sessions) > 10000:
+            raise ValueError("sessions must contain at most 10000 entries")
+        for item in sessions:
+            if not isinstance(item, Mapping) or not item.get("id"):
+                return {"ok": False, "imported": 0, "skipped": 0, "detached": 0, "imported_ids": [], "skipped_ids": [], "errors": [{"error": "session export requires an id"}]}
+            if not isinstance(item.get("messages", []), list):
+                return {"ok": False, "imported": 0, "skipped": 0, "detached": 0, "imported_ids": [], "skipped_ids": [], "errors": [{"id": item.get("id"), "error": "messages must be a list"}]}
+        imported_ids: list[str] = []
+        skipped_ids: list[str] = []
+        for item in sessions:
+            payload = {"session": item, "system_prompt": item.get("system_prompt"), "messages": item.get("messages", []), "usage": item.get("usage", [])}
+            outcome = self.import_moved_session(payload, profile_name=item.get("profile_name"))
+            (skipped_ids if outcome == "present" else imported_ids).append(str(item["id"]))
+        return {"ok": True, "imported": len(imported_ids), "skipped": len(skipped_ids), "detached": 0, "imported_ids": imported_ids, "skipped_ids": skipped_ids, "errors": []}
+    def _admin_delete_rows(self, cursor: Any, session_ids: Collection[str]) -> None:
+        ids = [str(value) for value in session_ids if value]
+        if not ids:
+            return
+        for table in ("gateway_session_routes", "foreign_import_receipts", "session_control_state", "rewind_receipts", "compression_locks", "telegram_dm_topic_bindings", "session_model_usage", "messages", "session_topics"):
+            cursor.execute(f"DELETE FROM {self._schema}.{table} WHERE session_id = ANY(%s)", (ids,))
+        cursor.execute(f"DELETE FROM {self._schema}.compression_rotation_receipts WHERE parent_session_id=ANY(%s) OR child_session_id=ANY(%s)", (ids, ids))
+        cursor.execute(f"UPDATE {self._schema}.sessions SET parent_session_id=NULL WHERE parent_session_id=ANY(%s)", (ids,))
+        cursor.execute(f"DELETE FROM {self._schema}.sessions WHERE id=ANY(%s)", (ids,))
+
+    def delete_moved_session(self, session_id: str) -> bool:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                return False
+            self._admin_delete_rows(cursor, [session_id])
+            return True
+
+    def _admin_delegate_children(self, cursor: Any, roots: list[str]) -> list[str]:
+        result: list[str] = []
+        pending = list(roots)
+        while pending:
+            cursor.execute(f"SELECT id, model_config FROM {self._schema}.sessions WHERE parent_session_id=ANY(%s)", (pending,))
+            next_ids = []
+            for row in cursor.fetchall():
+                config = row[1] if not isinstance(row, Mapping) else row["model_config"]
+                if isinstance(config, str):
+                    try: config = json.loads(config)
+                    except json.JSONDecodeError: config = {}
+                if isinstance(config, Mapping) and config.get("_delegate_from"):
+                    next_ids.append(str(row[0] if not isinstance(row, Mapping) else row["id"]))
+            result.extend(next_ids); pending = next_ids
+        return result
+
+    def get_session_delete_targets(self, session_id: str) -> list[str]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE id=%s", (session_id,))
+            if cursor.fetchone() is None:
+                return []
+            return [session_id, *sorted(self._admin_delegate_children(cursor, [session_id]))]
+
+    def delete_session(self, session_id: str, sessions_dir: Any = None, expected_delete_ids: list[str] | None = None) -> bool:
+        del sessions_dir
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                return False
+            targets = [session_id, *self._admin_delegate_children(cursor, [session_id])]
+            if expected_delete_ids is not None and set(expected_delete_ids) != set(targets):
+                return False
+            self._admin_delete_rows(cursor, targets)
+            return True
+
+    def delete_sessions(self, session_ids: list[str], sessions_dir: Any = None) -> int:
+        del sessions_dir
+        unique = list(dict.fromkeys(str(value) for value in (session_ids or []) if value))
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=ANY(%s) FOR UPDATE", (unique,))
+            roots = [str(row[0]) for row in cursor.fetchall()]
+            targets = roots + self._admin_delegate_children(cursor, roots)
+            if targets: self._admin_delete_rows(cursor, targets)
+            return len(roots)
+
+    def delete_session_if_empty(self, session_id: str, sessions_dir: Any = None, **kwargs: Any) -> bool:
+        del sessions_dir
+        if kwargs: raise TypeError(f"unsupported delete_session_if_empty options: {', '.join(sorted(kwargs))}")
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.sessions s WHERE s.id=%s AND s.title IS NULL AND NOT EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id=s.id) AND NOT EXISTS (SELECT 1 FROM {self._schema}.sessions c WHERE c.parent_session_id=s.id)", (session_id,))
+            if cursor.fetchone() is None: return False
+            self._admin_delete_rows(cursor, [session_id]); return True
+
+    def count_empty_sessions(self) -> int:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM {self._schema}.sessions s WHERE s.message_count=0 AND s.ended_at IS NOT NULL AND NOT s.archived AND NOT EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id=s.id)")
+            return int(cursor.fetchone()[0])
+
+    def delete_empty_sessions(self, sessions_dir: Any = None) -> int:
+        del sessions_dir
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions s WHERE s.message_count=0 AND s.ended_at IS NOT NULL AND NOT s.archived AND NOT EXISTS (SELECT 1 FROM {self._schema}.messages m WHERE m.session_id=s.id)")
+            ids = [str(row[0]) for row in cursor.fetchall()]
+            if ids: self._admin_delete_rows(cursor, ids)
+            return len(ids)
+
+    def find_foreign_import(self, origin: Mapping[str, Any]) -> str | None:
+        if not isinstance(origin, Mapping) or not origin.get("tool"):
+            return None
+        fingerprint, _canonical = self._foreign_import_fingerprint(origin)
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT session_id FROM {self._schema}.foreign_import_receipts WHERE origin_fingerprint=%s", (fingerprint,))
+            row = cursor.fetchone()
+            return None if row is None else str(row[0])
+
+    def find_session_by_origin(self, *, platform: str, chat_id: str, thread_id: str | None = None, user_id: str | None = None) -> str | None:
+        if not platform or chat_id in (None, ""): return None
+        clauses = ["LOWER(source)=LOWER(%s)", "session_key IS NOT NULL", "chat_id=%s", "ended_at IS NULL"]
+        params: list[Any] = [platform, str(chat_id)]
+        if thread_id is not None: clauses.append("COALESCE(thread_id,'')=%s"); params.append(str(thread_id))
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id,user_id FROM {self._schema}.sessions WHERE {' AND '.join(clauses)} ORDER BY started_at DESC", params)
+            rows = list(cursor.fetchall())
+        if not rows: return None
+        if user_id:
+            exact = [row for row in rows if str(row.get("user_id") or "") == str(user_id)]
+            if exact: return str(exact[0]["id"])
+            if len(rows) > 1: return None
+        elif len({str(row.get("user_id") or "").strip() for row in rows if row.get("user_id")}) > 1: return None
+        return str(rows[0]["id"])
+
+    get_session_by_origin = find_session_by_origin
+
+    def backfill_null_session_profiles(self, profile_name: str) -> int:
+        stamp = (profile_name or "").strip()
+        if not stamp: return 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET profile_name=%s WHERE profile_name IS NULL OR BTRIM(profile_name)=''", (stamp,))
+            return int(cursor.rowcount)
+
+    def find_crossed_profile_sessions(self, owner: str) -> dict[str, list[dict[str, Any]]]:
+        found = {"mislabelled": [], "foreign": [], "crossed_parents": []}
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT s.id,s.session_key,s.profile_name,s.parent_session_id,s.message_count,p.session_key AS parent_session_key FROM {self._schema}.sessions s LEFT JOIN {self._schema}.sessions p ON p.id=s.parent_session_id WHERE s.session_key LIKE 'agent:%%' ORDER BY s.started_at,s.id")
+            rows = list(cursor.fetchall())
+        for row in rows:
+            key = self._admin_session_key_profile(row["session_key"])
+            if key is None: continue
+            label = str(row["profile_name"]).strip() if row["profile_name"] else None
+            if label is not None and label != key: found["mislabelled"].append({"id": row["id"], "session_key": row["session_key"], "profile_name": label, "key_profile": key})
+            if key != owner: found["foreign"].append({"id": row["id"], "session_key": row["session_key"], "key_profile": key, "message_count": int(row["message_count"] or 0)})
+            parent = self._admin_session_key_profile(row["parent_session_key"])
+            if parent is not None and parent != key: found["crossed_parents"].append({"id": row["id"], "key_profile": key, "parent_session_id": row["parent_session_id"], "parent_profile": parent})
+        return found
+
+    def relabel_sessions_to_key_profile(self, ids: Collection[str]) -> int:
+        count = 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT id,session_key FROM {self._schema}.sessions WHERE id=ANY(%s)", (list(ids),))
+            for session_id, key in cursor.fetchall():
+                profile = self._admin_session_key_profile(key)
+                if profile:
+                    cursor.execute(f"UPDATE {self._schema}.sessions SET profile_name=%s WHERE id=%s AND profile_name IS DISTINCT FROM %s", (profile, session_id, profile)); count += cursor.rowcount
+        return count
+
+    def sever_crossed_parents(self, ids: Collection[str]) -> int:
+        changed = 0
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT s.id,s.session_key,p.session_key AS parent_key FROM {self._schema}.sessions s JOIN {self._schema}.sessions p ON p.id=s.parent_session_id WHERE s.id=ANY(%s)", (list(ids),))
+            for row in cursor.fetchall():
+                mine, theirs = self._admin_session_key_profile(row["session_key"]), self._admin_session_key_profile(row["parent_key"])
+                if mine and theirs and mine != theirs:
+                    cursor.execute(f"UPDATE {self._schema}.sessions SET parent_session_id=NULL WHERE id=%s", (row["id"],)); changed += cursor.rowcount
+        return changed
+
+    def rekey_legacy_main_sessions(self, ids: Collection[str], profile: str) -> int:
+        name = (profile or "").strip()
+        if not name: return 0
+        count = 0; new_prefix = f"agent:{name}:"
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET session_key=%s || substring(session_key from 12), profile_name=%s WHERE id=ANY(%s) AND left(session_key,11)='agent:main:'", (new_prefix, name, list(ids)))
+            count = int(cursor.rowcount)
+        return count
+
+    def rekey_profile_state(self, old_name: str, new_name: str) -> dict[str, int]:
+        old, new = (old_name or "").strip(), (new_name or "").strip()
+        if not old or not new or old == new: return {}
+        old_ns, new_ns = f"agent:{old}:", f"agent:{new}:"
+        counts: dict[str, int] = {}
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT 1 FROM {self._schema}.gateway_routing old JOIN {self._schema}.gateway_routing target ON target.scope=old.scope AND target.session_key=%s || substring(old.session_key from %s) WHERE left(old.session_key,%s)=%s LIMIT 1", (new_ns, len(old_ns)+1, len(old_ns), old_ns))
+            if cursor.fetchone() is not None: raise ValueError("profile routing collision")
+            cursor.execute(f"UPDATE {self._schema}.sessions SET profile_name=%s WHERE profile_name=%s", (new, old)); counts["sessions_profile_name"] = cursor.rowcount
+            cursor.execute(f"UPDATE {self._schema}.sessions SET session_key=%s || substring(session_key from %s) WHERE left(session_key,%s)=%s", (new_ns, len(old_ns)+1, len(old_ns), old_ns)); counts["sessions_session_key"] = cursor.rowcount
+            cursor.execute(f"UPDATE {self._schema}.gateway_heartbeats SET profile=%s WHERE profile=%s", (new, old)); counts["gateway_heartbeats_profile"] = cursor.rowcount
+            cursor.execute(f"SELECT id,origin_json FROM {self._schema}.sessions WHERE origin_json IS NOT NULL")
+            origin_count = 0
+            for session_id, origin in cursor.fetchall():
+                if isinstance(origin, str):
+                    try: origin = json.loads(origin)
+                    except json.JSONDecodeError: continue
+                if isinstance(origin, Mapping) and origin.get("profile") == old:
+                    updated = dict(origin); updated["profile"] = new
+                    cursor.execute(f"UPDATE {self._schema}.sessions SET origin_json=%s WHERE id=%s", (self._psycopg.types.json.Jsonb(updated), session_id)); origin_count += 1
+            counts["sessions_origin_json"] = origin_count
+            cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_mode SET profile_name=%s WHERE profile_name=%s", (new, old)); counts["telegram_dm_topic_mode_profile_name"] = cursor.rowcount
+            cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_bindings SET profile_name=%s WHERE profile_name=%s", (new, old))
+            binding_profile_count = cursor.rowcount
+            cursor.execute(f"UPDATE {self._schema}.telegram_dm_topic_bindings SET session_key=%s || substring(session_key from %s) WHERE left(session_key,%s)=%s", (new_ns, len(old_ns)+1, len(old_ns), old_ns))
+            counts["telegram_dm_topic_bindings"] = binding_profile_count + cursor.rowcount
+            cursor.execute(f"SELECT scope,session_key,entry_json FROM {self._schema}.gateway_routing WHERE left(session_key,%s)=%s", (len(old_ns), old_ns))
+            rows = cursor.fetchall(); counts["gateway_routing"] = len(rows)
+            for row in rows:
+                entry = row["entry_json"]
+                try: payload = json.loads(entry) if entry else {}
+                except (TypeError, json.JSONDecodeError): payload = {}
+                key = new_ns + row["session_key"][len(old_ns):]
+                if isinstance(payload, dict):
+                    if isinstance(payload.get("session_key"), str) and payload["session_key"].startswith(old_ns): payload["session_key"] = new_ns + payload["session_key"][len(old_ns):]
+                    if isinstance(payload.get("origin"), dict) and payload["origin"].get("profile") == old: payload["origin"]["profile"] = new
+                cursor.execute(f"UPDATE {self._schema}.gateway_routing SET session_key=%s,entry_json=%s WHERE scope=%s AND session_key=%s", (key, json.dumps(payload), row["scope"], row["session_key"]))
+        return counts
+
+    def purge_profile_state(self, profile: str) -> dict[str, int]:
+        name = (profile or "").strip()
+        if not name: return {}
+        ns = f"agent:{name}:"; counts: dict[str, int] = {}
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_routing WHERE left(session_key,%s)=%s", (len(ns), ns)); counts["gateway_routing"] = cursor.rowcount
+            cursor.execute(f"DELETE FROM {self._schema}.gateway_heartbeats WHERE profile=%s", (name,)); counts["gateway_heartbeats"] = cursor.rowcount
+            cursor.execute(f"DELETE FROM {self._schema}.telegram_dm_topic_mode WHERE profile_name=%s", (name,)); counts["telegram_dm_topic_mode"] = cursor.rowcount
+            cursor.execute(f"DELETE FROM {self._schema}.telegram_dm_topic_bindings WHERE profile_name=%s OR left(session_key,%s)=%s", (name, len(ns), ns)); counts["telegram_dm_topic_bindings"] = cursor.rowcount
+        return counts
+
+    def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
+        prefix = str(workspaces_root).rstrip("/\\")
+        if not prefix: return 0
+        gate = f"kanban_worker_source_retagged:{prefix}"
+        if self.get_meta(gate) == "1": return 0
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {self._schema}.sessions SET source='kanban' WHERE source='cli' AND (cwd=%s OR cwd LIKE %s ESCAPE '\\')", (prefix, _escape_like(prefix) + "/%"))
+            count = cursor.rowcount
+            self.set_meta(gate, "1", cursor=cursor)
+            return int(count)
+
+    def fts_rebuild_status(self) -> dict[str, Any]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM {self._schema}.messages")
+            total = int(cursor.fetchone()[0])
+        status = self.search_index_status()
+        indexed = total if status.get("available") else 0
+        return {"pending": False, "total": total, "indexed": indexed, "percent": 100 if status.get("available") else 0, "backend": "postgresql"}
+
+    def fts_cjk_rebuild_status(self) -> dict[str, Any]:
+        return {"pending": False, "total": 0, "indexed": 0, "percent": 100, "available": False, "backend": "postgresql"}
+
+    def fts_optimize_available(self) -> bool:
+        return bool(self.search_index_status().get("available"))
+
+    def optimize_fts(self) -> int:
+        result = self.rebuild_search_index()
+        return 0 if result.get("rebuild", {}).get("operation") == "already_running" else 1
+
+    def optimize_fts_storage(self, *, progress_cb: Any = None, vacuum: bool = True) -> dict[str, Any]:
+        result = self.rebuild_search_index()
+        if progress_cb is not None: progress_cb({"phase": "done", "percent": 100, "indexed": self.fts_rebuild_status()["indexed"], "total": self.fts_rebuild_status()["total"]})
+        return {"ok": result.get("rebuild", {}).get("operation") != "already_running", "vacuumed": self.vacuum() if vacuum else None}
+
+    def rebuild_fts(self) -> int:
+        return self.optimize_fts()
+
+    def retry_deferred_fts_recovery(self) -> bool:
+        return bool(self.optimize_fts())
+
+    def fts_rebuild_step(self) -> bool:
+        self.rebuild_fts(); return False
+
+    def fts_cjk_rebuild_step(self) -> bool:
+        return False
+
+    def logical_size_bytes(self) -> int:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT COALESCE(SUM(pg_total_relation_size(c.oid)),0) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relkind IN ('r','m','t')", (self._schema,))
+            return int(cursor.fetchone()[0] or 0)
+
+    def vacuum(self) -> int:
+        connection = self._new_connection(); connection.autocommit = True
+        count = 0
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET search_path TO "{self._schema}", pg_catalog')
+                cursor.execute("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relkind='r'", (self._schema,))
+                tables = [str(row[0]) for row in cursor.fetchall()]
+                for table in tables:
+                    cursor.execute(f'VACUUM (ANALYZE) "{self._schema}"."{table.replace(chr(34), chr(34)+chr(34))}"')
+                    count += 1
+        finally:
+            connection.close()
+        return count
+
+    def maybe_auto_prune_and_vacuum(self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True, sessions_dir: Any = None, **kwargs: Any) -> dict[str, Any]:
+        del sessions_dir, kwargs
+        marker = self.get_meta("last_auto_prune")
+        now = time.time()
+        if marker is not None:
+            try:
+                if now - float(marker) < float(min_interval_hours) * 3600: return {"skipped": True, "pruned": 0, "closed": 0, "vacuumed": False}
+            except (TypeError, ValueError): pass
+        closed = self.sweep_orphaned_sessions(max_idle_seconds=float(retention_days) * 86400, sources=("cli", "cron", "kanban", "subagent"), exclude_pinned=True)
+        vacuumed = self.vacuum() if vacuum else False
+        self.set_meta("last_auto_prune", str(now))
+        return {"skipped": False, "pruned": 0, "closed": len(closed), "vacuumed": bool(vacuumed)}
+
     def close(self) -> None:
         self._token_usage_transport.close()
         with self._lock:
