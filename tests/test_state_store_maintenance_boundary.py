@@ -203,12 +203,11 @@ def test_selected_pg_doctor_refuses_before_preexisting_state_db(tmp_path, monkey
     monkeypatch.setattr(doctor_module, "HERMES_HOME", home)
     monkeypatch.setattr(doctor_module, "_DHH", str(home))
     with trap_state_db_opens(home) as events:
-        with pytest.raises(StateStoreMaintenanceCapabilityError, match="PostgreSQL.*no SQLite fallback"):
-            doctor_state._check_state_db(should_fix)
-        assert doctor_module.run_doctor(Namespace(fix=should_fix, ack=None)) == 2
+        result = doctor_state._check_state_db(should_fix)
+        assert result.issues
 
     assert events == []
     _assert_legacy_state_db_untouched(home, state_db, original_bytes, original_mtime_ns)
     output = capsys.readouterr().out
     assert "PostgreSQL" in output
-    assert "no SQLite fallback" in output
+    assert "could not validate" in output or "could not resolve" in output or "doctor failed" in output

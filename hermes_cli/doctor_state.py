@@ -7,7 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 from hermes_cli.doctor_report import (
-    Finding, _fail_and_issue, _section, check_bool, check_info, check_ok, check_warn, doctor_check, ensure_dir,
+    Finding, _fail_and_issue, _section, check_bool, check_fail, check_info, check_ok, check_warn, doctor_check, ensure_dir,
     warn_on_error,
 )
 from hermes_cli.sizefmt import format_bytes as _human_bytes
@@ -365,9 +365,33 @@ def _retired_wal_holders(f: Finding, state_db_path: Path, _DHH: str) -> bool:
 
 @doctor_check()
 def _check_state_db(should_fix: bool, f: Finding) -> None:
-    """state.db session count, FTS write health, schema repair, stats snapshot, WAL size."""
-    from state_store_maintenance import require_state_store_maintenance
+    """Check the selected state store without opening SQLite for a PG profile."""
+    from state_store_maintenance import StateStoreMaintenanceError, StateStoreMaintenanceOperations, require_state_store_maintenance
     from hermes_cli.doctor import HERMES_HOME, _DHH
+
+    operations = StateStoreMaintenanceOperations.resolve(home=HERMES_HOME)
+    if operations.selected_backend == "postgresql":
+        try:
+            snapshot = operations.doctor()
+        except StateStoreMaintenanceError as exc:
+            check_fail("PostgreSQL state store", str(exc))
+            f.issues.append(f"PostgreSQL state-store doctor failed: {exc}")
+            return
+        schema = snapshot.get("schema", "<unknown>")
+        versions = snapshot.get("migration_versions", [])
+        invariants = snapshot.get("invariants", {})
+        search = snapshot.get("search", {})
+        ownership = snapshot.get("ownership", {})
+        check_ok("PostgreSQL state store", f"{schema} reachable")
+        check_ok("PostgreSQL migration catalog", f"{len(versions)} migrations ({versions[-1] if versions else 'none'} latest)")
+        check_ok("PostgreSQL search catalog", f"generated_document={search.get('generated_document')}, gin_index={search.get('gin_index')}")
+        check_ok("PostgreSQL ownership/invariants", f"active_leases={ownership.get('active_leases', 0)}, "
+                 f"message_orphans={invariants.get('message_orphans', 0)}, usage_orphans={invariants.get('usage_orphans', 0)}")
+        if not search.get("available") or search.get("generated_document") != "valid" or search.get("gin_index") != "valid":
+            f.issues.append("PostgreSQL search catalog is unhealthy")
+        if invariants.get("message_orphans", 0) or invariants.get("usage_orphans", 0):
+            f.issues.append("PostgreSQL state-store referential invariants are unhealthy")
+        return
 
     require_state_store_maintenance("doctor", home=HERMES_HOME)
     state_db_path = HERMES_HOME / "state.db"

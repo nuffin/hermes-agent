@@ -35,7 +35,9 @@ class StateStoreMaintenanceOperations:
         "snapshot-prune", "update-snapshot", "claw-snapshot", "approvals-suggest", "doctor",
     })
 
-    _postgresql_capabilities = frozenset({"sessions-prune", "sessions-archive", "sessions-clean-markers", "sessions-optimize"})
+    _postgresql_capabilities = frozenset({
+        "doctor", "sessions-prune", "sessions-archive", "sessions-clean-markers", "sessions-optimize",
+    })
 
     @classmethod
     def resolve(
