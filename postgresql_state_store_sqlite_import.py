@@ -47,6 +47,9 @@ _NON_MIGRATED_TABLES = frozenset({
     "compression_locks",
     "session_turn_leases",
     "async_delegations",
+    # Topic rows do not yet have a PostgreSQL StateStore contract. Empty tables
+    # are accepted; populated rows fail before import instead of being discarded.
+    "session_topics",
 })
 # Fields without a PostgreSQL StateStore contract.  A non-default value means the source is not
 # in the bounded migration slice and therefore must not be silently truncated.

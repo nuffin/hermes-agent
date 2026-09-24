@@ -57,6 +57,7 @@ _TRANSCRIPT_REWIND_SCHEMA_VERSION = 22
 _FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION = 23
 _GATEWAY_SESSION_ROUTE_SCHEMA_VERSION = 24
 _GATEWAY_TRANSCRIPT_SCHEMA_VERSION = 25
+_SESSION_TOPIC_MESSAGE_SCHEMA_VERSION = 26
 _SEARCH_INDEX_NAME = "messages_search_document_gin"
 _USAGE_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _USAGE_SUM_FIELDS = (*_USAGE_COUNTERS, "api_call_count")
@@ -191,7 +192,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {self._schema}.schema_migrations (version integer PRIMARY KEY, applied_at double precision NOT NULL)")
                 cursor.execute(f"SELECT version FROM {self._schema}.schema_migrations ORDER BY version")
                 applied = {int(row[0]) for row in cursor.fetchall()}
-                unsupported = sorted(version for version in applied if version < 1 or version > _GATEWAY_TRANSCRIPT_SCHEMA_VERSION)
+                unsupported = sorted(version for version in applied if version < 1 or version > _SESSION_TOPIC_MESSAGE_SCHEMA_VERSION)
                 if unsupported:
                     raise StateStoreConfigurationError(f"Unsupported PostgreSQL State Store schema migration versions: {unsupported}")
                 migrations = (
@@ -220,6 +221,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (_FOREIGN_IMPORT_RECEIPT_SCHEMA_VERSION, self._apply_v23, self._validate_v23),
                     (_GATEWAY_SESSION_ROUTE_SCHEMA_VERSION, self._apply_v24, self._validate_v24),
                     (_GATEWAY_TRANSCRIPT_SCHEMA_VERSION, self._apply_v25, self._validate_v25),
+                    (_SESSION_TOPIC_MESSAGE_SCHEMA_VERSION, self._apply_v26, self._validate_v26),
                 )
                 for migration_version, apply, validate in migrations:
                     if migration_version not in applied:
@@ -760,6 +762,14 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         self._required_columns(cursor, "messages", {"platform_message_id"})
         self._require_index(cursor, "messages_platform_message_id_unique")
         self._require_index(cursor, "messages_session_platform_message_id")
+
+    def _apply_v26(self, cursor: Any) -> None:
+        """Preserve the SQLite conversation projection's optional topic pointer."""
+        cursor.execute(f"ALTER TABLE {self._schema}.messages ADD COLUMN IF NOT EXISTS topic_id text")
+
+    def _validate_v26(self, cursor: Any) -> None:
+        self._validate_v25(cursor)
+        self._required_columns(cursor, "messages", {"topic_id"})
 
     @staticmethod
     def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -2299,7 +2309,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata"
+            "active, compacted, api_content, display_kind, display_metadata, topic_id"
         )
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             visibility = "(active OR compacted)" if include_compacted else "active"
@@ -2333,7 +2343,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata"
+            "active, compacted, api_content, display_kind, display_metadata, topic_id"
         )
         cursor.execute(
             f"SELECT {columns} FROM {self._schema}.messages "
