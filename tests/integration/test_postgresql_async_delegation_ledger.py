@@ -7,6 +7,7 @@ exercised through the ``tools.async_delegation`` seam with a no-``state.db``-ope
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -122,7 +123,14 @@ def test_record_unit_child_partial_and_recover(ledger):
     target.execute(
         f"UPDATE {target.schema}.async_delegations SET owner_pid=NULL WHERE delegation_id='d2'")
     assert ledger.recover_abandoned_delegations() == 1
-    assert ledger.get_durable_delegation("d2")["state"] == "unknown"
+    recovered = ledger.get_durable_delegation("d2")
+    assert recovered["state"] == "unknown"
+    assert recovered["result"]["last_known_status"] == "running"
+    assert recovered["result"]["task_transcripts"] == {}
+    assert recovered["result"]["results"] == [{"task_index": 0, "status": "completed"}, {
+        "task_index": 1, "status": "unknown", "summary": None,
+        "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
+    }]
 
 
 def test_restore_undelivered_replays_pending(ledger):
@@ -142,6 +150,25 @@ def test_restore_undelivered_replays_pending(ledger):
     assert q.items[0]["restored"] is True
     # After replay the row stays pending (delivery is claimed separately).
     assert ledger.get_durable_delegation("d1")["delivery_state"] == "pending"
+
+
+def test_orphan_sweep_reoffers_pending_once(ledger):
+    from tools.async_delegation import _ORPHAN_STALE_S
+
+    ledger, target = ledger
+    delegation_id = f"orphan-{time.time_ns()}"
+    ledger.persist_dispatch(_record(delegation_id))
+    ledger.persist_completion(*_completion(delegation_id))
+    now = time.time()
+    target.execute(
+        f"UPDATE {target.schema}.async_delegations "
+        "SET owner_pid=NULL, updated_at=%s WHERE delegation_id=%s",
+        (now - _ORPHAN_STALE_S - 1, delegation_id),
+    )
+    q = queue.Queue()
+    assert ledger.sweep_orphaned_completions(q, now=now) == 1
+    assert q.get_nowait()["delegation_id"] == delegation_id
+    assert ledger.sweep_orphaned_completions(q, now=now + _ORPHAN_STALE_S) == 0
 
 
 def test_transaction_rollback_preserves_no_partial_dispatch(ledger, monkeypatch):
@@ -186,6 +213,19 @@ def test_selected_pg_routes_async_delegation_seam_without_state_db(
             assert ad.claim_completion_delivery("seam-1", "c1") is True
             assert ad.complete_completion_delivery("seam-1", "c1") is True
             assert ad.get_durable_delegation("seam-1")["delivery_state"] == "delivered"
+            orphan_id = f"seam-orphan-{time.time_ns()}"
+            ad._persist_dispatch(_record(orphan_id))
+            ad._persist_completion(*_completion(orphan_id))
+            now = time.time()
+            with ledger._transaction() as cur:
+                cur.execute(
+                    "UPDATE async_delegations SET owner_pid=NULL, updated_at=%s "
+                    "WHERE delegation_id=%s",
+                    (now - ad._ORPHAN_STALE_S - 1, orphan_id),
+                )
+            q = queue.Queue()
+            assert ad.sweep_orphaned_completions(q, now=now) == 1
+            assert q.get_nowait()["delegation_id"] == orphan_id
         assert events == []
         assert not (home / "state.db").exists()
     finally:

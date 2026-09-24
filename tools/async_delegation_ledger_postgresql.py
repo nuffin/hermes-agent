@@ -22,14 +22,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from hermes_constants import get_hermes_home, profile_name_for_home
+from hermes_constants import get_hermes_home, hermes_home_key, profile_name_for_home
 from tools.async_delegation import (
+    _CLAIM_LEASE_S,
     _DURABLE_RETENTION_SECONDS,
     _MAX_COMPLETION_REPLAY_AGE_S,
     _MAX_DELIVERY_ATTEMPTS,
     _MAX_DURABLE_PENDING,
     _MAX_RETAINED_COMPLETED,
+    _ORPHAN_STALE_S,
     _ROUTING_KEYS,
+    _offered,
+    _orphan_lock,
     _recovered_results,
 )
 
@@ -190,8 +194,12 @@ class PostgreSQLAsyncDelegationLedger:
         task_payload = {
             key: record.get(key)
             for key in ("goal", "goals", "context", "toolsets", "role", "model",
-                        "is_batch", "task_indexes", *_ROUTING_KEYS)
+                        "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
             if key in record}
+        try:
+            task_payload["owner_cwd"] = os.getcwd()
+        except OSError:
+            pass
         with self._transaction() as cur:
             cur.execute("""INSERT INTO async_delegations
                 (delegation_id, origin_session, origin_ui_session_id, parent_session_id,
@@ -267,14 +275,16 @@ class PostgreSQLAsyncDelegationLedger:
     # ── Recovery ────────────────────────────────────────────────────────────
     def _owner_alive(self, pid, started) -> bool:
         try:
-            from gateway.status import _pid_exists, get_process_start_time
+            from gateway.status import _pid_exists, get_process_start_time, start_time_fingerprints_match
         except Exception:
             return False
         if not pid:
             return False
         try:
             return _pid_exists(int(pid)) and (
-                started is None or get_process_start_time(int(pid)) == int(started))
+                started is None
+                or start_time_fingerprints_match(started, get_process_start_time(int(pid)) or 0)
+            )
         except (TypeError, ValueError):
             return False
 
@@ -283,11 +293,11 @@ class PostgreSQLAsyncDelegationLedger:
         with self._transaction() as cur:
             cur.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id, result_json
+                      owner_started_at, task_json, origin_session_id, result_json, state
                FROM async_delegations WHERE state IN ('running','finalizing')""")
             rows = cur.fetchall()
             for (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-                 pid, started, task_json, origin_sid, result_json) in rows:
+                 pid, started, task_json, origin_sid, result_json, last_state) in rows:
                 if self._owner_alive(pid, started):
                     continue
                 task = json.loads(task_json or "{}")
@@ -298,6 +308,15 @@ class PostgreSQLAsyncDelegationLedger:
                     error = (f"Delegation owner exited before the unit finished; "
                              f"{done}/{len(recovered_results)} child results were recorded and are "
                              f"included below, the rest are unknown.")
+                diagnostics = {
+                    "last_known_status": last_state,
+                    "task_transcripts": task.get("task_transcripts") or {},
+                }
+                from tools.async_delegation_recovery_hints import git_state_hint, transcript_tails
+                if tails := transcript_tails(diagnostics["task_transcripts"]):
+                    diagnostics["transcript_tails"] = tails
+                if hint := git_state_hint(task.get("owner_cwd")):
+                    diagnostics["git_state_hint"] = hint
                 event = {
                     "type": "async_delegation", "delegation_id": delegation_id,
                     "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -306,12 +325,14 @@ class PostgreSQLAsyncDelegationLedger:
                     "context": task.get("context"), "toolsets": task.get("toolsets"),
                     "role": task.get("role"), "model": task.get("model"),
                     "is_batch": bool(task.get("is_batch")), "status": "unknown",
-                    "summary": None, "error": error,
-                    **(dict(recovered_results=recovered_results) if recovered_results else {}),
+                    "summary": None, "error": error, **diagnostics,
+                    **({"results": recovered_results} if recovered_results else {}),
                     "dispatched_at": dispatched_at, "completed_at": now,
                     **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
-                result = {"status": "unknown", "summary": None, "error": event["error"],
-                          **(dict(recovered_results=recovered_results) if recovered_results else {})}
+                result = {
+                    "status": "unknown", "summary": None, "error": event["error"], **diagnostics,
+                    **({"results": recovered_results} if recovered_results else {}),
+                }
                 cur.execute("""UPDATE async_delegations SET state='unknown', completed_at=%s,
                        updated_at=%s, event_json=%s, result_json=%s, delivery_state='pending'
                        WHERE delegation_id=%s""",
@@ -321,32 +342,69 @@ class PostgreSQLAsyncDelegationLedger:
 
     def restore_undelivered_completions(self, target_queue) -> int:
         self.recover_abandoned_delegations()
-        now, restored = time.time(), 0
+        now = time.time()
         with self._transaction() as cur:
             cur.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                    FROM async_delegations
                    WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                    ORDER BY completed_at, delegation_id""")
-            rows = cur.fetchall()
-            for delegation_id, payload, completed_at, dispatched_at in rows:
-                age_basis = completed_at or dispatched_at
-                if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+            return self._replay_pending(cur, cur.fetchall(), target_queue, now)
+
+    def _replay_pending(self, cur, rows, target_queue, now: float) -> int:
+        home, restored = hermes_home_key(get_hermes_home()), 0
+        for delegation_id, payload, completed_at, dispatched_at in rows:
+            age_basis = completed_at or dispatched_at
+            if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+                cur.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=%s
+                       WHERE delegation_id=%s AND delivery_state='pending'""",
+                    (now, delegation_id))
+                logger.warning(
+                    "Async delegation %s: pending completion is %.1fh old (cap %.1fh); "
+                    "terminally dropping the replay (result remains queryable).",
+                    delegation_id, (now - age_basis) / 3600.0,
+                    _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+                continue
+            evt = json.loads(payload)
+            if isinstance(evt, dict):
+                evt["restored"] = True
+            target_queue.put(evt)
+            with _orphan_lock:
+                _offered.add((home, delegation_id))
+            restored += 1
+        return restored
+
+    def sweep_orphaned_completions(self, target_queue, *, now: float | None = None) -> int:
+        self.recover_abandoned_delegations()
+        now = time.time() if now is None else now
+        home = hermes_home_key(get_hermes_home())
+        with _orphan_lock:
+            offered = {delegation_id for key, delegation_id in _offered if key == home}
+        with self._transaction() as cur:
+            cur.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
+                          owner_pid, owner_started_at, delivery_attempts
+                   FROM async_delegations
+                   WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     AND event_json IS NOT NULL AND updated_at < %s
+                     AND (delivery_claim IS NULL OR delivery_claimed_at < %s)
+                   ORDER BY completed_at, delegation_id""",
+                (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S))
+            orphans = []
+            for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in cur.fetchall():
+                if delegation_id in offered or self._owner_alive(pid, started):
+                    continue
+                if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                     cur.execute("""UPDATE async_delegations SET delivery_state='dropped',
                                   delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=%s
                            WHERE delegation_id=%s AND delivery_state='pending'""",
                         (now, delegation_id))
                     logger.warning(
-                        "Async delegation %s: pending completion is %.1fh old (cap %.1fh); "
-                        "terminally dropping the replay (result remains queryable).",
-                        delegation_id, (now - age_basis) / 3600.0,
-                        _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+                        "Async delegation %s exhausted its %d delivery attempts; "
+                        "marking terminally dropped (result remains queryable).",
+                        delegation_id, _MAX_DELIVERY_ATTEMPTS)
                     continue
-                evt = json.loads(payload)
-                if isinstance(evt, dict):
-                    evt["restored"] = True
-                target_queue.put(evt)
-                restored += 1
-        return restored
+                orphans.append((delegation_id, payload, completed_at, dispatched_at))
+            return self._replay_pending(cur, orphans, target_queue, now)
 
     # ── Delivery claim transitions ──────────────────────────────────────────
     def mark_completion_delivered(self, delegation_id: str) -> bool:
@@ -371,7 +429,7 @@ class PostgreSQLAsyncDelegationLedger:
                       delivery_attempts=delivery_attempts+1, updated_at=%s
                WHERE delegation_id=%s AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < %s)""",
-                (claim_id, now, now, delegation_id, now - 300))
+                (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
             return cur.rowcount == 1
 
     def release_completion_delivery(self, delegation_id: str, claim_id: str) -> bool:

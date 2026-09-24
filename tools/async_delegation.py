@@ -424,6 +424,9 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
     the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
     callers bind the owning profile first."""
+    ledger = _selected_async_delegation_ledger()
+    if ledger is not None:
+        return ledger.sweep_orphaned_completions(target_queue, now=now)
     alive = _owner_liveness()
     if alive is None or not _db_path().exists():
         return 0  # never create a ledger just to sweep it

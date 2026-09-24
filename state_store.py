@@ -205,7 +205,10 @@ class StateStore(Protocol):
 
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None: ...
 
-    def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None: ...
+    def update_session_model(
+        self, session_id: str, model: str, provider: str | None = None, *,
+        base_url: str | None = None, api_mode: str | None = None,
+    ) -> None: ...
 
     def patch_session_model_config(self, session_id: str, patch: Mapping[str, Any]) -> None: ...
 
@@ -456,8 +459,12 @@ class SqliteStateStore:
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
         self._session_db.update_session_meta(session_id, model_config_json, model)
 
-    def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None:
-        self._session_db.update_session_model(session_id, model, provider)
+    def update_session_model(
+        self, session_id: str, model: str, provider: str | None = None, *,
+        base_url: str | None = None, api_mode: str | None = None,
+    ) -> None:
+        self._session_db.update_session_model(
+            session_id, model, provider, base_url=base_url, api_mode=api_mode)
 
     def patch_session_model_config(self, session_id: str, patch: Mapping[str, Any]) -> None:
         self._session_db.patch_session_model_config(session_id, dict(patch))

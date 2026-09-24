@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from gateway.platforms import api_server
+from gateway.platforms import api_server_room_dispatch as room_dispatch
 
 
 

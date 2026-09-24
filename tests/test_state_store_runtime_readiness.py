@@ -148,6 +148,10 @@ def test_selected_postgresql_blocks_raw_ledger_openers_before_state_db_side_effe
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_STATE_STORE_TEST_DSN", "postgresql://fixture/only")
+    if module_name == "gateway.delivery_ledger":
+        # The gateway delivery ledger is process-scoped so multiplexed profile overrides
+        # cannot split boot recovery from live writes; bind its launch home explicitly.
+        monkeypatch.setenv("HERMES_HOME", str(home))
     token = set_hermes_home_override(str(home))
     try:
         opener = importlib.import_module(module_name)._connect

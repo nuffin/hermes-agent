@@ -2832,14 +2832,18 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         session = self.get_session(session_id) or {}
         return self._model_config_object(session.get("model_config")).get(key, default)
 
-    def update_session_model(self, session_id: str, model: str, provider: str | None = None) -> None:
+    def update_session_model(
+        self, session_id: str, model: str, provider: str | None = None, *,
+        base_url: str | None = None, api_mode: str | None = None,
+    ) -> None:
         """Switch the persisted route after queued pre-switch usage has drained."""
         self.flush_token_counts()
         patch: dict[str, Any] = {"browser_model_lock": None}
         if model:
             patch["model"] = model
         if provider:
-            patch["provider"] = provider
+            route = {"provider": provider, "base_url": base_url or None, "api_mode": api_mode or None}
+            patch.update(route, gateway_runtime=route)
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(f"SELECT model_config FROM {self._schema}.sessions WHERE id = %s FOR UPDATE", (session_id,))
             row = cursor.fetchone()

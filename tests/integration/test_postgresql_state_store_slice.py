@@ -674,7 +674,10 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
             store.ensure_session(session_id, source="integration", metadata={"model": "initial", "model_config": {"keep": 1, "drop": "x"}})
             store.set_system_prompt(session_id, "cached footer")
             store.queue_token_counts(session_id, input_tokens=4, api_call_count=1, model="before", billing_provider="old", billing_base_url="old-url")
-            store.update_session_model(session_id, "after", "provider-after")
+            store.update_session_model(
+                session_id, "after", "provider-after",
+                base_url="https://provider.example/v1", api_mode="chat",
+            )
             store.patch_session_model_config(session_id, {"keep": None, "nested": {"json": None}, "new": [1, 2]})
             store.update_session_billing_route(session_id, provider="new-provider", base_url="new-url", billing_mode="metered")
             assert store.get_session_model_config_value(session_id, "missing", "fallback") == "fallback"
@@ -704,7 +707,15 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
                 "route": route, "usage": usage,
             })
         assert observations == [{
-            "model": "after", "config": {"drop": "x", "model": "after", "provider": "provider-after", "nested": {"json": None}, "new": [1, 2]},
+            "model": "after", "config": {
+                "drop": "x", "model": "after", "provider": "provider-after",
+                "base_url": "https://provider.example/v1", "api_mode": "chat",
+                "gateway_runtime": {
+                    "provider": "provider-after", "base_url": "https://provider.example/v1",
+                    "api_mode": "chat",
+                },
+                "nested": {"json": None}, "new": [1, 2],
+            },
             "prompt": None, "route": ("new-provider", "new-url", "metered"), "usage": (4, 1),
         }] * 2
         postgresql = cast(Any, stores[1])
