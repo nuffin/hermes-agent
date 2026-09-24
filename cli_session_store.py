@@ -262,21 +262,32 @@ class PostgreSQLCLISessionStore:
             row = cursor.fetchone()
         return int(row[0]) if row else 0
 
-    def export_session(self, session_id: str) -> dict[str, Any] | None:
+    def export_session(
+        self, session_id: str, include_compacted: bool = False,
+    ) -> dict[str, Any] | None:
         """Project one complete active PostgreSQL segment into SessionDB export shape."""
         session = self._store.get_session(session_id)
         if session is None:
             return None
-        messages = self._store.get_message_records(session_id)
+        messages = self._store.get_message_records(
+            session_id, include_compacted=include_compacted,
+        )
         from hermes_state_portability import _export_timings
         return {**session, "message_count": len(messages), "messages": messages, "timings": _export_timings(messages, session_id)}
 
-    def export_session_lineage(self, session_id: str) -> dict[str, Any] | None:
+    def export_session_lineage(
+        self, session_id: str, include_compacted: bool = False,
+    ) -> dict[str, Any] | None:
         """Export the complete compression lineage when every segment is available."""
         lineage_ids = self._store.get_compression_lineage(session_id)
         if not lineage_ids:
             return None
-        segments = [segment for segment in (self.export_session(item) for item in lineage_ids) if segment]
+        segments = [
+            segment for segment in (
+                self.export_session(item, include_compacted=include_compacted)
+                for item in lineage_ids
+            ) if segment
+        ]
         if not segments:
             return None
         messages = [message for segment in segments for message in segment["messages"]]
@@ -321,7 +332,7 @@ class PostgreSQLCLISessionStore:
             "last_active_before", "last_active_after", "started_before", "started_after", "source", "title_like",
             "end_reason", "cwd_prefix", "min_messages", "max_messages", "model_like", "provider", "user_id",
             "chat_id", "chat_type", "branch_like", "min_tokens", "max_tokens", "min_cost", "max_cost",
-            "min_tool_calls", "max_tool_calls", "archived", "include_pinned",
+            "min_tool_calls", "max_tool_calls", "archived", "include_pinned", "lineage_tips_only",
         }
         unknown = set(filters) - allowed
         if unknown:
@@ -331,6 +342,8 @@ class PostgreSQLCLISessionStore:
         last_active = "COALESCE(s.last_activity_at, (SELECT MAX(m.created_at) FROM " + self._store._schema + ".messages m WHERE m.session_id=s.id), s.started_at)"
         clauses, params = ["s.ended_at IS NOT NULL"], []
         values = dict(filters)
+        if values.get("lineage_tips_only", False):
+            clauses.append("COALESCE(s.end_reason, '') <> 'compression'")
         if older_than_days is not None and values.get("last_active_before") is None and values.get("started_before") is None:
             values["last_active_before"] = time.time() - float(older_than_days) * 86400
         def add(clause: str, value: Any, enabled: bool = True) -> None:

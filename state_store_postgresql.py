@@ -2285,7 +2285,16 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(f"INSERT INTO {self._schema}.rewind_receipts (request_id, session_id, conversation_root_id, target_message_id, turn_holder, turn_fence, compression_holder, compression_fence, replacement_message_id, retired_count, active_prefix_ids, committed_at) VALUES (%s, %s, %s, %s, NULL, NULL, NULL, NULL, %s, %s, %s, %s)", (request_id, session_id, root, target_message_id, replacement_id, retired, self._psycopg.types.json.Jsonb(prefix_ids), now))
             return {"request_id": request_id, "rewound_count": retired, "target_message": dict(target), "new_head_id": replacement_id, "replacement_message_id": replacement_id, "active_prefix_ids": prefix_ids}
 
-    def get_message_records(self, session_id: str) -> list[dict[str, Any]]:
+    def get_message_records(
+        self, session_id: str, *, include_compacted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return live rows, or the user-visible compacted history for export.
+
+        Rewind-retired rows have both flags false and remain excluded.  PostgreSQL
+        compression rotation normally publishes a child instead of compacting in
+        place, but imported or future in-place rows still need the same export
+        contract as ``SessionDB.get_messages(include_compacted=True)``.
+        """
         columns = (
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
@@ -2293,7 +2302,12 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "active, compacted, api_content, display_kind, display_metadata"
         )
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(f"SELECT {columns} FROM {self._schema}.messages WHERE session_id = %s AND active ORDER BY id", (session_id,))
+            visibility = "(active OR compacted)" if include_compacted else "active"
+            cursor.execute(
+                f"SELECT {columns} FROM {self._schema}.messages "
+                f"WHERE session_id = %s AND {visibility} ORDER BY id",
+                (session_id,),
+            )
             records = list(cursor.fetchall())
         for record in records:
             record["content"] = self._decode_content(record["content"])

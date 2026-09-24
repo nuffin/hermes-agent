@@ -13,7 +13,11 @@ from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 _DSN = "postgresql://hermes_state_store_test@127.0.0.1:5432/hermes_state_store_test"
 @pytest.fixture
 def ledger(postgresql_delivery_target: OwnedPostgreSQLTestTarget):
-    value = PostgreSQLDeliveryLedger(_DSN, schema=postgresql_delivery_target.schema, settings=DeliveryLedgerPostgreSQLConfig(lease_seconds=.01))
+    value = PostgreSQLDeliveryLedger(
+        _DSN,
+        schema=postgresql_delivery_target.schema,
+        settings=DeliveryLedgerPostgreSQLConfig(lease_seconds=1),
+    )
     try:
         yield value, postgresql_delivery_target
     finally:
@@ -56,14 +60,27 @@ def test_concurrent_claim_only_one_receipt_wins(ledger):
 
 def test_expired_lease_steal_rejects_stale_receipt_and_owner_guard(ledger):
     ledger, target = ledger
-    original=_record(ledger); first=ledger.mark_attempting(original); assert first
-    import time; time.sleep(.02)
-    thief=PostgreSQLDeliveryLedger(_DSN,schema=target.schema,settings=DeliveryLedgerPostgreSQLConfig(lease_seconds=1))
+    short_lease = PostgreSQLDeliveryLedger(
+        _DSN, schema=target.schema,
+        settings=DeliveryLedgerPostgreSQLConfig(lease_seconds=.01),
+    )
+    original = _record(short_lease)
+    first = short_lease.mark_attempting(original)
+    assert first
+    import time
+    time.sleep(.02)
+    thief = PostgreSQLDeliveryLedger(
+        _DSN, schema=target.schema,
+        settings=DeliveryLedgerPostgreSQLConfig(lease_seconds=1),
+    )
     try:
-        stolen=thief.sweep_recoverable(); assert len(stolen)==1
-        assert not ledger.mark_delivered(first)
+        stolen = thief.sweep_recoverable()
+        assert len(stolen) == 1
+        assert not short_lease.mark_delivered(first)
         assert thief.mark_delivered(stolen[0]['receipt'])
-    finally: thief.close()
+    finally:
+        thief.close()
+        short_lease.close()
 
 
 def test_transaction_rollback_preserves_no_partial_obligation(ledger, monkeypatch):

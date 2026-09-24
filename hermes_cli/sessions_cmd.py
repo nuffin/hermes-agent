@@ -1135,9 +1135,12 @@ def cmd_sessions(args, sessions_parser=None):
         if handler is None:
             sessions_parser.print_help()
             return
-        if action in _HELD_STORE_ACTIONS and not getattr(args, "dry_run", False) and not getattr(args, "force", False):
+        if (selected_store.backend != "postgresql" and action in _HELD_STORE_ACTIONS
+                and not getattr(args, "dry_run", False) and not getattr(args, "force", False)):
             from hermes_state_holders import held_store_refusal
-            # Same resolver the SessionDB above opened, so the scan never depends on the db object.
+            # This protects SQLite file replacement only. Selected PostgreSQL
+            # maintenance uses database-native transactions and must never resolve
+            # or inspect state.db as an implicit fallback.
             refusal = held_store_refusal(_default_db_path(), command=action)
             if refusal:
                 print(refusal)

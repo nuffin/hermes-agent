@@ -251,6 +251,13 @@ def test_pg18_production_rotation_interface_publishes_fenced_handoff(harness):
 
 def test_pg18_unknown_catalog_version_is_rejected_fail_closed(postgresql_test_target: OwnedPostgreSQLTestTarget):
     store = _store(postgresql_test_target.schema); store.close()
-    postgresql_test_target.execute(f"INSERT INTO {postgresql_test_target.schema}.schema_migrations (version, applied_at) VALUES (22, 0)")
-    with pytest.raises(StateStoreConfigurationError, match=r"Unsupported PostgreSQL State Store schema migration versions: \[22\]"):
+    unknown_version = 26
+    postgresql_test_target.execute(
+        f"INSERT INTO {postgresql_test_target.schema}.schema_migrations "
+        f"(version, applied_at) VALUES ({unknown_version}, 0)"
+    )
+    with pytest.raises(
+        StateStoreConfigurationError,
+        match=rf"Unsupported PostgreSQL State Store schema migration versions: \[{unknown_version}\]",
+    ):
         _store(postgresql_test_target.schema)
