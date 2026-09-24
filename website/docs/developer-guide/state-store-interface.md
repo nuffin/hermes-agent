@@ -1,6 +1,6 @@
 ---
 title: "State Store Interface"
-description: "The backend-neutral protocol plugins code against and its SQLite reference implementation"
+description: "The backend-neutral protocol plugins code against, and how the SQLite and PostgreSQL backends implement it"
 ---
 
 # State Store Interface
@@ -24,8 +24,8 @@ stores:
 2. **Interface-layer SQLite** (this layer): the store satisfies
    `StateStoreInterface`, so the plugin can rely on the contracted face and
    call `clear_stored_system_prompts()` instead of hand-rolled SQL.
-3. **Another backend**: the same face implemented over a different storage
-   engine; a plugin written against the protocol works unchanged.
+3. **PostgreSQL backend** (PR #118142): the same face implemented over
+   PostgreSQL; a plugin written against the protocol works unchanged.
 
 The protocol is what makes states 2 and 3 interchangeable from a plugin's
 point of view.
@@ -120,13 +120,18 @@ Semantics, identical across backends:
    consumer; speculative members freeze implementation details that no one
    needs yet.
 
-## Relationship to other backends
+## Relationship to PR #118142 (PostgreSQL state store)
 
-Backend implementations are reviewed and shipped independently from this
-interface layer. A backend may carry an equivalent protocol definition while
-the changes are under separate review, then converge on this module after both
-lines land. That temporary duplication does not make either pull request a
-dependency of the other.
+The PostgreSQL state-store branch (`feat/postgresql-state-store`) delivers a
+PostgreSQL backend whose facade today mirrors the SQLite `SessionDB` by hand.
+This interface branch is the abstraction layer that sits **between
+`upstream/main` and the backend branch**: the backend line rebases onto it,
+and its PostgreSQL facade then *implements* `StateStoreInterface` explicitly
+(including the PG side of `clear_stored_system_prompts`) instead of merely
+coincidentally matching the SQLite shape. For plugin authors that changes
+nothing on day one — the SQLite store already satisfies the protocol — but it
+gives the PG backend a written contract to conform to and gives reviewers a
+single place to check that the two backends do not drift apart.
 
-This layer contains only the protocol and the SQLite reference behavior: it
-introduces no PostgreSQL dependency and changes no SQLite default behavior.
+This layer itself is pure SQLite: it introduces no PostgreSQL dependency and
+changes no SQLite default behavior.
