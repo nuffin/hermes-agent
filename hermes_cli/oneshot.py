@@ -626,9 +626,22 @@ def _linger_for_background_completions() -> None:
     process_registry.wait_for_pending_completions(None)
 
 
+def _finalize_oneshot_lifecycle(session_id: str | None, platform: str) -> None:
+    """Flush lifecycle observers before one-shot's hard process exit."""
+    from hermes_cli.lifecycle import finalize_session
+
+    finalize_session(
+        session_id=session_id,
+        platform=platform,
+        reason="oneshot_cleanup",
+    )
+
+
 def _close_agent(agent, session_db) -> None:
     """Teardown mirroring gateway/run.py:_cleanup_agent_resources (NOT cli.py:_run_cleanup):
     oneshot has no _active_agent_ref and the hard-exit path skips finalizers."""
+    session_id = getattr(agent, "session_id", None) if agent is not None else None
+    platform = (getattr(agent, "platform", None) or "cli") if agent is not None else "cli"
     if agent is not None:
         # Linger (bounded) for notify_on_complete background processes BEFORE agent.close():
         # close() kill_all()s the task and the dying parent owns the children's stdout pipes, so
@@ -638,6 +651,9 @@ def _close_agent(agent, session_db) -> None:
         memory_args = (session_messages,) if isinstance(session_messages, list) else ()
         _quietly("memory/context cleanup", lambda: agent.shutdown_memory_provider(*memory_args))
         _quietly("agent cleanup", lambda: agent.close())
+    # Plugins using queued observability state must get a synchronous finalization callback before
+    # the one-shot process closes its DB and crosses the os._exit boundary.
+    _quietly("plugin lifecycle cleanup", lambda: _finalize_oneshot_lifecycle(session_id, platform))
     # agent.close() ends the session but leaves the connection open; close it to checkpoint the WAL.
     if session_db is not None:
         _quietly("session store cleanup", lambda: session_db.close())
