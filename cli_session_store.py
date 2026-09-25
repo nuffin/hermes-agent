@@ -78,6 +78,7 @@ class PostgreSQLCLISessionStore:
         effect_disposition: str | None = None, _compressed_summary: bool = False,
         timestamp: Any = None, api_content: str | None = None,
         display_kind: str | None = None, display_metadata: dict[str, Any] | None = None,
+        topic_id: int | None = None,
         **kwargs: Any,
     ) -> int:
         """Persist the SessionDB-compatible single-message CLI surface.
@@ -101,7 +102,7 @@ class PostgreSQLCLISessionStore:
             effect_disposition=effect_disposition,
             _compressed_summary=_compressed_summary, timestamp=timestamp,
             api_content=api_content, display_kind=display_kind,
-            display_metadata=display_metadata,
+            display_metadata=display_metadata, topic_id=topic_id,
         ))
 
     def append_messages_batch(self, session_id: str, messages: list[Mapping[str, Any]], **kwargs: Any) -> int:
@@ -115,6 +116,32 @@ class PostgreSQLCLISessionStore:
             raise PostgreSQLCLISessionCapabilityError(
                 "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(kwargs)))
         return self._store.append_message_records(session_id, [self._record(message) for message in messages])
+
+    def _topic_capability(self, name: str) -> Any:
+        method = getattr(self._store, name, None)
+        if not callable(method):
+            raise PostgreSQLCLISessionCapabilityError(
+                f"PostgreSQL CLI persistence does not support session topics: {name}"
+            )
+        return method
+
+    def create_topic(self, session_id: str, title: str, summary: Any = None) -> int:
+        return self._topic_capability("create_topic")(session_id, title, summary)
+
+    def get_topics(self, session_id: str) -> list[dict[str, Any]]:
+        return self._topic_capability("get_topics")(session_id)
+
+    def get_active_topic(self, session_id: str) -> dict[str, Any] | None:
+        return self._topic_capability("get_active_topic")(session_id)
+
+    def set_active_topic(self, session_id: str, topic_id: int) -> bool:
+        return self._topic_capability("set_active_topic")(session_id, topic_id)
+
+    def update_topic_message_count(self, topic_id: int, count_delta: int = 1) -> None:
+        return self._topic_capability("update_topic_message_count")(topic_id, count_delta)
+
+    def get_topic_messages(self, session_id: str, topic_id: int, include_inactive: bool = False) -> list[dict[str, Any]]:
+        return self._topic_capability("get_topic_messages")(session_id, topic_id, include_inactive=include_inactive)
 
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
         """Replace the session's model config (and fill a missing model) after queued usage is durable.

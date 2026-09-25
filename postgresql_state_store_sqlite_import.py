@@ -31,6 +31,7 @@ _ISOLATED_SCHEMA_RE = re.compile(r"^hermes_state_store_tenant_[0-9a-f]{32}$")
 _SUPPORTED_OBJECTS = (
     "system_prompts",
     "sessions",
+    "session_topics",
     "messages",
     "session_model_usage",
     "conversation_generations",
@@ -47,9 +48,6 @@ _NON_MIGRATED_TABLES = frozenset({
     "compression_locks",
     "session_turn_leases",
     "async_delegations",
-    # Topic rows do not yet have a PostgreSQL StateStore contract. Empty tables
-    # are accepted; populated rows fail before import instead of being discarded.
-    "session_topics",
 })
 # Fields without a PostgreSQL StateStore contract.  A non-default value means the source is not
 # in the bounded migration slice and therefore must not be silently truncated.
@@ -86,12 +84,15 @@ _SUPPORTED_SOURCE_COLUMNS = {
         "api_call_count", "profile_name", "archived", "pinned", "hidden",
         *_UNSUPPORTED_SESSION_COLUMNS,
     }),
+    "session_topics": frozenset({
+        "id", "session_id", "title", "normalized_title", "summary", "state", "message_count", "created_at", "last_active_at",
+    }),
     "messages": frozenset({
         "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
         "effect_disposition", "timestamp", "token_count", "finish_reason", "reasoning",
         "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
         "platform_message_id", "observed", "_compressed_summary", "active", "compacted",
-        "api_content", "display_kind", "display_metadata", *_UNSUPPORTED_MESSAGE_COLUMNS,
+        "api_content", "display_kind", "display_metadata", "topic_id", *_UNSUPPORTED_MESSAGE_COLUMNS,
     }),
     "session_model_usage": frozenset({
         "session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task",
@@ -148,6 +149,16 @@ class SQLitePostgreSQLImportResult:
     source_fingerprint: str
     object_counts: Mapping[str, int]
     manifest: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _PreparedSQLiteSource:
+    """One immutable, fully validated source snapshot consumed by an import."""
+
+    snapshot: Path
+    fingerprint: str
+    counts: Mapping[str, int]
+    source_schema: Mapping[str, Any]
 
 
 _SQLITE_IMPORT_OWNERSHIP_SCHEMA_PREFIX = "hermes_sqlite_import_owner_"
@@ -294,6 +305,12 @@ def source_object_mapping_manifest() -> dict[str, Any]:
                 }
                 for name in _SUPPORTED_OBJECTS
             ),
+            {
+                "source": "session_topics.state",
+                "target": "session_topics.state",
+                "classification": "canonical-supported-with-preflight",
+                "action": "only active|warm states are accepted and every nonempty source session must have exactly one active topic; reject otherwise",
+            },
             {
                 "source": "messages_fts*",
                 "target": "messages.search_document",
@@ -466,6 +483,35 @@ def _assert_unknown_columns_unpopulated(connection: sqlite3.Connection, table: s
             )
 
 
+def _assert_single_active_topics(connection: sqlite3.Connection) -> None:
+    """Require PostgreSQL-compatible topic state before any target bootstrap.
+
+    SQLite historical data can contain several active topics or only warm topics.
+    Neither can be imported faithfully into the v27 singleton-active contract, so
+    reject the immutable snapshot rather than choosing or warming a topic.
+    """
+    invalid_state = connection.execute(
+        "SELECT session_id, state FROM session_topics "
+        "WHERE state IS NULL OR state NOT IN ('active', 'warm') "
+        "ORDER BY session_id, id LIMIT 1"
+    ).fetchone()
+    if invalid_state is not None:
+        raise SQLitePostgreSQLImportError(
+            "SQLite import rejects session_topics states outside active|warm"
+        )
+    invalid = connection.execute(
+        "SELECT session_id, count(*) AS topics, "
+        "count(*) FILTER (WHERE state='active') AS active_topics "
+        "FROM session_topics GROUP BY session_id "
+        "HAVING count(*) FILTER (WHERE state='active') <> 1 "
+        "ORDER BY session_id LIMIT 1"
+    ).fetchone()
+    if invalid is not None:
+        raise SQLitePostgreSQLImportError(
+            "SQLite import rejects session_topics without exactly one active topic"
+        )
+
+
 def _source_inventory(snapshot: Path) -> tuple[dict[str, int], dict[str, Any]]:
     with sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True) as connection:
         tables = _source_tables(connection)
@@ -504,6 +550,16 @@ def _source_inventory(snapshot: Path) -> tuple[dict[str, int], dict[str, Any]]:
         _assert_default_columns(connection, "messages", _UNSUPPORTED_MESSAGE_COLUMNS)
         for table in _SUPPORTED_OBJECTS:
             _assert_unknown_columns_unpopulated(connection, table)
+        mismatch = connection.execute(
+            "SELECT 1 FROM messages AS message LEFT JOIN session_topics AS topic "
+            "ON topic.id=message.topic_id WHERE message.topic_id IS NOT NULL "
+            "AND (topic.id IS NULL OR topic.session_id IS NOT message.session_id) LIMIT 1"
+        ).fetchone()
+        if mismatch is not None:
+            raise SQLitePostgreSQLImportError(
+                "SQLite import rejects message topic_id outside its session"
+            )
+        _assert_single_active_topics(connection)
         counts = {
             table: int(
                 connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
@@ -522,6 +578,120 @@ def _source_inventory(snapshot: Path) -> tuple[dict[str, int], dict[str, Any]]:
         "derived_fts_excluded": fts,
         "mapping": source_object_mapping_manifest(),
     }
+
+
+def _sessions_in_foreign_key_order(source: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Validate and order the immutable source's self-referential sessions."""
+    rows = list(source.execute('SELECT * FROM "sessions"'))
+    by_id = {str(row["id"]): row for row in rows}
+    if len(by_id) != len(rows):
+        raise SQLitePostgreSQLImportError("SQLite import source has duplicate session IDs")
+    for row in rows:
+        parent = row["parent_session_id"]
+        if parent is not None and str(parent) not in by_id:
+            raise SQLitePostgreSQLImportError(
+                "SQLite import source has a session parent outside its source"
+            )
+    ordered: list[sqlite3.Row] = []
+    pending = dict(by_id)
+    while pending:
+        ready = [
+            session_id
+            for session_id, row in pending.items()
+            if row["parent_session_id"] is None
+            or str(row["parent_session_id"]) not in pending
+        ]
+        if not ready:
+            raise SQLitePostgreSQLImportError(
+                "SQLite import source sessions contain a parent-session cycle"
+            )
+        for session_id in sorted(ready):
+            ordered.append(pending.pop(session_id))
+    return ordered
+
+
+def _validate_source_rows(snapshot: Path) -> None:
+    """Validate every row transform and source reference before target allocation.
+
+    PostgreSQL is deliberately not used as a validator here: a public allocation
+    helper must reject malformed input without creating a marker or tenant schema.
+    Target constraints remain defence in depth for the transactional import.
+    """
+    with sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True) as source:
+        source.row_factory = sqlite3.Row
+        sessions = _sessions_in_foreign_key_order(source)
+        session_ids = {str(row["id"]) for row in sessions}
+        prompts = {
+            str(row["hash"])
+            for row in source.execute('SELECT hash FROM "system_prompts"')
+        }
+        for row in sessions:
+            prompt = row["system_prompt_hash"]
+            if prompt is not None and str(prompt) not in prompts:
+                raise SQLitePostgreSQLImportError(
+                    "SQLite import source has a session system prompt outside its source"
+                )
+            _normalise_json(row["model_config"], "sessions", "model_config")
+        topics: dict[int, str] = {}
+        for row in source.execute('SELECT id, session_id FROM "session_topics"'):
+            topic_id = int(row["id"])
+            if topic_id in topics or str(row["session_id"]) not in session_ids:
+                raise SQLitePostgreSQLImportError(
+                    "SQLite import source has a topic outside its session source"
+                )
+            topics[topic_id] = str(row["session_id"])
+        for row in source.execute(
+            'SELECT session_id, topic_id, tool_calls, display_metadata FROM "messages"'
+        ):
+            session_id = str(row["session_id"])
+            if session_id not in session_ids:
+                raise SQLitePostgreSQLImportError(
+                    "SQLite import source has a message outside its session source"
+                )
+            topic_id = row["topic_id"]
+            if topic_id is not None and topics.get(int(topic_id)) != session_id:
+                raise SQLitePostgreSQLImportError(
+                    "SQLite import rejects message topic_id outside its session"
+                )
+            _normalise_json(row["tool_calls"], "messages", "tool_calls")
+            _normalise_json(row["display_metadata"], "messages", "display_metadata")
+        for row in source.execute('SELECT session_id FROM "session_model_usage"'):
+            if str(row["session_id"]) not in session_ids:
+                raise SQLitePostgreSQLImportError(
+                    "SQLite import source has usage outside its session source"
+                )
+        for row in source.execute('SELECT receipt_json FROM "session_runtime_turns"'):
+            _normalise_json(row["receipt_json"], "session_runtime_turns", "receipt_json")
+
+
+def _release_snapshot(snapshot: Path) -> None:
+    snapshot.unlink(missing_ok=True)
+    if snapshot.parent.exists() and not any(snapshot.parent.iterdir()):
+        snapshot.parent.rmdir()
+
+
+def _prepare_source(source_path: Path, snapshot_root: Path) -> _PreparedSQLiteSource:
+    """Snapshot, inventory, and validate source-only state before any PG action."""
+    source = source_path.resolve()
+    try:
+        from hermes_constants import get_hermes_home
+
+        if source == (get_hermes_home() / "state.db").resolve():
+            raise SQLitePostgreSQLImportError(
+                "SQLite import refuses the active default state.db; supply a disposable explicit source"
+            )
+    except SQLitePostgreSQLImportError:
+        raise
+    except Exception:
+        pass
+    snapshot = _snapshot_sqlite(source, snapshot_root)
+    try:
+        counts, source_schema = _source_inventory(snapshot)
+        _validate_source_rows(snapshot)
+        return _PreparedSQLiteSource(snapshot, _hash_file(snapshot), counts, source_schema)
+    except Exception:
+        _release_snapshot(snapshot)
+        raise
 
 
 def _target_counts(cursor: Any, schema: str) -> dict[str, int]:
@@ -805,29 +975,7 @@ class SQLitePostgreSQLSandboxImporter:
     def _sessions_in_foreign_key_order(
         self, source: sqlite3.Connection
     ) -> list[sqlite3.Row]:
-        """Return source sessions parent-first; reject malformed self-reference cycles."""
-        rows = list(self._rows(source, "sessions"))
-        by_id = {str(row["id"]): row for row in rows}
-        if len(by_id) != len(rows):
-            raise SQLitePostgreSQLImportError(
-                "SQLite import source has duplicate session IDs"
-            )
-        ordered: list[sqlite3.Row] = []
-        pending = dict(by_id)
-        while pending:
-            ready = [
-                session_id
-                for session_id, row in pending.items()
-                if row["parent_session_id"] is None
-                or str(row["parent_session_id"]) not in pending
-            ]
-            if not ready:
-                raise SQLitePostgreSQLImportError(
-                    "SQLite import source sessions contain a parent-session cycle"
-                )
-            for session_id in sorted(ready):
-                ordered.append(pending.pop(session_id))
-        return ordered
+        return _sessions_in_foreign_key_order(source)
 
     def _import_objects(
         self, cursor: Any, source: sqlite3.Connection, *, fail_after: str | None = None
@@ -901,6 +1049,21 @@ class SQLitePostgreSQLSandboxImporter:
             )
         if fail_after == "sessions":
             raise RuntimeError("injected interruption")
+        topic_columns = (
+            "id", "session_id", "title", "summary", "state", "message_count", "created_at", "last_active_at",
+        )
+        for row in self._rows(source, "session_topics"):
+            active_count = int(source.execute(
+                'SELECT count(*) FROM "messages" WHERE topic_id=? AND active=1', (row["id"],)
+            ).fetchone()[0])
+            cursor.execute(
+                f"INSERT INTO {qschema}.session_topics ({', '.join(topic_columns)}) "
+                f"OVERRIDING SYSTEM VALUE VALUES ({', '.join(['%s'] * len(topic_columns))})",
+                [row["id"], row["session_id"], row["title"], row["summary"], row["state"], active_count,
+                 row["created_at"], row["last_active_at"]],
+            )
+        if fail_after == "session_topics":
+            raise RuntimeError("injected interruption")
         message_columns = (
             "id",
             "session_id",
@@ -926,6 +1089,7 @@ class SQLitePostgreSQLSandboxImporter:
             "api_content",
             "display_kind",
             "display_metadata",
+            "topic_id",
         )
         for row in self._rows(source, "messages"):
             values = [
@@ -1004,6 +1168,15 @@ class SQLitePostgreSQLSandboxImporter:
             f"SELECT setval(%s::regclass, COALESCE((SELECT max(id) FROM {qschema}.messages), 1), (SELECT count(*) > 0 FROM {qschema}.messages))",
             (sequence,),
         )
+        cursor.execute(
+            f"SELECT pg_get_serial_sequence(%s, 'id')", (f"{self._schema}.session_topics",)
+        )
+        topic_sequence = cursor.fetchone()[0]
+        cursor.execute(
+            f"SELECT setval(%s::regclass, COALESCE((SELECT max(id) FROM {qschema}.session_topics), 1), "
+            f"(SELECT count(*) > 0 FROM {qschema}.session_topics))",
+            (topic_sequence,),
+        )
 
     def import_source(
         self,
@@ -1012,29 +1185,16 @@ class SQLitePostgreSQLSandboxImporter:
         snapshot_root: Path,
         evidence_path: Path | None = None,
         fail_after: str | None = None,
+        prepared_source: _PreparedSQLiteSource | None = None,
     ) -> SQLitePostgreSQLImportResult:
-        source = source_path.resolve()
-        # Explicitly prevent accidental use of the active default store.  Profile/custom sources are
-        # intentionally not inferred; all callers must pass their disposable path directly.
-        try:
-            from hermes_constants import get_hermes_home
-
-            if source == (get_hermes_home() / "state.db").resolve():
-                raise SQLitePostgreSQLImportError(
-                    "SQLite import refuses the active default state.db; supply a disposable explicit source"
-                )
-        except SQLitePostgreSQLImportError:
-            raise
-        except Exception:
-            pass
-        snapshot = _snapshot_sqlite(source, snapshot_root)
-        fingerprint = _hash_file(snapshot)
-        counts: Mapping[str, int] = {}
-        source_schema: Mapping[str, Any] = {}
+        prepared = prepared_source or _prepare_source(source_path, snapshot_root)
+        snapshot = prepared.snapshot
+        fingerprint = prepared.fingerprint
+        counts: Mapping[str, int] = prepared.counts
+        source_schema: Mapping[str, Any] = prepared.source_schema
         import_id = ""
         preflight_started = False
         try:
-            counts, source_schema = _source_inventory(snapshot)
             self._prepare_target()
             with (
                 sqlite3.connect(
@@ -1144,10 +1304,7 @@ class SQLitePostgreSQLSandboxImporter:
                 f"SQLite import failed; target remains isolated and must not be selected for runtime: {exc}"
             ) from exc
         finally:
-            snapshot.unlink(missing_ok=True)
-            snapshot.parent.rmdir() if snapshot.parent.exists() and not any(
-                snapshot.parent.iterdir()
-            ) else None
+            _release_snapshot(snapshot)
 
 
 def import_into_allocated_target(
@@ -1166,14 +1323,23 @@ def import_into_allocated_target(
     included in that error path.
     """
     try:
+        prepared_source = _prepare_source(source_path, snapshot_root)
+    except SQLitePostgreSQLImportError as exc:
+        raise SQLitePostgreSQLImportError(
+            "SQLite import rejected source during read-only preflight",
+            stage="source-preflight",
+        ) from exc
+    try:
         target = allocate_owned_sqlite_import_target(dsn)
     except SQLitePostgreSQLImportError as exc:
+        _release_snapshot(prepared_source.snapshot)
         raise SQLitePostgreSQLImportError(
             "SQLite import could not allocate an owned isolated PostgreSQL target",
             cleanup=exc.cleanup,
             stage="allocation",
         ) from exc
     except Exception as exc:
+        _release_snapshot(prepared_source.snapshot)
         raise SQLitePostgreSQLImportError(
             "SQLite import could not allocate an owned isolated PostgreSQL target",
             stage="allocation",
@@ -1185,6 +1351,7 @@ def import_into_allocated_target(
             source_path,
             snapshot_root=snapshot_root,
             evidence_path=evidence_path,
+            prepared_source=prepared_source,
         )
     except Exception as exc:
         try:
