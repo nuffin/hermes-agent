@@ -438,7 +438,7 @@ def finish_text_response(
             )
 
     _release = getattr(agent, "_release_deferred_final_response", None)
-    if callable(_release):
+    if callable(_release) and not getattr(agent, "_topic_segmentation_enabled", False):
         _release(final_response)
 
     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"

@@ -385,4 +385,5 @@ def test_topic_runtime_errors_are_exact_and_identifier_free(operation):
     assert exc.code == TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE
     assert str(exc) == TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
     assert exc.__cause__ is None
+    assert exc.__context__ is None
     assert session_id not in public and marker not in public

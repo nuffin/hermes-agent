@@ -564,6 +564,21 @@ def finalize_turn(
                 # non-PG persistence, observation, memory, review, or hook sink.
                 start = getattr(agent, "_persist_user_message_idx", None)
                 if isinstance(start, int) and 0 <= start < len(messages):
+                    row_ids = [
+                        row["_row_id"] for row in messages[start:]
+                        if isinstance(row, dict) and isinstance(row.get("_row_id"), int)
+                        and row["_row_id"] > 0
+                    ]
+                    # Crash-persisted current-turn rows must be retired by
+                    # exact durable id and active lease before their in-memory
+                    # mirrors are quarantined. Never use a suffix/broad delete.
+                    retract = getattr(getattr(agent, "_session_db", None), "retract_topic_turn_messages", None)
+                    if row_ids and callable(retract):
+                        try:
+                            retract(agent.session_id, row_ids,
+                                    turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+                        except Exception:
+                            logger.warning("selected-topic turn retraction failed", exc_info=True)
                     del messages[start:]
                 else:
                     messages[:] = [
@@ -571,6 +586,9 @@ def finalize_turn(
                         if not (isinstance(message, dict) and message.get("role") == "assistant")
                     ]
                 final_response = None
+                discard = getattr(agent, "_discard_deferred_final_response", None)
+                if callable(discard):
+                    discard()
                 agent._topic_segmentation_runtime_error = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
                 return
         if final_response and not interrupted and not topic_segmentation_runtime_failed:
@@ -593,6 +611,27 @@ def finalize_turn(
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+
+    # Topic-enabled turns intentionally buffer final text and external-memory
+    # admission until the selected-store transition *and* append succeed.  A
+    # cleanup error is conservatively treated as no publication.
+    if (
+        getattr(agent, "_topic_segmentation_enabled", False)
+        and not topic_segmentation_runtime_failed
+        and final_response
+        and not interrupted
+        and not failed
+        and not _cleanup_errors
+    ):
+        release = getattr(agent, "_release_deferred_final_response", None)
+        if callable(release):
+            release(final_response)
+        if getattr(agent, "_topic_memory_start_deferred", False):
+            from agent.turn_context import _memory_turn_start_and_prefetch
+            _memory_turn_start_and_prefetch(
+                agent, original_user_message, allow_selected_topic_publication=True,
+            )
+            agent._topic_memory_start_deferred = False
 
     if not topic_segmentation_runtime_failed:
         # Do not publish post-turn auxiliary artifacts before a selected topic
@@ -691,8 +730,9 @@ def finalize_turn(
         "service_tier": (
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
-        "session_id": agent.session_id,
     }
+    if not topic_segmentation_runtime_failed:
+        result["session_id"] = agent.session_id
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway

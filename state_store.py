@@ -838,10 +838,13 @@ def _historic_default_postgresql_state_exists(
                     (_HISTORIC_DEFAULT_POSTGRESQL_SCHEMA,),
                 )
                 return bool(cursor.fetchone()[0])
-    except Exception as exc:
-        raise StateStoreConfigurationError(
-            "PostgreSQL state store could not inspect the historic default-profile cutover boundary"
-        ) from exc
+    except Exception:
+        # Raise after the handler: `from None` suppresses rendered context but
+        # still retains it for programmatic exception formatters.
+        pass
+    raise StateStoreConfigurationError(
+        "PostgreSQL state store could not inspect the historic default-profile cutover boundary"
+    )
 
 
 def open_state_store(

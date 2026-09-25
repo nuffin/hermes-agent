@@ -1566,6 +1566,38 @@ def _run_conversation_turn(
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+    except Exception as _topic_setup_exc:
+        from agent.session_topics import TopicSegmentationRuntimeError
+        if not isinstance(_topic_setup_exc, TopicSegmentationRuntimeError):
+            raise
+        # Topic setup is a fail-closed selected-store boundary.  It happens
+        # before crash persistence and provider publication, so return only the
+        # prior history and the invariant public error envelope.
+        from agent.session_topics import (
+            TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+            TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+        )
+        return {
+            "final_response": None,
+            "last_reasoning": None,
+            "messages": list(conversation_history or []),
+            "api_calls": 0,
+            "completed": False,
+            "turn_exit_reason": TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+            "failed": True,
+            "partial": False,
+            "interrupted": False,
+            "response_transformed": False,
+            "pre_transform_response": None,
+            "response_previewed": False,
+            "model": agent.model,
+            "provider": agent.provider,
+            "base_url": agent.base_url,
+            "last_prompt_tokens": 0,
+            "service_tier": None,
+            "error": TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+            "failure_reason": TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+        }
 
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not

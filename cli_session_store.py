@@ -174,6 +174,13 @@ class PostgreSQLCLISessionStore:
             message_ids=message_ids, turn_lease_holder=turn_lease_holder,
         )
 
+    def retract_topic_turn_messages(
+        self, session_id: str, message_ids: list[int], *, turn_lease_holder: str | None = None,
+    ) -> int:
+        return self._topic_capability("retract_topic_turn_messages")(
+            session_id, message_ids, turn_lease_holder=turn_lease_holder,
+        )
+
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
         """Replace the session's model config (and fill a missing model) after queued usage is durable.
 

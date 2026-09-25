@@ -754,7 +754,7 @@ def _collect_pre_llm_call_context(
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
     (never the system prompt). Oversized per-hook context is spilled to disk so a
     runaway plugin can't inflate every subsequent turn's prompt."""
-    if getattr(agent, "_persist_disabled", False):
+    if getattr(agent, "_persist_disabled", False) or getattr(agent, "_topic_segmentation_enabled", False):
         return ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -858,10 +858,17 @@ def _memory_query_text(original_user_message: Any) -> str:
 
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
+    *, allow_selected_topic_publication: bool = False,
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
     Returns the prefetch text (``""`` when nothing was injected)."""
+    # Selected-topic turns defer all external observation until the topic
+    # transition and durable append have committed. This intentionally trades
+    # current-turn recall/stream progress for a fail-closed publication boundary.
+    if getattr(agent, "_topic_segmentation_enabled", False) and not allow_selected_topic_publication:
+        agent._topic_memory_start_deferred = True
+        return ""
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)

@@ -69,6 +69,7 @@ def initialize_topic_segmentation(agent: Any, config: Any) -> None:
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     session_override: Optional[bool] = None
+    failure: TopicSegmentationRuntimeError | None = None
     if db is not None and session_id:
         try:
             override = db.get_session_model_config_value(
@@ -78,9 +79,10 @@ def initialize_topic_segmentation(agent: Any, config: Any) -> None:
                 session_override = override
                 enabled = override
         except Exception as exc:
-            if enabled:
-                raise _topic_runtime_failure("restore_override", exc) from None
+            failure = _topic_runtime_failure("restore_override", exc) if enabled else None
             logger.warning("Could not restore disabled topic-segmentation state for session=%s", session_id, exc_info=True)
+        if failure is not None:
+            raise failure
     if session_override is not None and isinstance(
         getattr(agent, "_session_init_model_config", None), dict
     ):
@@ -93,7 +95,11 @@ def initialize_topic_segmentation(agent: Any, config: Any) -> None:
             active = db.get_active_topic(session_id)
             agent._active_topic_id = active["id"] if active else None
         except Exception as exc:
-            raise _topic_runtime_failure("restore_active_topic", exc) from None
+            failure = _topic_runtime_failure("restore_active_topic", exc)
+        else:
+            failure = None
+        if failure is not None:
+            raise failure
     _sync_context_engine_topic(agent)
 
 
@@ -203,6 +209,8 @@ def prepare_topic_turn(
         return messages, current_turn_user_idx, prior
 
     user_message = messages[current_turn_user_idx]
+    history: list[dict[str, Any]] = []
+    topic_id = 0
     try:
         holder = getattr(agent, "_active_session_turn_lease_holder", None)
         if holder is None:
@@ -221,7 +229,11 @@ def prepare_topic_turn(
             topic_id=topic_id,
         )
     except Exception as exc:
-        raise _topic_runtime_failure("load_history", exc) from None
+        failure = _topic_runtime_failure("load_history", exc)
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
 
     current_row_id = user_message.get("_row_id") if isinstance(user_message, dict) else None
     if isinstance(current_row_id, int):
@@ -242,10 +254,15 @@ def topic_prompt_context(agent: Any) -> str:
     session_id = getattr(agent, "session_id", None)
     if db is None or not session_id:
         raise _topic_runtime_failure("build_index_missing_store")
+    topics: list[dict[str, Any]] = []
     try:
         topics = db.get_topics(session_id)
     except Exception as exc:
-        raise _topic_runtime_failure("build_index", exc) from None
+        failure = _topic_runtime_failure("build_index", exc)
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
     lines = ["[SESSION TOPICS — classify this turn; no extra model call]"]
     for topic in topics[:8]:
         marker = " active" if topic.get("state") == "active" else ""
@@ -287,6 +304,7 @@ def process_turn_topic(agent: Any, messages: list[dict[str, Any]], final_respons
         return
 
     title = parse_topic_signal(final_response)
+    topic_id = 0
     try:
         topics = db.get_topics(session_id)
         active = next((topic for topic in topics if topic.get("state") == "active"), None)
@@ -308,7 +326,11 @@ def process_turn_topic(agent: Any, messages: list[dict[str, Any]], final_respons
         )
         topic_id = int(selected["id"])
     except Exception as exc:
-        raise _topic_runtime_failure("transition", exc) from None
+        failure = _topic_runtime_failure("transition", exc)
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
 
     agent._active_topic_id = topic_id
     _sync_context_engine_topic(agent)

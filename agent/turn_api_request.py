@@ -106,7 +106,11 @@ def build_api_request(
     # a rejected candidate cannot leak while the next request is prepared.
     try:
         from hermes_cli.lifecycle import has_hook
-        agent._defer_final_response_stream_delivery = bool(has_hook("pre_final_response"))
+        # Selected-topic turns are deliberately non-progressive: text cannot
+        # reach a public sink until the durable topic transition succeeds.
+        agent._defer_final_response_stream_delivery = bool(
+            has_hook("pre_final_response") or getattr(agent, "_topic_segmentation_enabled", False)
+        )
     except Exception:
         agent._defer_final_response_stream_delivery = False
     agent._reset_stream_delivery_tracking()

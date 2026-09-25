@@ -453,6 +453,7 @@ def test_topic_transition_failure_quarantines_every_post_finalization_sink(monke
     assert "private assistant tail" not in public
     assert "private current user" not in public
     assert "session-private-marker" not in public
+    assert "session_id" not in result
 
 
 def test_successful_turn_retains_post_finalization_sinks(monkeypatch):

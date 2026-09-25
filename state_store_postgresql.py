@@ -1212,6 +1212,36 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             )
             return dict(cursor.fetchone())
 
+    def retract_topic_turn_messages(
+        self, session_id: str, message_ids: list[int], *, turn_lease_holder: str | None = None,
+    ) -> int:
+        """Soft-retire exact failed-turn rows under the owning turn lease."""
+        ids = list(dict.fromkeys(
+            row_id for row_id in message_ids
+            if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0
+        ))
+        if not ids:
+            return 0
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                raise LookupError("selected session does not exist")
+            self._transcript_write_guards(cursor, session_id, turn_lease_holder=turn_lease_holder)
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.messages WHERE session_id=%s AND active AND id=ANY(%s) FOR UPDATE",
+                (session_id, ids),
+            )
+            if {int(row["id"]) for row in cursor.fetchall()} != set(ids):
+                raise LookupError("current turn message ids are not all active in the selected session")
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET active=false, compacted=false WHERE session_id=%s AND id=ANY(%s) AND active",
+                (session_id, ids),
+            )
+            if cursor.rowcount != len(ids):
+                raise RuntimeError("current turn retraction lost its exact durable boundary")
+            self._refresh_topic_message_counts(cursor, session_id)
+            return len(ids)
+
     def set_active_topic(self, session_id: str, topic_id: int) -> bool:
         now = time.time()
         with self._connection() as connection, connection.cursor() as cursor:
