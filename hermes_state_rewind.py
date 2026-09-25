@@ -106,7 +106,8 @@ def _rewind_user_turn_impl(
 
     prefix = durable_prefix
     if warm_history is not None:
-        warm = [m for m in warm_history if not _is_ephemeral_scaffolding(m)]
+        warm = [dict(m) for m in warm_history if not _is_ephemeral_scaffolding(m)]
+        repair_message_sequence(None, warm)
         warm_user = _user_indices(warm)
         if len(warm_user) != len(durable_user):
             raise RuntimeError(_HISTORY_CHANGED)
@@ -129,13 +130,18 @@ def _rewind_user_turn_impl(
     request_id = request_id or uuid4().hex
     try:
         receipt_capable = callable(getattr(self, "get_rewind_receipt", None))
+        raw_target = next((message for message in durable if message.get("_row_id") == target_row_id), None)
+        if raw_target is None:
+            raise RuntimeError("rewind target has no durable source row")
+        _, raw_live_view = split_user_originated_turn(raw_target)
+        if raw_live_view is None:
+            raise RuntimeError("rewind target is not a durable user turn")
         mutation_kwargs = {
             "preserve_compaction_handoff": scaffold is not None,
             "expected_active_ids": expected_active_ids,
             # Pin against the STORED row (upstream #115493 semantics); receipt-bearing stores
             # compare on the same projection the durable row stores.
-            "expected_target_content": _comparison_content(stored_view) if receipt_capable else stored_view.get("content"),
-        }
+            "expected_target_content": _comparison_content(stored_view) if receipt_capable else stored_view.get("content"),        }
         # SQLite retains its historical primitive signature. Receipt-bearing
         # stores opt in explicitly; this is not a duck-typed SQLite extension.
         if receipt_capable:

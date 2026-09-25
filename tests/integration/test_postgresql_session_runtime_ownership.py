@@ -128,7 +128,7 @@ def test_pg18_namespace_isolation_release_fence_and_catalog_rollback():
         assert store.begin_session_runtime_turn(successor, "after-rollback")
         with store._connection() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT version_num FROM alembic_version")
-            assert cursor.fetchall() == [("state_store_v26_sqlite_import",)]
+            assert cursor.fetchall() == [("state_store_v27_session_topics",)]
     finally:
         store.close()
 

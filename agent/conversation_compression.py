@@ -1690,6 +1690,9 @@ def _adopt_live_compression_child(
     if not confirmed or str(confirmed) != child_session_id:
         return None
     agent.session_id = child_session_id
+    # Topic ids are session-scoped. A compression child starts with no inherited
+    # topic association; the next durable user row creates/selects its own topic.
+    agent._active_topic_id = None
     _rebind_session_context(child_session_id)
     agent._session_db_created = True
     if child.get("system_prompt"):
@@ -3401,6 +3404,8 @@ def _publish_rotated_compaction(
         if isinstance(_handoff_message, dict):
             _handoff_message[_DB_PERSISTED_MARKER] = True
     agent.session_id = new_session_id
+    # A topic belongs to the parent session and cannot be reused by the child.
+    agent._active_topic_id = None
     agent._db_flush_scan_prefix = None
     _rebind_session_context(agent.session_id)
     agent._session_db_created = True

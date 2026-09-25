@@ -505,6 +505,15 @@ def _source_inventory(snapshot: Path) -> tuple[dict[str, int], dict[str, Any]]:
         _assert_default_columns(connection, "messages", _UNSUPPORTED_MESSAGE_COLUMNS)
         for table in _SUPPORTED_OBJECTS:
             _assert_unknown_columns_unpopulated(connection, table)
+        mismatch = connection.execute(
+            "SELECT 1 FROM messages AS message LEFT JOIN session_topics AS topic "
+            "ON topic.id=message.topic_id WHERE message.topic_id IS NOT NULL "
+            "AND (topic.id IS NULL OR topic.session_id IS NOT message.session_id) LIMIT 1"
+        ).fetchone()
+        if mismatch is not None:
+            raise SQLitePostgreSQLImportError(
+                "SQLite import rejects message topic_id outside its session"
+            )
         counts = {
             table: int(
                 connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
