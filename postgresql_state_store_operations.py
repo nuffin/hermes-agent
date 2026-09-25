@@ -210,6 +210,11 @@ class PostgreSQLSandboxOperations:
             )
             usage_orphans = int(cursor.fetchone()[0])
             cursor.execute(
+                f"SELECT count(*) FROM (SELECT session_id FROM {_quote_identifier(self._schema)}.session_topics "
+                "GROUP BY session_id HAVING count(*) FILTER (WHERE state='active') <> 1) AS invalid_topics"
+            )
+            invalid_topic_sessions = int(cursor.fetchone()[0])
+            cursor.execute(
                 f"SELECT count(*) FROM {_quote_identifier(self._schema)}.session_runtime_owners "
                 "WHERE expires_at > EXTRACT(EPOCH FROM clock_timestamp())"
             )
@@ -236,7 +241,7 @@ class PostgreSQLSandboxOperations:
             gin_index = bool((cursor.fetchone() or (False,))[0])
         if not generated_document or not gin_index:
             raise PostgreSQLSandboxOperationsError("PostgreSQL tenant search catalog is unhealthy")
-        if missing_extensions or message_orphans or usage_orphans:
+        if missing_extensions or message_orphans or usage_orphans or invalid_topic_sessions:
             raise PostgreSQLSandboxOperationsError("PostgreSQL tenant invariant check failed")
         return {
             "backend": "postgresql",
@@ -250,7 +255,8 @@ class PostgreSQLSandboxOperations:
             "table_counts": table_counts,
             "search": {"available": True, "generated_document": "valid", "gin_index": "valid"},
             "ownership": {"active_leases": active_leases, "catalog_present": True},
-            "invariants": {"message_orphans": message_orphans, "usage_orphans": usage_orphans},
+            "invariants": {"message_orphans": message_orphans, "usage_orphans": usage_orphans,
+                           "invalid_topic_sessions": invalid_topic_sessions},
         }
 
     def _delivery_snapshot(self, connection: Any) -> dict[str, Any] | None:

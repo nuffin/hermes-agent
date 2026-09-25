@@ -315,7 +315,9 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
         settings, _DSN, schema=schema, command_runner=_runner
     )
     doctor = operations.doctor(required_extensions=("pg_trgm", "vector"))
-    assert doctor["invariants"] == {"message_orphans": 0, "usage_orphans": 0}
+    assert doctor["invariants"] == {
+        "message_orphans": 0, "usage_orphans": 0, "invalid_topic_sessions": 0,
+    }
     backup_root = tmp_path / "backups"
     backup = operations.backup(
         backup_root, required_extensions=("pg_trgm", "vector"), quiesced=True
@@ -331,6 +333,35 @@ def test_pg18_import_rejects_cross_session_topic_before_target_mutation(sandbox,
 
     with pytest.raises(SQLitePostgreSQLImportError, match="topic_id outside its session"):
         importer.import_source(sqlite_source, snapshot_root=tmp_path)
+    with target.connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT to_regclass(%s)", (f"{target.schema}.alembic_version",))
+        assert cursor.fetchone() == (None,)
+
+
+@pytest.mark.parametrize("topic_states", (("warm",), ("active", "active")))
+def test_pg18_import_rejects_non_singleton_active_topics_before_target_mutation(
+    sandbox, sqlite_source, tmp_path, topic_states,
+):
+    """Legacy SQLite topic divergence is read-only rejected, never normalized."""
+    importer, target, _settings = sandbox
+    with sqlite3.connect(sqlite_source) as connection:
+        connection.execute("UPDATE session_topics SET state=? WHERE id=1", (topic_states[0],))
+        if len(topic_states) == 2:
+            connection.execute(
+                "INSERT INTO session_topics (id, session_id, title, state, message_count, created_at, last_active_at) "
+                "VALUES (2, 'session-a', 'second', 'active', 0, 102, 102)"
+            )
+        before = connection.execute(
+            "SELECT id, session_id, state FROM session_topics ORDER BY id"
+        ).fetchall()
+
+    with pytest.raises(SQLitePostgreSQLImportError, match="exactly one active topic"):
+        importer.import_source(sqlite_source, snapshot_root=tmp_path)
+
+    with sqlite3.connect(sqlite_source) as connection:
+        assert connection.execute(
+            "SELECT id, session_id, state FROM session_topics ORDER BY id"
+        ).fetchall() == before
     with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute("SELECT to_regclass(%s)", (f"{target.schema}.alembic_version",))
         assert cursor.fetchone() == (None,)

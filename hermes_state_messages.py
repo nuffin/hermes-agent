@@ -336,6 +336,14 @@ class SessionMessagesMixin:
         now = time.time()
 
         def _do(conn):
+            # New SQLite histories follow the singleton-active contract.  Do not
+            # rewrite pre-existing divergent rows; the PostgreSQL importer rejects
+            # those histories during its read-only source preflight.
+            conn.execute(
+                """UPDATE session_topics SET state = 'warm', last_active_at = ?
+                   WHERE session_id = ? AND state = 'active'""",
+                (now, session_id),
+            )
             cursor = conn.execute(
                 """INSERT INTO session_topics
                    (session_id, title, summary, state, created_at, last_active_at)

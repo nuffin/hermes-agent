@@ -926,6 +926,25 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         if cursor.fetchone() is None:
             raise ValueError("message topic_id does not belong to session")
 
+    def _assert_active_topic_invariant(self, cursor: Any, session_id: str) -> None:
+        """Reject a malformed nonempty topic set without manufacturing an active row.
+
+        A topicless session is valid history.  For a nonempty catalog v27's
+        partial unique index supplies at-most-one active row; this runtime guard
+        supplies the fail-closed at-least-one half without triggers or repair.
+        """
+        cursor.execute(
+            f"SELECT count(*) AS total_topics, "
+            f"count(*) FILTER (WHERE state='active') AS active_topics "
+            f"FROM {self._schema}.session_topics WHERE session_id=%s",
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        total = row["total_topics"] if isinstance(row, Mapping) else row[0]
+        active = row["active_topics"] if isinstance(row, Mapping) else row[1]
+        if int(total) and int(active) != 1:
+            raise ValueError("session topic invariant requires exactly one active topic when topics exist")
+
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
         return self.append_message_record(session_id, MessageRecord(role=role, content=content))
 
@@ -990,6 +1009,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
             if cursor.fetchone() is None:
                 raise ValueError("cannot create topic for missing session")
+            self._assert_active_topic_invariant(cursor, session_id)
             cursor.execute(
                 f"UPDATE {self._schema}.session_topics SET state='warm', last_active_at=%s "
                 "WHERE session_id=%s AND state='active'",
@@ -1001,10 +1021,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 "VALUES (%s, %s, %s, 'active', %s, %s) RETURNING id",
                 (session_id, title, summary, now, now),
             )
-            return int(cursor.fetchone()[0])
+            topic_id = int(cursor.fetchone()[0])
+            self._assert_active_topic_invariant(cursor, session_id)
+            return topic_id
 
     def get_topics(self, session_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._assert_active_topic_invariant(cursor, session_id)
             cursor.execute(
                 f"SELECT id, title, summary, message_count, state, created_at, last_active_at "
                 f"FROM {self._schema}.session_topics WHERE session_id=%s "
@@ -1015,6 +1038,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
 
     def get_active_topic(self, session_id: str) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._assert_active_topic_invariant(cursor, session_id)
             cursor.execute(
                 f"SELECT id, title, summary, message_count, state, created_at, last_active_at "
                 f"FROM {self._schema}.session_topics WHERE session_id=%s AND state='active' "
@@ -1032,6 +1056,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
             if cursor.fetchone() is None:
                 return False
+            self._assert_active_topic_invariant(cursor, session_id)
             cursor.execute(
                 f"SELECT id FROM {self._schema}.session_topics WHERE id=%s AND session_id=%s FOR UPDATE",
                 (topic_id, session_id),
@@ -1048,6 +1073,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 "WHERE id=%s AND session_id=%s",
                 (now, topic_id, session_id),
             )
+            self._assert_active_topic_invariant(cursor, session_id)
             return True
 
     def update_topic_message_count(self, topic_id: int, count_delta: int = 1) -> None:
@@ -1833,7 +1859,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata"
+            "active, compacted, api_content, display_kind, display_metadata, topic_id"
         )
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             visibility = "(active OR compacted)" if include_compacted else "active"

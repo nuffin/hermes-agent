@@ -334,6 +334,7 @@ class SqliteStateStore:
                 "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
                 "reasoning_details", "codex_reasoning_items", "codex_message_items", "platform_message_id",
                 "observed", "_compressed_summary", "api_content", "display_kind", "display_metadata",
+                "topic_id",
             )
         }
 

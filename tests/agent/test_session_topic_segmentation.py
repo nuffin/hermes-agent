@@ -134,9 +134,9 @@ class TestTopicManager:
 
         topics = db.get_topics(sid)
         assert len(topics) == 2
-        # Most recently active first
-        assert topics[0]["title"] == "docker"
-        assert topics[1]["title"] == "python"
+        states = {topic["title"]: topic["state"] for topic in topics}
+        assert states == {"docker": "active", "python": "warm"}
+        assert sum(topic["state"] == "active" for topic in topics) == 1
 
     def test_set_active_topic(self, db):
         sid = "test-db"
