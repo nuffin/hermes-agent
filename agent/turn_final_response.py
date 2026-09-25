@@ -348,17 +348,23 @@ def finish_text_response(
             final_msg["content"] = final_response
 
     append_message(messages, final_msg)
-    # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
-    # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.
-    try:
-        agent._flush_messages_to_session_db(messages, conversation_history)
-    except Exception:
-        logger.warning(
-            "final text-turn flush failed (session=%s) — reply is "
-            "not yet durable; relying on finalize_turn retry",
-            getattr(agent, "session_id", None) or "none",
-            exc_info=True,
-        )
+    # Enabled topic segmentation owns the final assistant tail as one durable
+    # transition in turn_finalizer: it must classify/retag the tail before the
+    # append-only flush. Persisting here would make a selected-store topic
+    # failure leave an unsegmented assistant row behind.
+    if not getattr(agent, "_topic_segmentation_enabled", False):
+        # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER
+        # keeps _persist_session idempotent). Failure must NOT abort the turn:
+        # finalize retries.
+        try:
+            agent._flush_messages_to_session_db(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "final text-turn flush failed (session=%s) — reply is "
+                "not yet durable; relying on finalize_turn retry",
+                getattr(agent, "session_id", None) or "none",
+                exc_info=True,
+            )
 
     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
     if not agent.quiet_mode:

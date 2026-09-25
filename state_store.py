@@ -871,4 +871,13 @@ def open_state_store(
             "PostgreSQL state store found historic default-profile schema hermes_state_store_slice; "
             "formal reinitialization/cutover is required before hashed tenant bootstrap"
         )
-    return PostgreSQLStateStore(resolved.postgresql, str(dsn), schema=schema)
+    try:
+        return PostgreSQLStateStore(resolved.postgresql, str(dsn), schema=schema)
+    except StateStoreConfigurationError:
+        raise
+    except Exception as exc:
+        # The selected-backend boundary must not expose the secret DSN through
+        # driver errors, and must never fall back to a local SQLite store.
+        raise StateStoreConfigurationError(
+            "PostgreSQL state store could not open the selected backend"
+        ) from exc
