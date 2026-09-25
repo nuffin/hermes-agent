@@ -17,7 +17,7 @@ import re
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from typing import Any, Collection, Optional
+from typing import Any, Collection
 
 from hermes_cli.timefmt import coerce_epoch
 from agent.session_activity import bound_activity_description, normalize_activity_provenance
@@ -66,7 +66,7 @@ _MESSAGE_RECORD_COLUMNS = (
     "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "token_count", "finish_reason",
     "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
     "platform_message_id", "observed", "_compressed_summary", "active", "compacted", "api_content",
-    "display_kind", "display_metadata", "display_identity", "topic_id",
+    "display_kind", "display_metadata", "display_identity",
 )
 _MESSAGE_RECORD_WRITE_COLUMNS = tuple(
     column for column in _MESSAGE_RECORD_COLUMNS if column not in {"active", "compacted", "display_identity"}
@@ -290,7 +290,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             self._transcript_write_guards(cursor, new_session_id)
             cursor.execute(
                 f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id, created_at",
+                f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id, created_at",
                 self._record_params(new_session_id, record),
             )
             row = cursor.fetchone()
@@ -905,7 +905,6 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             self._record_json_text(record.codex_message_items), record.platform_message_id, bool(record.observed),
             bool(record._compressed_summary), record.api_content, record.display_kind,
             self._psycopg.types.json.Jsonb(display_metadata) if display_metadata else None,
-            record.topic_id,
         )
 
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
@@ -929,7 +928,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 reject_active_turn_lease=reject_active_turn_lease)
             cursor.execute(
                 f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id, created_at",
+                f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id, created_at",
                 self._record_params(session_id, record),
             )
             row = cursor.fetchone()
@@ -949,7 +948,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             for record in records:
                 cursor.execute(
                     f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                    f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING created_at",
+                    f"VALUES ({', '.join('%s' for _ in range(21))}) RETURNING created_at",
                     self._record_params(session_id, record),
                 )
                 created_at = cursor.fetchone()[0]
@@ -959,67 +958,6 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     (created_at, session_id),
                 )
         return len(records)
-
-    def create_topic(self, session_id: str, title: str, summary: Optional[str] = None) -> int:
-        now = time.time()
-        with self._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                f"INSERT INTO {self._schema}.session_topics (session_id, title, summary, state, created_at, last_active_at) VALUES (%s, %s, %s, 'active', %s, %s) RETURNING id",
-                (session_id, title, summary, now, now),
-            )
-            return int(cursor.fetchone()[0])
-
-    def get_topics(self, session_id: str) -> list[dict[str, Any]]:
-        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(
-                f"SELECT id, title, summary, message_count, state, created_at, last_active_at FROM {self._schema}.session_topics WHERE session_id = %s ORDER BY last_active_at DESC",
-                (session_id,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
-
-    def get_active_topic(self, session_id: str) -> Optional[dict[str, Any]]:
-        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(
-                f"SELECT id, title, summary, message_count, state, created_at, last_active_at FROM {self._schema}.session_topics WHERE session_id = %s AND state = 'active' ORDER BY last_active_at DESC LIMIT 1",
-                (session_id,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-    def set_active_topic(self, session_id: str, topic_id: int) -> bool:
-        now = time.time()
-        with self._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(f"SELECT id FROM {self._schema}.session_topics WHERE id = %s AND session_id = %s", (topic_id, session_id))
-            if cursor.fetchone() is None:
-                return False
-            cursor.execute(f"UPDATE {self._schema}.session_topics SET state = 'warm', last_active_at = %s WHERE session_id = %s AND state = 'active'", (now, session_id))
-            cursor.execute(f"UPDATE {self._schema}.session_topics SET state = 'active', last_active_at = %s WHERE id = %s AND session_id = %s", (now, topic_id, session_id))
-            return True
-
-    def update_topic_message_count(self, topic_id: int, count_delta: int = 1) -> None:
-        with self._connection() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                f"UPDATE {self._schema}.session_topics SET message_count = message_count + %s, last_active_at = %s WHERE id = %s",
-                (count_delta, time.time(), topic_id),
-            )
-
-    def get_topic_messages(self, session_id: str, topic_id: int, include_inactive: bool = False) -> list[dict[str, Any]]:
-        active_clause = "" if include_inactive else " AND active = true"
-        columns = (
-            "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
-            "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
-            "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata, topic_id"
-        )
-        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            cursor.execute(
-                f"SELECT {columns} FROM {self._schema}.messages WHERE session_id = %s AND topic_id = %s{active_clause} ORDER BY id",
-                (session_id, topic_id),
-            )
-            records = list(cursor.fetchall())
-        for record in records:
-            record["content"] = self._decode_content(record["content"])
-        return records
 
     def branch_session(
         self, *, parent_session_id: str, child_session_id: str, source: str,
@@ -1181,7 +1119,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(f"INSERT INTO {self._schema}.sessions ({', '.join(columns)}) VALUES ({', '.join('%s' for _ in columns)})", values)
             for message in messages:
                 record = MessageRecord(**{name: message[name] for name in record_fields if name in message})
-                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(22))})", self._record_params(child_session_id, record))
+                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(21))})", self._record_params(child_session_id, record))
             if watermark is not None:
                 upper = int(watermark_ceiling) if watermark_ceiling is not None else 9223372036854775807
                 cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_COLUMNS)}) SELECT %s, role, content, created_at, {', '.join(_MESSAGE_RECORD_COLUMNS)} FROM {self._schema}.messages WHERE session_id=%s AND active AND id > %s AND id <= %s ORDER BY id", (child_session_id, parent_session_id, int(watermark), upper))
@@ -1481,7 +1419,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             for record in records:
                 cursor.execute(
                     f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                    f"VALUES ({', '.join('%s' for _ in range(22))})",
+                    f"VALUES ({', '.join('%s' for _ in range(21))})",
                     self._record_params(session_id, record),
                 )
 
@@ -1748,7 +1686,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 if handoff is None:  # guarded above; keeps the transactional path type-safe.
                     raise ValueError("preserve_compaction_handoff requires an active composite carrier")
                 record = MessageRecord(**{name: handoff[name] for name in MessageRecord.__dataclass_fields__ if name in handoff})
-                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id", self._record_params(session_id, record))
+                cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(21))}) RETURNING id", self._record_params(session_id, record))
                 inserted = cursor.fetchone()
                 replacement_id = int(inserted["id"] if isinstance(inserted, Mapping) else inserted[0])
             if replacement_id is None:
@@ -1777,7 +1715,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata, topic_id"
+            "active, compacted, api_content, display_kind, display_metadata"
         )
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             visibility = "(active OR compacted)" if include_compacted else "active"
@@ -1811,7 +1749,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "created_at AS timestamp, token_count, finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, _compressed_summary, "
-            "active, compacted, api_content, display_kind, display_metadata, topic_id"
+            "active, compacted, api_content, display_kind, display_metadata"
         )
         cursor.execute(
             f"SELECT {columns} FROM {self._schema}.messages "
