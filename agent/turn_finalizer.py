@@ -529,58 +529,88 @@ def finalize_turn(
     _rollback_interrupted_preflight_display(agent, interrupted)
 
     _cleanup_errors: List[str] = []
-    # The model has answered (or the loop gave up): a title upgrade held back because it shares a
-    # self-hosted endpoint with the main request (#117296) may go out now.
-    from agent.turn_context import start_deferred_title_upgrade
-    _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
-    # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
-    _guarded_cleanup(
-        "save_trajectory",
-        lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
-        _cleanup_errors, logger,
-    )
-    _guarded_cleanup(
-        "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
-        _cleanup_errors, logger,
-    )
+    topic_segmentation_runtime_failed = False
     # Persist only after the transcript tail is shaped and scaffolding removed. Each
     # sub-step runs in the same order as the original inline block, and the
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
-        nonlocal final_response, failed, completed, _turn_exit_reason
+        nonlocal final_response, failed, completed, _turn_exit_reason, topic_segmentation_runtime_failed
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
         )
-        # Recovery paths (stream-recovered / prior-turn text) reach here with a response no
-        # earlier seam transformed; the normal text turn already did this before its flush and
-        # gets the recorded outcome back. Either way the tail close below writes the text the
-        # user will see, never the raw model text (#44239).
-        if final_response and not interrupted:
-            final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if final_response and not interrupted and not failed:
             from agent.session_topics import process_turn_topic
             try:
                 process_turn_topic(agent, messages, final_response)
             except Exception as exc:
-                from agent.session_topics import TopicSegmentationRuntimeError
+                from agent.session_topics import (
+                    TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+                    TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+                    TopicSegmentationRuntimeError,
+                )
                 if not isinstance(exc, TopicSegmentationRuntimeError):
                     raise
                 failed = True
                 completed = False
-                _turn_exit_reason = "topic_segmentation_runtime_failed"
-                agent._topic_segmentation_runtime_error = str(exc)
-                # The topic transition and the assistant tail are one durable
-                # contract. Do not persist an unsegmented tail after failure.
+                topic_segmentation_runtime_failed = True
+                _turn_exit_reason = TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE
+                # A selected-store topic transition is the publication boundary:
+                # discard the current in-memory turn and return only a stable
+                # failure envelope.  No unsegmented assistant text may reach a
+                # non-PG persistence, observation, memory, review, or hook sink.
+                start = getattr(agent, "_persist_user_message_idx", None)
+                if isinstance(start, int) and 0 <= start < len(messages):
+                    del messages[start:]
+                else:
+                    messages[:] = [
+                        message for message in messages
+                        if not (isinstance(message, dict) and message.get("role") == "assistant")
+                    ]
+                final_response = None
+                agent._topic_segmentation_runtime_error = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
                 return
+        if final_response and not interrupted and not topic_segmentation_runtime_failed:
+            # Topic activation is the publication barrier. Only a successful
+            # transition may expose the assistant text to transform hooks.
+            untransformed_response = final_response
+            final_response, _, _ = apply_llm_output_transform(
+                agent, final_response, turn_id=turn_id, logger=logger,
+            )
+            if final_response != untransformed_response:
+                tail = messages[-1] if messages else None
+                if isinstance(tail, dict) and tail.get("role") == "assistant" and tail.get("content") == untransformed_response:
+                    tail["content"] = final_response
+                    tail["api_content"] = final_response
+                    stamp_message_timestamp(tail)
+                    tail.pop(_DB_PERSISTED_MARKER, None)
+                    agent._db_flush_scan_prefix = None
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+
+    if not topic_segmentation_runtime_failed:
+        # Do not publish post-turn auxiliary artifacts before a selected topic
+        # store has accepted the transition. Successful and disabled-topic turns
+        # keep their ordinary hooks, trajectory, and cleanup behavior.
+        from agent.turn_context import start_deferred_title_upgrade
+        _guarded_cleanup(
+            "start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger,
+        )
+        _guarded_cleanup(
+            "save_trajectory",
+            lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
+            _cleanup_errors, logger,
+        )
+        _guarded_cleanup(
+            "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
+            _cleanup_errors, logger,
+        )
 
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
@@ -590,9 +620,9 @@ def finalize_turn(
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
     # Response transforms apply only to real, uninterrupted responses.
-    if final_response and not interrupted:
+    if not topic_segmentation_runtime_failed and final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
+    if not topic_segmentation_runtime_failed and not interrupted:
         final_response = _explain_abnormal_exit(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
@@ -600,7 +630,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    if not topic_segmentation_runtime_failed and final_response and not interrupted:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -609,15 +639,16 @@ def finalize_turn(
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        _notify_context_engine_turn_complete(
-            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
-            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
-            interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    if not topic_segmentation_runtime_failed:
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            _notify_context_engine_turn_complete(
+                agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
+                turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
+                interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Surrogate chokepoint: RAW SDK text with a lone UTF-16 surrogate crashes downstream
     # consumers (stdout, Telegram ``utf16_len``, JSON); scrub once where it leaves the loop.
@@ -679,7 +710,8 @@ def finalize_turn(
         _cause = getattr(agent, "_last_persistence_error_cause", None)
         result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
     elif failed and str(_turn_exit_reason) == "topic_segmentation_runtime_failed":
-        result["error"] = getattr(agent, "_topic_segmentation_runtime_error", None) or "enabled topic segmentation failed before turn persistence"
+        from agent.session_topics import TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+        result["error"] = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
         result["failure_reason"] = "topic_segmentation_runtime_failed"
     elif _exit_failure is not None:
         if failed:
@@ -709,17 +741,19 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
-    )
+    if not topic_segmentation_runtime_failed:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message, final_response=final_response,
+            interrupted=interrupted, messages=messages,
+        )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
     if (
-        final_response
+        not topic_segmentation_runtime_failed
+        and final_response
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
@@ -732,7 +766,7 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    if not getattr(agent, "_persist_disabled", False):
+    if not topic_segmentation_runtime_failed and not getattr(agent, "_persist_disabled", False):
         _invoke_hook_safely(
             "on_session_end", logger,
             session_id=agent.session_id,

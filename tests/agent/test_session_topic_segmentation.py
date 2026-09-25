@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from agent.session_topics import (
+    TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+    TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
     TOPIC_SESSION_CONFIG_KEY,
+    TopicSegmentationRuntimeError,
     initialize_topic_segmentation,
     match_existing_topic,
     merge_topic_prompt_context,
@@ -17,6 +20,7 @@ from agent.session_topics import (
     prepare_topic_turn,
     process_turn_topic,
     refresh_topic_segmentation,
+    topic_prompt_context,
 )
 from hermes_state import SessionDB
 
@@ -317,3 +321,68 @@ def test_prompt_context_is_user_tail_only(db: SessionDB):
 
     assert merged.startswith("plugin note\n\n[SESSION TOPICS")
     assert "TOPIC: <short-name>" in merged
+
+
+class _TopicFailureDB:
+    def __init__(self, operation: str, marker: str):
+        self.operation = operation
+        self.marker = marker
+
+    def get_session_model_config_value(self, *_args):
+        if self.operation == "read":
+            raise RuntimeError(self.marker)
+        return None
+
+    def get_active_topic(self, *_args):
+        return None
+
+    def ensure_session_topic(self, *_args, **_kwargs):
+        if self.operation == "history":
+            raise RuntimeError(self.marker)
+        return {"id": 1}
+
+    def get_messages_as_conversation(self, *_args, **_kwargs):
+        return []
+
+    def get_topics(self, *_args):
+        if self.operation == "index":
+            raise RuntimeError(self.marker)
+        return []
+
+    def activate_topic_for_messages(self, *_args, **_kwargs):
+        if self.operation == "transition":
+            raise RuntimeError(self.marker)
+        return {"id": 1}
+
+
+@pytest.mark.parametrize("operation", ("read", "history", "index", "transition"))
+def test_topic_runtime_errors_are_exact_and_identifier_free(operation):
+    """Every public topic failure path returns the same identifier-free envelope."""
+    import traceback
+
+    session_id = "real-session-id-must-never-be-public"
+    marker = f"driver-secret-for-{session_id}"
+    agent = _agent(_TopicFailureDB(operation, marker), session_id=session_id)
+
+    with pytest.raises(TopicSegmentationRuntimeError) as raised:
+        if operation == "read":
+            initialize_topic_segmentation(
+                agent, {"session": {"topic_segmentation": {"enabled": True}}}
+            )
+        elif operation == "history":
+            prepare_topic_turn(agent, [{"role": "user", "content": "q"}], 0, "q")
+        elif operation == "index":
+            topic_prompt_context(agent)
+        else:
+            agent._persist_user_message_idx = 0
+            process_turn_topic(
+                agent, [{"role": "user", "content": "q"}, {"role": "assistant", "content": "TOPIC: next"}],
+                "TOPIC: next",
+            )
+
+    exc = raised.value
+    public = "\n".join((str(exc), repr(exc), "".join(traceback.format_exception(exc))))
+    assert exc.code == TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE
+    assert str(exc) == TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+    assert exc.__cause__ is None
+    assert session_id not in public and marker not in public

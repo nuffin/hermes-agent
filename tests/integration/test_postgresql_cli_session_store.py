@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 import json
+import traceback
 from functools import wraps
 from pathlib import Path
 import time
@@ -1246,7 +1247,12 @@ def _offline_text_response(content: str) -> SimpleNamespace:
 
 
 def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_cli_home):
-    """A normal public turn owns the PG lease and persists durable topic transitions."""
+    """Production-owner wiring with deterministic provider seams owns PG topic transitions.
+
+    This intentionally patches the local provider/tool bootstrap seams; it is
+    not mock-free runtime acceptance. The independent staging-wrapper gate is
+    the no-mock execution proof.
+    """
     import agent.conversation_loop as conversation_loop
     from hermes_cli.config import load_config
     from run_agent import AIAgent
@@ -1346,7 +1352,7 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
 
 
 def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(pg_cli_home):
-    """A selected-store transition failure reaches finalization but never writes an unsegmented tail."""
+    """A deterministic provider seam proves the selected-store failure boundary."""
     import agent.conversation_loop as conversation_loop
     from hermes_cli.config import load_config
     from run_agent import AIAgent
@@ -1383,9 +1389,16 @@ def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(
 
         assert len(finalize_calls) == 1
         assert result["completed"] is False and result["failed"] is True
+        from agent.session_topics import TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+
         assert result["failure_reason"] == "topic_segmentation_runtime_failed"
-        assert "topic transition failed" in result["error"]
+        assert result["error"] == TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+        assert result["final_response"] is None
+        assert answer not in repr(result)
         assert answer not in [row["content"] for row in store.get_messages_as_conversation(session_id)]
+        topics = store.get_topics(session_id)
+        assert len(topics) == 1 and topics[0]["state"] == "active"
+        assert topics[0]["title"] != "cooking"
     assert opens == []
     assert not (home / "state.db").exists()
 
@@ -1514,7 +1527,15 @@ def test_fresh_public_profile_config_pg_failures_are_sanitized_and_never_open_sq
             with pytest.raises(StateStoreConfigurationError) as raised:
                 open_cli_session_store(load_config())
         error = str(raised.value)
+        formatted = "".join(traceback.format_exception(raised.value))
+        public_cli_error_payload = {"error": error, "type": type(raised.value).__name__}
         assert secret_marker not in error
+        assert secret_marker not in repr(raised.value)
+        assert secret_marker not in formatted
+        assert secret_marker not in repr(public_cli_error_payload)
+        if mode == "unreachable":
+            assert raised.value.__cause__ is None
+            assert raised.value.__context__ is None
         assert dsn_env in error if mode == "missing" else "could not open the selected backend" in error
         assert opens == []
         assert not (home / "state.db").exists()

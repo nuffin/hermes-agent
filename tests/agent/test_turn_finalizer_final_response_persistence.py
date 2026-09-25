@@ -366,6 +366,117 @@ def test_failed_turn_does_not_recover_stream_buffer_as_final_response(monkeypatc
     assert result["failed"] is True
 
 
+class _TopicTransitionFailureStore:
+    def get_topics(self, _session_id):
+        return []
+
+    def activate_topic_for_messages(self, *_args, **_kwargs):
+        raise RuntimeError("driver fault contains session-private-marker")
+
+
+class _TopicTransitionFailureAgent(FakeAgent):
+    def __init__(self):
+        super().__init__()
+        self._topic_segmentation_enabled = True
+        self._session_db = _TopicTransitionFailureStore()
+        self._persist_user_message_idx = 0
+        self._active_session_turn_lease_holder = None
+        self.trajectory_calls = []
+        self.cleanup_calls = []
+        self.sync_calls = []
+        self.review_calls = []
+        self._skill_nudge_interval = 1
+        self._iters_since_skill = 1
+        self.valid_tool_names = ["skill_manage"]
+
+    def _save_trajectory(self, *args):
+        self.trajectory_calls.append(args)
+
+    def _cleanup_task_resources(self, *args):
+        self.cleanup_calls.append(args)
+
+    def _sync_external_memory_for_turn(self, **kwargs):
+        self.sync_calls.append(kwargs)
+
+    def _spawn_background_review(self, **kwargs):
+        self.review_calls.append(kwargs)
+
+
+def _finalize_topic_transition(agent):
+    return finalize_turn(
+        agent,
+        final_response="private assistant tail\nTOPIC: cooking",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "private current user"},
+            {"role": "assistant", "content": "private assistant tail\\nTOPIC: cooking"},
+        ],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="private current user",
+        original_user_message="private current user",
+        _should_review_memory=True,
+        _turn_exit_reason="text_response(final)",
+    )
+
+
+def test_topic_transition_failure_quarantines_every_post_finalization_sink(monkeypatch):
+    """A failed selected-topic transition publishes only its safe failure envelope."""
+    from agent.session_topics import (
+        TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+        TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+    )
+
+    hooks, observations = [], []
+    monkeypatch.setattr("agent.turn_finalizer._invoke_hook_safely", lambda name, *_a, **kw: hooks.append((name, kw)) or [])
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_a, **kw: observations.append(kw),
+    )
+    agent = _TopicTransitionFailureAgent()
+    result = _finalize_topic_transition(agent)
+
+    assert result["final_response"] is None
+    assert result["completed"] is False and result["failed"] is True
+    assert result["turn_exit_reason"] == TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE
+    assert result["failure_reason"] == TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE
+    assert result["error"] == TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+    assert result["messages"] == []
+    assert agent.persisted_messages is None
+    assert agent.trajectory_calls == [] and agent.cleanup_calls == []
+    assert agent.sync_calls == [] and agent.review_calls == []
+    assert hooks == [] and observations == []
+    public = repr(result)
+    assert "private assistant tail" not in public
+    assert "private current user" not in public
+    assert "session-private-marker" not in public
+
+
+def test_successful_turn_retains_post_finalization_sinks(monkeypatch):
+    """The quarantine is scoped: an ordinary successful turn still reaches every sink."""
+    hooks, observations = [], []
+    monkeypatch.setattr("agent.turn_finalizer._invoke_hook_safely", lambda name, *_a, **kw: hooks.append((name, kw)) or [])
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_a, **kw: observations.append(kw),
+    )
+    agent = _TopicTransitionFailureAgent()
+    agent._topic_segmentation_enabled = False
+    result = _finalize_topic_transition(agent)
+
+    assert result["completed"] is True and result["failed"] is False
+    assert agent.persisted_messages is not None
+    assert agent.trajectory_calls and agent.cleanup_calls
+    assert agent.sync_calls and agent.review_calls
+    assert {name for name, _kwargs in hooks} == {
+        "transform_llm_output", "post_llm_call", "on_session_end",
+    }
+    assert len(observations) == 1
+
+
 def test_stream_recovered_final_response_survives_persist_step_failure(monkeypatch):
     """#95514 + #8049 ordering: the stream-recovered ``final_response`` is bound as soon
     as it is computed, BEFORE the fallible tail-shaping / override / persist calls in the
