@@ -354,7 +354,7 @@ def test_postgresql_fresh_alembic_baseline_is_idempotent_and_catalog_complete(mo
     try:
         store = open_state_store(_config())
         store.close()
-        assert _alembic_revisions(dsn) == ["state_store_v26_sqlite_import"]
+        assert _alembic_revisions(dsn) == ["state_store_v27_session_topics"]
         with _psycopg().connect(dsn) as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_schema = '{_SCHEMA}' AND table_name = 'sessions'")
             columns = {row[0] for row in cursor.fetchall()}
@@ -373,7 +373,7 @@ def test_postgresql_fresh_alembic_baseline_is_idempotent_and_catalog_complete(mo
             ]
         store = open_state_store(_config())
         store.close()
-        assert _alembic_revisions(dsn) == ["state_store_v26_sqlite_import"]
+        assert _alembic_revisions(dsn) == ["state_store_v27_session_topics"]
         _target().execute(f"UPDATE {_SCHEMA}.alembic_version SET version_num='unknown_revision'")
         with pytest.raises(StateStoreConfigurationError, match="exactly one supported revision"):
             open_state_store(_config())
@@ -681,7 +681,7 @@ def test_sqlite_and_postgresql_model_config_lifecycle_parity(monkeypatch, tmp_pa
         postgresql = cast(Any, stores[1])
         with postgresql._connection() as connection, connection.cursor() as cursor:
             cursor.execute(f"SELECT version_num FROM {_SCHEMA}.alembic_version")
-            assert cursor.fetchall() == [("state_store_v26_sqlite_import",)]
+            assert cursor.fetchall() == [("state_store_v27_session_topics",)]
     finally:
         for store in stores:
             store.close()

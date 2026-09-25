@@ -324,6 +324,18 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
     assert restored["verified"] is True and restored["restored_database"] is None
 
 
+def test_pg18_import_rejects_cross_session_topic_before_target_mutation(sandbox, sqlite_source, tmp_path):
+    importer, target, _settings = sandbox
+    with sqlite3.connect(sqlite_source) as connection:
+        connection.execute("UPDATE messages SET session_id='other-session' WHERE id=41")
+
+    with pytest.raises(SQLitePostgreSQLImportError, match="topic_id outside its session"):
+        importer.import_source(sqlite_source, snapshot_root=tmp_path)
+    with target.connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT to_regclass(%s)", (f"{target.schema}.alembic_version",))
+        assert cursor.fetchone() == (None,)
+
+
 def test_pg18_import_interruption_rolls_back_and_resumes_idempotently(
     sandbox, sqlite_source, tmp_path
 ):

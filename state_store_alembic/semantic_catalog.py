@@ -91,7 +91,7 @@ _CORE_FKS = {
 _FKS = {
     **_CORE_FKS,
     ("session_topics", "session_topics_session_id_fkey"): (("session_id",), "sessions", ("id",), "c", "a", "s", True, False, False),
-    ("messages", "messages_topic_id_fkey"): (("topic_id",), "session_topics", ("id",), "n", "a", "s", True, False, False),
+    ("messages", "messages_topic_id_fkey"): (("session_id", "topic_id"), "session_topics", ("session_id", "id"), "n", "a", "s", True, False, False),
 }
 # CHECK name -> canonical pg_get_constraintdef() expression and convalidated state.
 _CORE_CHECKS = {
@@ -132,11 +132,16 @@ _INDEXES = {
     "gateway_session_routes_session_unique": ("gateway_session_routes", "btree", (("tenant_namespace", 0), ("session_id", 0)), True, None),
     "messages_platform_message_id_unique": ("messages", "btree", (("platform_message_id", 0),), True, "platform_message_id is not null"), "messages_session_platform_message_id": ("messages", "btree", (("session_id", 0), ("platform_message_id", 0)), False, "platform_message_id is not null"),
     "session_topics_session_last_active": ("session_topics", "btree", (("session_id", 0), ("last_active_at", 3)), False, None),
+    "session_topics_session_id_id_unique": ("session_topics", "btree", (("session_id", 0), ("id", 0)), True, None),
+    "session_topics_one_active_per_session": ("session_topics", "btree", (("session_id", 0),), True, "state = 'active'"),
     "messages_topic_id": ("messages", "btree", (("session_id", 0), ("topic_id", 0), ("id", 0)), False, None),
 }
 _V26_INDEXES = {
     name: value for name, value in _INDEXES.items()
-    if name not in {"session_topics_session_last_active", "messages_topic_id"}
+    if name not in {
+        "session_topics_session_last_active", "session_topics_session_id_id_unique",
+        "session_topics_one_active_per_session", "messages_topic_id",
+    }
 }
 
 
@@ -259,20 +264,24 @@ def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mappin
     _validate_identity_sequence(cursor, schema, table="messages", sequence="messages_id_seq")
     if "session_topics" in tables:
         _validate_identity_sequence(cursor, schema, table="session_topics", sequence="session_topics_id_seq")
-    cursor.execute("SELECT constraint_table.relname, constraint_row.conname, constraint_row.contype, array_agg(source_column.attname ORDER BY source_key.ordinality), target_table.relname, array_agg(target_column.attname ORDER BY target_key.ordinality), constraint_row.confdeltype, constraint_row.confupdtype, constraint_row.confmatchtype, constraint_row.convalidated, constraint_row.condeferrable, constraint_row.condeferred FROM pg_catalog.pg_constraint constraint_row JOIN pg_catalog.pg_class constraint_table ON constraint_table.oid=constraint_row.conrelid LEFT JOIN pg_catalog.pg_class target_table ON target_table.oid=constraint_row.confrelid LEFT JOIN unnest(constraint_row.conkey) WITH ORDINALITY source_key(attnum, ordinality) ON true LEFT JOIN pg_catalog.pg_attribute source_column ON source_column.attrelid=constraint_row.conrelid AND source_column.attnum=source_key.attnum LEFT JOIN unnest(constraint_row.confkey) WITH ORDINALITY target_key(attnum, ordinality) ON target_key.ordinality=source_key.ordinality LEFT JOIN pg_catalog.pg_attribute target_column ON target_column.attrelid=constraint_row.confrelid AND target_column.attnum=target_key.attnum JOIN pg_catalog.pg_namespace namespace ON namespace.oid=constraint_table.relnamespace WHERE namespace.nspname=%s AND constraint_row.contype IN ('p','u','f') GROUP BY constraint_table.relname, constraint_row.conname, constraint_row.contype, target_table.relname, constraint_row.confdeltype, constraint_row.confupdtype, constraint_row.confmatchtype, constraint_row.convalidated, constraint_row.condeferrable, constraint_row.condeferred", (schema,))
+    cursor.execute("SELECT constraint_table.relname, constraint_row.conname, constraint_row.contype, array_agg(source_column.attname ORDER BY source_key.ordinality), target_table.relname, target_namespace.nspname, array_agg(target_column.attname ORDER BY target_key.ordinality), constraint_row.confdeltype, constraint_row.confupdtype, constraint_row.confmatchtype, constraint_row.convalidated, constraint_row.condeferrable, constraint_row.condeferred FROM pg_catalog.pg_constraint constraint_row JOIN pg_catalog.pg_class constraint_table ON constraint_table.oid=constraint_row.conrelid LEFT JOIN pg_catalog.pg_class target_table ON target_table.oid=constraint_row.confrelid LEFT JOIN pg_catalog.pg_namespace target_namespace ON target_namespace.oid=target_table.relnamespace LEFT JOIN unnest(constraint_row.conkey) WITH ORDINALITY source_key(attnum, ordinality) ON true LEFT JOIN pg_catalog.pg_attribute source_column ON source_column.attrelid=constraint_row.conrelid AND source_column.attnum=source_key.attnum LEFT JOIN unnest(constraint_row.confkey) WITH ORDINALITY target_key(attnum, ordinality) ON target_key.ordinality=source_key.ordinality LEFT JOIN pg_catalog.pg_attribute target_column ON target_column.attrelid=constraint_row.confrelid AND target_column.attnum=target_key.attnum JOIN pg_catalog.pg_namespace namespace ON namespace.oid=constraint_table.relnamespace WHERE namespace.nspname=%s AND constraint_row.contype IN ('p','u','f') GROUP BY constraint_table.relname, constraint_row.conname, constraint_row.contype, target_table.relname, target_namespace.nspname, constraint_row.confdeltype, constraint_row.confupdtype, constraint_row.confmatchtype, constraint_row.convalidated, constraint_row.condeferrable, constraint_row.condeferred", (schema,))
     actual_pks: dict[str, tuple[str, ...]] = {}
-    actual_fks: dict[tuple[str, str], tuple[tuple[str, ...], str, tuple[str, ...], str, str, str, bool, bool, bool]] = {}
-    for table, name, kind, source, target, target_columns, delete, update, match, validated, deferrable, deferred in cursor.fetchall():
+    actual_fks: dict[tuple[str, str], tuple[tuple[str, ...], str, str, tuple[str, ...], str, str, str, bool, bool, bool]] = {}
+    for table, name, kind, source, target, target_schema, target_columns, delete, update, match, validated, deferrable, deferred in cursor.fetchall():
         if kind == "p":
             actual_pks[str(table)] = tuple(source)
         elif kind == "f":
             actual_fks[(str(table), str(name))] = (
-                tuple(source), str(target), tuple(target_columns), str(delete), str(update), str(match),
+                tuple(source), str(target_schema), str(target), tuple(target_columns), str(delete), str(update), str(match),
                 bool(validated), bool(deferrable), bool(deferred),
             )
         else:
             _fail(f"unexpected unique constraint {name}")
-    if actual_pks != pks or actual_fks != fks:
+    expected_fks = {
+        key: (source, schema, target, target_columns, delete, update, match, validated, deferrable, deferred)
+        for key, (source, target, target_columns, delete, update, match, validated, deferrable, deferred) in fks.items()
+    }
+    if actual_pks != pks or actual_fks != expected_fks:
         _fail("primary-key, unique, or foreign-key semantics differ")
     cursor.execute("SELECT constraint_table.relname, constraint_row.conname, pg_get_constraintdef(constraint_row.oid, true), constraint_row.convalidated FROM pg_catalog.pg_constraint constraint_row JOIN pg_catalog.pg_class constraint_table ON constraint_table.oid=constraint_row.conrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid=constraint_table.relnamespace WHERE namespace.nspname=%s AND constraint_row.contype='c'", (schema,))
     actual_checks = {(str(table), str(name)): (str(definition), bool(validated)) for table, name, definition, validated in cursor.fetchall()}

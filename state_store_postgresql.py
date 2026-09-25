@@ -913,6 +913,19 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             record.topic_id,
         )
 
+    def _assert_message_topic_belongs_to_session(self, cursor: Any, session_id: str, topic_id: int | None) -> None:
+        """Reject a cross-session topic reference before any message write."""
+        if topic_id is None:
+            return
+        if isinstance(topic_id, bool) or not isinstance(topic_id, int) or topic_id <= 0:
+            raise ValueError("message topic_id must be a positive integer or null")
+        cursor.execute(
+            f"SELECT 1 FROM {self._schema}.session_topics WHERE id=%s AND session_id=%s FOR KEY SHARE",
+            (topic_id, session_id),
+        )
+        if cursor.fetchone() is None:
+            raise ValueError("message topic_id does not belong to session")
+
     def append_message(self, session_id: str, *, role: str, content: str | None = None) -> int:
         return self.append_message_record(session_id, MessageRecord(role=role, content=content))
 
@@ -928,6 +941,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         ``reject_active_turn_lease`` to refuse while any active lease exists.
         """
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._assert_message_topic_belongs_to_session(cursor, session_id, record.topic_id)
             self._transcript_write_guards(cursor, session_id,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
@@ -952,6 +966,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             return 0
         with self._connection() as connection, connection.cursor() as cursor:
             for record in records:
+                self._assert_message_topic_belongs_to_session(cursor, session_id, record.topic_id)
+            for record in records:
                 cursor.execute(
                     f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
                     f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING created_at",
@@ -969,6 +985,11 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         """Create the sole active topic for a session in one transaction."""
         now = time.time()
         with self._connection() as connection, connection.cursor() as cursor:
+            # The parent-row lock serializes every active-topic transition for
+            # this session before the partial unique index is challenged.
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                raise ValueError("cannot create topic for missing session")
             cursor.execute(
                 f"UPDATE {self._schema}.session_topics SET state='warm', last_active_at=%s "
                 "WHERE session_id=%s AND state='active'",
@@ -1006,6 +1027,11 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
     def set_active_topic(self, session_id: str, topic_id: int) -> bool:
         now = time.time()
         with self._connection() as connection, connection.cursor() as cursor:
+            # Lock the session-wide transition domain, not only the selected
+            # topic, so concurrent switches have a deterministic serial order.
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                return False
             cursor.execute(
                 f"SELECT id FROM {self._schema}.session_topics WHERE id=%s AND session_id=%s FOR UPDATE",
                 (topic_id, session_id),

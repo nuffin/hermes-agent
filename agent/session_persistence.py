@@ -307,6 +307,8 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
         return False
     logger.warning("Adopted live compression tip %s for closed session %s; retrying flush once", tip, old_id)
     agent.session_id, agent._flushed_db_message_ids, agent._last_flushed_db_idx = tip, set(), 0
+    # A continuation is a new topic namespace; never retry with a parent topic.
+    agent._active_topic_id = None
     agent._compression_adoption_failed = False
     return True
 

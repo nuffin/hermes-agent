@@ -6,7 +6,7 @@
 
 The root/default tenant and every named profile get `hermes_state_store_tenant_<32 lowercase SHA-256 hex>` derived from canonical home plus canonical profile name. The profile name is never interpolated into an SQL identifier. `hermes_state_store_slice` is historic fixed-schema state only: it is never accepted as a runtime tenant route, and historic default-profile objects there fail closed pending formal reinitialization/cutover.
 
-Every tenant schema has its own Alembic ledger at the current non-topic head `state_store_v26_sqlite_import`, reached through `state_store_v25_core` → `state_store_v26_sqlite_import`. Tenant-specific advisory locks serialize bootstrap. All table references are schema-qualified. A pool checkout sets the fixed quoted `search_path` for that store before use, including an idle connection returned after a hostile or accidental `SET search_path`. The chain contains no `session_topics` or `messages.topic_id`; topic DDL is reserved for the separate session-topic branch.
+Every tenant schema has its own Alembic ledger at the current topic-owned head `state_store_v27_session_topics`, reached through `state_store_v25_core` → `state_store_v26_sqlite_import` → `state_store_v27_session_topics`. v26 is the non-topic import manifest revision; historic raw numeric v26 remains distinct. Tenant-specific advisory locks serialize bootstrap. All table references are schema-qualified. A pool checkout sets the fixed quoted `search_path` for that store before use, including an idle connection returned after a hostile or accidental `SET search_path`. Only v27 owns `session_topics` and `messages.topic_id` DDL.
 
 ## PG18 evidence
 
