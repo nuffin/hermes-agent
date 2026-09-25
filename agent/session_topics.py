@@ -23,6 +23,10 @@ _TOPIC_WORD_RE = re.compile(r"[a-z0-9]+")
 _MAX_TOPIC_TITLE_CHARS = 64
 
 
+class TopicSegmentationRuntimeError(RuntimeError):
+    """An enabled durable topic operation failed and the turn must not downgrade."""
+
+
 def _configured_default(config: Any) -> bool:
     session = config.get("session", {}) if isinstance(config, dict) else {}
     topics = session.get("topic_segmentation", {}) if isinstance(session, dict) else {}
@@ -49,13 +53,12 @@ def initialize_topic_segmentation(agent: Any, config: Any) -> None:
             if isinstance(override, bool):
                 session_override = override
                 enabled = override
-        except Exception:
-            logger.warning(
-                "Could not restore topic-segmentation state for session=%s; disabling it",
-                session_id,
-                exc_info=True,
-            )
-            enabled = False
+        except Exception as exc:
+            if enabled:
+                raise TopicSegmentationRuntimeError(
+                    f"could not restore enabled topic segmentation for session {session_id!r}"
+                ) from exc
+            logger.warning("Could not restore disabled topic-segmentation state for session=%s", session_id, exc_info=True)
     if session_override is not None and isinstance(
         getattr(agent, "_session_init_model_config", None), dict
     ):
@@ -67,13 +70,10 @@ def initialize_topic_segmentation(agent: Any, config: Any) -> None:
         try:
             active = db.get_active_topic(session_id)
             agent._active_topic_id = active["id"] if active else None
-        except Exception:
-            logger.warning(
-                "Could not restore active topic for session=%s; disabling topic segmentation",
-                session_id,
-                exc_info=True,
-            )
-            agent._topic_segmentation_enabled = False
+        except Exception as exc:
+            raise TopicSegmentationRuntimeError(
+                f"could not restore active topic for enabled session {session_id!r}"
+            ) from exc
     _sync_context_engine_topic(agent)
 
 
@@ -178,17 +178,20 @@ def prepare_topic_turn(
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if db is None or not session_id:
-        agent._topic_segmentation_enabled = False
-        agent._active_topic_id = None
-        return messages, current_turn_user_idx, prior
+        raise TopicSegmentationRuntimeError("enabled topic segmentation has no durable session store")
     if not (0 <= current_turn_user_idx < len(messages)):
         return messages, current_turn_user_idx, prior
 
     user_message = messages[current_turn_user_idx]
     try:
-        active = db.ensure_session_topic(
-            session_id, _initial_topic_title(original_user_message)
-        )
+        holder = getattr(agent, "_active_session_turn_lease_holder", None)
+        if holder is None:
+            # Preserve the SQLite SessionDB contract, which has no holder kwarg.
+            active = db.ensure_session_topic(session_id, _initial_topic_title(original_user_message))
+        else:
+            active = db.ensure_session_topic(
+                session_id, _initial_topic_title(original_user_message), turn_lease_holder=holder,
+            )
         topic_id = int(active["id"])
         history = db.get_messages_as_conversation(
             session_id,
@@ -197,15 +200,10 @@ def prepare_topic_turn(
             include_row_ids=True,
             topic_id=topic_id,
         )
-    except Exception:
-        logger.warning(
-            "Topic history load failed for session=%s; keeping unsegmented history",
-            session_id,
-            exc_info=True,
-        )
-        agent._topic_segmentation_enabled = False
-        agent._active_topic_id = None
-        return messages, current_turn_user_idx, prior
+    except Exception as exc:
+        raise TopicSegmentationRuntimeError(
+            f"topic history load failed for enabled session {session_id!r}"
+        ) from exc
 
     current_row_id = user_message.get("_row_id") if isinstance(user_message, dict) else None
     if isinstance(current_row_id, int):
@@ -225,12 +223,13 @@ def topic_prompt_context(agent: Any) -> str:
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if db is None or not session_id:
-        return ""
+        raise TopicSegmentationRuntimeError("enabled topic segmentation has no durable session store")
     try:
         topics = db.get_topics(session_id)
-    except Exception:
-        logger.warning("Could not build session topic index", exc_info=True)
-        return ""
+    except Exception as exc:
+        raise TopicSegmentationRuntimeError(
+            f"could not build topic index for enabled session {session_id!r}"
+        ) from exc
     lines = ["[SESSION TOPICS — classify this turn; no extra model call]"]
     for topic in topics[:8]:
         marker = " active" if topic.get("state") == "active" else ""
@@ -266,7 +265,7 @@ def process_turn_topic(agent: Any, messages: list[dict[str, Any]], final_respons
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if db is None or not session_id:
-        return
+        raise TopicSegmentationRuntimeError("enabled topic segmentation has no durable session store")
     start = getattr(agent, "_persist_user_message_idx", None)
     if not isinstance(start, int) or not (0 <= start < len(messages)):
         return
@@ -292,13 +291,10 @@ def process_turn_topic(agent: Any, messages: list[dict[str, Any]], final_respons
             turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         )
         topic_id = int(selected["id"])
-    except Exception:
-        logger.warning(
-            "Topic transition failed for session=%s; keeping the prior active topic",
-            session_id,
-            exc_info=True,
-        )
-        return
+    except Exception as exc:
+        raise TopicSegmentationRuntimeError(
+            f"topic transition failed for enabled session {session_id!r}"
+        ) from exc
 
     agent._active_topic_id = topic_id
     _sync_context_engine_topic(agent)

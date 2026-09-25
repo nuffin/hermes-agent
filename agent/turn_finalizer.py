@@ -549,7 +549,7 @@ def finalize_turn(
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, failed, completed, _turn_exit_reason
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -563,7 +563,19 @@ def finalize_turn(
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if final_response and not interrupted and not failed:
             from agent.session_topics import process_turn_topic
-            process_turn_topic(agent, messages, final_response)
+            try:
+                process_turn_topic(agent, messages, final_response)
+            except Exception as exc:
+                from agent.session_topics import TopicSegmentationRuntimeError
+                if not isinstance(exc, TopicSegmentationRuntimeError):
+                    raise
+                failed = True
+                completed = False
+                _turn_exit_reason = "topic_segmentation_runtime_failed"
+                agent._topic_segmentation_runtime_error = str(exc)
+                # The topic transition and the assistant tail are one durable
+                # contract. Do not persist an unsegmented tail after failure.
+                return
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
         agent._persist_session(messages, conversation_history)
@@ -666,6 +678,9 @@ def finalize_turn(
         )
         _cause = getattr(agent, "_last_persistence_error_cause", None)
         result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
+    elif failed and str(_turn_exit_reason) == "topic_segmentation_runtime_failed":
+        result["error"] = getattr(agent, "_topic_segmentation_runtime_error", None) or "enabled topic segmentation failed before turn persistence"
+        result["failure_reason"] = "topic_segmentation_runtime_failed"
     elif _exit_failure is not None:
         if failed:
             result["error"] = final_response or str(_turn_exit_reason)

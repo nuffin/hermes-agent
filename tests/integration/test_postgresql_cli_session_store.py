@@ -1195,3 +1195,24 @@ def test_postgresql_maintenance_archive_prune_markers_and_title_repair_match_sql
         assert not (home / "state.db").exists()
     finally:
         oracle.close()
+
+
+def test_selected_postgresql_facade_fences_batch_append_and_exposes_blocking_turn_lease(pg_cli_home):
+    """The generic admission API reaches PG and stale batch writers cannot append."""
+    from hermes_state_errors import SessionTurnLeaseLostError
+
+    _home, stores = pg_cli_home
+    store = _open(stores)
+    session_id = "pg-facade-fenced-batch"
+    try:
+        store.create_session(session_id, "cli")
+        assert store.acquire_session_turn_lease(session_id, "holder-a", wait_seconds=0.01, poll_interval_seconds=0.01)
+        assert not store.acquire_session_turn_lease(session_id, "holder-b", wait_seconds=0.01, poll_interval_seconds=0.01)
+        assert store.append_messages_batch(session_id, [{"role": "user", "content": "owned"}], turn_lease_holder="holder-a") == 1
+        store.release_session_turn_lease(session_id, "holder-a")
+        assert store.acquire_session_turn_lease(session_id, "holder-b", wait_seconds=0.01, poll_interval_seconds=0.01)
+        with pytest.raises(SessionTurnLeaseLostError):
+            store.append_messages_batch(session_id, [{"role": "assistant", "content": "stale"}], turn_lease_holder="holder-a")
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id)] == ["owned"]
+    finally:
+        store.close()

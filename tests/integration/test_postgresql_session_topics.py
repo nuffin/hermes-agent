@@ -153,6 +153,12 @@ def test_cross_session_topic_append_is_rejected_before_message_mutation(store, p
             (second_session, foreign_topic),
         )
     assert store.get_messages_as_conversation(second_session) == []
+    # Read filtering must reject foreign IDs rather than misrepresent the
+    # session as having an empty topic transcript.
+    with pytest.raises(ValueError, match="does not belong to session"):
+        store.get_topic_messages(second_session, foreign_topic)
+    with pytest.raises(ValueError, match="does not belong to session"):
+        store.get_messages_as_conversation(second_session, topic_id=foreign_topic)
 
 
 def test_topic_delete_nulls_its_messages_topic_id_without_deleting_messages(store, postgresql_test_target):

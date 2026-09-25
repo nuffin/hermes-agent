@@ -110,12 +110,22 @@ class PostgreSQLCLISessionStore:
         # turn/compression lease. PostgreSQL coordinates those leases separately
         # from append-only rows; accepting the metadata here preserves the public
         # SessionDB call shape without pretending that it is an SQLite mutex.
-        for name in ("compression_lock_holder", "turn_lease_holder", "turn_lease_ttl_seconds", "chunk_rows"):
-            kwargs.pop(name, None)
+        turn_lease_holder = kwargs.pop("turn_lease_holder", None)
+        turn_lease_ttl_seconds = kwargs.pop("turn_lease_ttl_seconds", 300.0)
+        reject_active_turn_lease = bool(kwargs.pop("reject_active_turn_lease", False))
+        # The existing agent batch surface always supplies this compatibility
+        # field. PostgreSQL's transcript guard does not emulate a SQLite mutex.
+        kwargs.pop("compression_lock_holder", None)
+        kwargs.pop("chunk_rows", None)
         if kwargs:
             raise PostgreSQLCLISessionCapabilityError(
                 "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(kwargs)))
-        return self._store.append_message_records(session_id, [self._record(message) for message in messages])
+        return self._store.append_message_records(
+            session_id, [self._record(message) for message in messages],
+            turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            reject_active_turn_lease=reject_active_turn_lease,
+        )
 
     def _topic_capability(self, name: str) -> Any:
         method = getattr(self._store, name, None)
@@ -143,8 +153,8 @@ class PostgreSQLCLISessionStore:
     def get_topic_messages(self, session_id: str, topic_id: int, include_inactive: bool = False) -> list[dict[str, Any]]:
         return self._topic_capability("get_topic_messages")(session_id, topic_id, include_inactive=include_inactive)
 
-    def ensure_session_topic(self, session_id: str, title: str) -> dict[str, Any]:
-        return self._topic_capability("ensure_session_topic")(session_id, title)
+    def ensure_session_topic(self, session_id: str, title: str, *, turn_lease_holder: str | None = None) -> dict[str, Any]:
+        return self._topic_capability("ensure_session_topic")(session_id, title, turn_lease_holder=turn_lease_holder)
 
     def activate_topic_for_messages(
         self, session_id: str, *, topic_id: int | None = None, title: str | None = None,
@@ -268,6 +278,12 @@ class PostgreSQLCLISessionStore:
     def release_compression_lock(self, session_id: str, holder: str): return self._store.release_compression_lock(session_id, holder)
     def get_compression_lock_holder(self, session_id: str): return self._store.get_compression_lock_holder(session_id)
     def try_acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, **kwargs: Any): return self._store.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds, **kwargs)
+    def acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0, on_wait=None, wait_notice_interval_seconds: float = 15.0, should_abort=None):
+        return self._store.acquire_session_turn_lease(
+            session_id, holder, ttl_seconds=ttl_seconds, wait_seconds=wait_seconds,
+            poll_interval_seconds=poll_interval_seconds, on_wait=on_wait,
+            wait_notice_interval_seconds=wait_notice_interval_seconds, should_abort=should_abort,
+        )
     def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0): return self._store.refresh_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds)
     def release_session_turn_lease(self, session_id: str, holder: str): return self._store.release_session_turn_lease(session_id, holder)
     def get_active_message_watermark(self, session_id: str): return self._store.get_active_message_watermark(session_id)

@@ -10,7 +10,11 @@ from state_store import open_state_store
 from tests.integration.postgresql_test_target import TEST_DSN, OwnedPostgreSQLTestTarget
 
 
-_FAMILY = (
+# This is deliberately a bounded migrated-family inventory, not a repository-wide
+# PostgreSQL fixture-safety claim. Raw-DDL protocol harnesses such as
+# test_postgresql_state_store_core_alembic.py and postgresql_rotation_protocol.py
+# are outside this inventory and must not be treated as covered by its sentinel.
+_MIGRATED_OWNED_TARGET_FAMILY = (
     "test_postgresql_state_store_slice.py",
     "test_postgresql_session_runtime_ownership.py",
     "test_postgresql_delivery_ledger.py",
@@ -101,11 +105,11 @@ def _store_internal_line_numbers(source: str, tree: ast.AST) -> set[int]:
     return covered
 
 
-def test_migrated_family_has_no_direct_dangerous_postgresql_execute_calls():
-    """Regression inventory: mutations require OwnedPostgreSQLTestTarget.execute."""
+def test_bounded_migrated_family_has_no_direct_dangerous_postgresql_execute_calls():
+    """Regression inventory for the explicitly bounded migrated fixture family."""
     root = Path(__file__).parent
     violations: list[str] = []
-    for filename in _FAMILY:
+    for filename in _MIGRATED_OWNED_TARGET_FAMILY:
         source = (root / filename).read_text(encoding="utf-8")
         tree = ast.parse(source, filename=filename)
         store_internal = _store_internal_line_numbers(source, tree)

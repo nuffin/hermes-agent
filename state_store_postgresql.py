@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import math
+import logging
 import queue
 import re
 import threading
@@ -28,6 +29,8 @@ from state_store import MessageRecord, PostgreSQLStateStoreConfig, StateStoreCon
 from state_store_postgresql_search import compile_postgresql_search_expression
 from state_store_alembic.migration_helpers import TrustedTenantSchema, require_trusted_tenant_schema
 from token_usage_transport import TokenUsageTransport
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA_PATTERN = re.compile(r"^hermes_state_store_tenant_[0-9a-f]{32}$")
 _SESSION_METADATA_SCHEMA_VERSION = 2
@@ -962,11 +965,14 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         ``reject_active_turn_lease`` to refuse while any active lease exists.
         """
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            self._assert_message_topic_belongs_to_session(cursor, session_id, record.topic_id)
+            # Every transcript/topic mutation locks the session transition domain
+            # first. Topic locks follow it, never precede it.
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
             self._transcript_write_guards(cursor, session_id,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
                 reject_active_turn_lease=reject_active_turn_lease)
+            self._assert_message_topic_belongs_to_session(cursor, session_id, record.topic_id)
             cursor.execute(
                 f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
                 f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id, created_at",
@@ -983,10 +989,21 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             self._refresh_topic_message_counts(cursor, session_id)
             return int(message_id)
 
-    def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int:
+    def append_message_records(self, session_id: str, records: list[MessageRecord], *,
+                               turn_lease_holder: str | None = None,
+                               turn_lease_ttl_seconds: float = 300.0,
+                               reject_active_turn_lease: bool = False) -> int:
         if not records:
             return 0
         with self._connection() as connection, connection.cursor() as cursor:
+            # Batch append is the normal turn persistence path. Serialize on the
+            # session before coordination or topic rows, then validate its fence.
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            self._transcript_write_guards(
+                cursor, session_id, turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                reject_active_turn_lease=reject_active_turn_lease,
+            )
             for record in records:
                 self._assert_message_topic_belongs_to_session(cursor, session_id, record.topic_id)
             for record in records:
@@ -1062,7 +1079,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             row = cursor.fetchone()
             return None if row is None else dict(row)
 
-    def ensure_session_topic(self, session_id: str, title: str) -> dict[str, Any]:
+    def ensure_session_topic(self, session_id: str, title: str, *,
+                             turn_lease_holder: str | None = None) -> dict[str, Any]:
         """Return/create the active topic and atomically adopt topicless history."""
         clean_title = " ".join(str(title or "session").strip().split())[:64] or "session"
         now = time.time()
@@ -1070,6 +1088,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
             if cursor.fetchone() is None:
                 raise ValueError("cannot ensure topic for missing session")
+            self._transcript_write_guards(cursor, session_id, turn_lease_holder=turn_lease_holder)
             self._assert_active_topic_invariant(cursor, session_id)
             cursor.execute(
                 f"SELECT id, title, summary, message_count, state, created_at, last_active_at "
@@ -1117,10 +1136,11 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             raise ValueError("topic_id must be a positive integer")
         now = time.time()
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
-            self._transcript_write_guards(cursor, session_id, turn_lease_holder=turn_lease_holder)
+            # Lock the session transition domain before the lease/topic rows.
             cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
             if cursor.fetchone() is None:
                 raise LookupError(f"session {session_id!r} does not exist")
+            self._transcript_write_guards(cursor, session_id, turn_lease_holder=turn_lease_holder)
             self._assert_active_topic_invariant(cursor, session_id)
             if topic_id is not None:
                 cursor.execute(
@@ -1225,6 +1245,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "active, compacted, api_content, display_kind, display_metadata, topic_id"
         )
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._assert_message_topic_belongs_to_session(cursor, session_id, topic_id)
             cursor.execute(
                 f"SELECT {columns} FROM {self._schema}.messages "
                 f"WHERE session_id=%s AND topic_id=%s{active_clause} ORDER BY id",
@@ -1731,6 +1752,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         topic_clause = "" if topic_id is None else " AND topic_id=%s"
         parameters: tuple[Any, ...] = (session_id,) if topic_id is None else (session_id, topic_id)
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            if topic_id is not None:
+                self._assert_message_topic_belongs_to_session(cursor, session_id, topic_id)
             cursor.execute(
                 f"SELECT {columns} FROM {self._schema}.messages WHERE session_id=%s{active_clause}{topic_clause} ORDER BY id",
                 parameters,
@@ -1877,6 +1900,40 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         with self._connection() as connection, connection.cursor() as cursor:
             key = self._compression_turn_lease_key_on_cursor(cursor, session_id)
             return self._try_coordination_lease(cursor, table="session_turn_leases", key_column="conversation_id", key=key, holder=holder, ttl_seconds=ttl_seconds)
+
+    def acquire_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
+                                   wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0,
+                                   on_wait: Any = None, wait_notice_interval_seconds: float = 15.0,
+                                   should_abort: Any = None) -> bool:
+        """Acquire through bounded short PostgreSQL transactions; never wait holding a row lock."""
+        if not session_id or not holder:
+            return False
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        wait_started: float | None = None
+        last_notice_at: float | None = None
+        notice_every = max(0.0, float(wait_notice_interval_seconds))
+        while True:
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        return False
+                except Exception:
+                    logger.debug("session turn lease should_abort callback failed", exc_info=True)
+            if self.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=ttl_seconds):
+                return True
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                return False
+            if wait_started is None:
+                wait_started = now
+            if on_wait is not None and (last_notice_at is None or notice_every == 0.0 or now - last_notice_at >= notice_every):
+                try:
+                    on_wait(max(0.0, now - wait_started))
+                except Exception:
+                    logger.debug("session turn lease on_wait callback failed", exc_info=True)
+                last_notice_at = now
+            time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
     def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0) -> bool:
         if not session_id or not holder:
