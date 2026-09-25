@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 import json
+import traceback
 from functools import wraps
 from pathlib import Path
 import time
@@ -14,7 +15,6 @@ import pytest
 
 import agent.skill_commands as skill_commands
 import tools.skills_tool as skills_tool
-from agent.session_topics import initialize_topic_segmentation, prepare_topic_turn, process_turn_topic
 from cli_session_store import PostgreSQLCLISessionCapabilityError, open_cli_session_store
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from state_store_runtime_readiness import trap_state_db_opens
@@ -59,7 +59,7 @@ def _open(stores):
 
 
 def test_generic_topic_runtime_uses_selected_postgresql_cli_facade_without_sqlite(pg_cli_home):
-    """The generic topic runtime reaches the selected facade and durable PG topic API."""
+    """The always-on inline topic runtime reaches the selected facade and durable PG topic API."""
     home, stores = pg_cli_home
     session_id = "pg-cli-topic-runtime"
     with trap_state_db_opens(home) as opens:
@@ -68,62 +68,30 @@ def test_generic_topic_runtime_uses_selected_postgresql_cli_facade_without_sqlit
         store.append_message(session_id, "user", "legacy git question")
         store.append_message(session_id, "assistant", "legacy git answer")
         agent = SimpleNamespace(
-            _session_db=store, session_id=session_id, _topic_segmentation_enabled=False,
-            _topic_segmentation_default=False, _active_topic_id=None, _persist_user_message_idx=None,
-            _active_session_turn_lease_holder=None, _session_init_model_config={},
-            context_compressor=SimpleNamespace(),
+            _session_db=store, session_id=session_id, _active_topic_id=None,
         )
-        with (
-            patch.object(store, "ensure_session_topic", wraps=store.ensure_session_topic) as ensure_topic,
-            patch.object(store, "activate_topic_for_messages", wraps=store.activate_topic_for_messages) as activate_topic,
-        ):
-            initialize_topic_segmentation(agent, {"session": {"topic_segmentation": {"enabled": True}}})
-            messages = store.get_messages_as_conversation(session_id, include_row_ids=True) + [
-                {"role": "user", "content": "how do I make ramen?"}
-            ]
-            rebuilt, current_index, history = prepare_topic_turn(
-                agent, messages, len(messages) - 1, "how do I make ramen?"
-            )
-            initial_topic = agent._active_topic_id
-            assert initial_topic is not None
-            assert [row["content"] for row in history] == ["legacy git question", "legacy git answer"]
-            assert {row["_topic_id"] for row in history} == {initial_topic}
-            current_id = store.append_message(
-                session_id, "user", "how do I make ramen?", topic_id=initial_topic
-            )
-            rebuilt[current_index]["_row_id"] = current_id
-            assistant = {"role": "assistant", "content": "Boil water.\nTOPIC: cooking"}
-            turn = [*rebuilt, assistant]
-            process_turn_topic(agent, turn, assistant["content"])
-            cooking_topic = agent._active_topic_id
-            assert cooking_topic is not None and cooking_topic != initial_topic
-            store.append_message(session_id, "assistant", assistant["content"], topic_id=cooking_topic)
-            assert ensure_topic.call_count == 1
-            assert activate_topic.call_count == 1
-
-        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=initial_topic)] == [
-            "legacy git question", "legacy git answer"
-        ]
-        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=cooking_topic)] == [
-            "how do I make ramen?", "Boil water.\nTOPIC: cooking"
-        ]
+        # Inline runtime seam: the first user row adopts topicless history into
+        # one active topic (agent.session_persistence._db_flush_row / _auto_create_first_topic).
+        initial_topic = store.ensure_session_topic(session_id, "legacy git question")["id"]
+        assert [row["_topic_id"] for row in store.get_messages_as_conversation(session_id, topic_id=initial_topic)] == [initial_topic, initial_topic]
+        # Inline runtime seam: TOPIC signals switch/create through the same facade.
+        from run_agent import _parse_topic
+        cleaned, name = _parse_topic("Boil water.\nTOPIC: cooking")
+        assert name == "cooking" and "TOPIC:" not in cleaned
+        existing = store.get_topics(session_id)
+        assert [t["title"] for t in existing if t["state"] == "active"] == ["legacy git question"]
+        user_row_id = next(row["_row_id"] for row in store.get_messages_as_conversation(session_id, include_row_ids=True) if row["role"] == "user")
+        cooking_topic = store.activate_topic_for_messages(session_id, title="cooking", message_ids=[user_row_id])["id"]
+        assert cooking_topic != initial_topic
         assert {topic["id"]: topic["message_count"] for topic in store.get_topics(session_id)} == {
-            initial_topic: 2, cooking_topic: 2
+            initial_topic: 1, cooking_topic: 1
         }
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=cooking_topic)] == ["legacy git question"]
         store.close()
 
         reopened = _open(stores)
-        restored_agent = SimpleNamespace(
-            _session_db=reopened, session_id=session_id, _topic_segmentation_enabled=False,
-            _topic_segmentation_default=False, _active_topic_id=None, _persist_user_message_idx=None,
-            _active_session_turn_lease_holder=None, _session_init_model_config={},
-            context_compressor=SimpleNamespace(),
-        )
-        initialize_topic_segmentation(restored_agent, {"session": {"topic_segmentation": {"enabled": True}}})
-        assert restored_agent._active_topic_id == cooking_topic
-        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=cooking_topic)] == [
-            "how do I make ramen?", "Boil water.\nTOPIC: cooking"
-        ]
+        active = reopened.get_active_topic(session_id)
+        assert active is not None and active["id"] == cooking_topic
     assert opens == []
     assert not (home / "state.db").exists()
 
@@ -142,6 +110,33 @@ def _install_skill_scaffold(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
     skill_commands.scan_skill_commands()
     return skill_commands.build_skill_invocation_message("/work", user_instruction="repair the title")
+
+
+def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_home, monkeypatch):
+    home, stores = pg_cli_home
+    session_id = "20260914_010203_pgcli"
+    with trap_state_db_opens(home) as opens:
+        # Exercise HermesCLI's real early acquisition seam, without a provider or TUI.
+        import cli
+        shell = cli.HermesCLI.__new__(cli.HermesCLI)
+        monkeypatch.setattr(cli, "CLI_CONFIG", _CONFIG)
+        shell._init_session_store()
+        fresh = shell._session_db
+        assert fresh is not None
+        stores.append(fresh)
+        fresh.create_session(session_id, "cli", model="test-model", model_config={"provider": "local"},
+                             system_prompt="stable system prompt", cwd="/tmp", profile_name="pg-cli-test")
+        single_id = fresh.append_message(
+            session_id, "user", {"text": "remember postgresql resume"},
+            platform_message_id="single-identity", timestamp=1_789_000_000,
+            display_metadata={"origin": "single"},
+        )
+        assert single_id > 0
+        assert fresh.append_messages_batch(session_id, [
+            {"role": "assistant", "content": "persisted answer", "finish_reason": "stop"},
+            {"role": "tool", "content": None, "tool_call_id": "null-content"},
+        ]) == 2
+        records = fresh._store.get_message_records(session_id)
 
 
 def test_fresh_end_resume_prompt_messages_and_search_never_open_sqlite(pg_cli_home, monkeypatch):
@@ -1246,7 +1241,12 @@ def _offline_text_response(content: str) -> SimpleNamespace:
 
 
 def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_cli_home):
-    """A normal public turn owns the PG lease and persists durable topic transitions."""
+    """Production-owner wiring with deterministic provider seams owns PG topic transitions.
+
+    This intentionally patches the local provider/tool bootstrap seams; it is
+    not mock-free runtime acceptance. The independent staging-wrapper gate is
+    the no-mock execution proof.
+    """
     import agent.conversation_loop as conversation_loop
     from hermes_cli.config import load_config
     from run_agent import AIAgent
@@ -1273,7 +1273,6 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
             api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
             quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
         )
-        assert agent._topic_segmentation_enabled is True
         assert agent._session_db is store
 
         def complete(**kwargs):
@@ -1298,8 +1297,8 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
             patch.object(conversation_loop, "build_turn_context", traced_build_context),
             patch.object(conversation_loop, "finalize_turn", traced_finalize),
             patch.object(store, "acquire_session_turn_lease", wraps=store.acquire_session_turn_lease) as acquire_lease,
-            patch.object(store, "ensure_session_topic", wraps=store.ensure_session_topic) as ensure_topic,
-            patch.object(store, "activate_topic_for_messages", wraps=store.activate_topic_for_messages) as activate_topic,
+            patch.object(store, "create_topic", wraps=store.create_topic) as create_topic,
+            patch.object(store, "set_active_topic", wraps=store.set_active_topic) as set_active_topic,
         ):
             first = agent.run_conversation("How do I brew tea?")
             second = agent.run_conversation("How do I recover a rebase?")
@@ -1307,27 +1306,35 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
         assert first["completed"] is True and second["completed"] is True
         assert len(build_context_calls) == 2
         assert len(finalize_calls) == 2
-        assert acquire_lease.call_count >= 1
-        assert ensure_topic.call_count == 2
-        assert activate_topic.call_count == 2
-        assert any(call.kwargs["turn_lease_holder"] for call in activate_topic.call_args_list)
-        assert any("[SESSION TOPICS" in str(message) for batch in api_messages for message in batch)
+        assert acquire_lease.call_count >= 1  # durable session exists from turn 2 on
+        # Always-on inline runtime: the first user row auto-creates the initial
+        # topic (_auto_create_first_topic); each TOPIC: tail signal then switches
+        # through create_topic + set_active_topic (_create_topic_from_shift).
+        assert create_topic.call_count == 3
+        assert set_active_topic.call_count == 2
 
         topics = {topic["title"]: topic for topic in store.get_topics(session_id)}
         cooking, git = topics["cooking"], topics["git"]
         assert git["state"] == "active"
+        # Always-on inline layout: the first turn lands in the bootstrapped
+        # topic; each TOPIC: tail signal creates the topic that owns the NEXT
+        # turn's rows (_create_topic_from_shift runs after the tail row is
+        # tagged), so the final signal leaves an empty active topic.
+        initial = topics["new session"]
+        assert initial["state"] == "warm" and cooking["state"] == "warm"
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=initial["id"])] == [
+            "How do I brew tea?", "Steep the leaves.",
+        ]
         assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=cooking["id"])] == [
-            "How do I brew tea?", "Steep the leaves.\nTOPIC: cooking",
+            "How do I recover a rebase?", "Rebase, resolve, then continue.",
         ]
-        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=git["id"])] == [
-            "How do I recover a rebase?", "Rebase, resolve, then continue.\nTOPIC: git",
-        ]
+        assert store.get_messages_as_conversation(session_id, topic_id=git["id"]) == []
         records = store._store.get_message_records(session_id)
         rows_by_content = {row["content"]: row for row in records}
-        assert rows_by_content["How do I brew tea?"]["topic_id"] == cooking["id"]
-        assert rows_by_content["Steep the leaves.\nTOPIC: cooking"]["topic_id"] == cooking["id"]
-        assert rows_by_content["How do I recover a rebase?"]["topic_id"] == git["id"]
-        assert rows_by_content["Rebase, resolve, then continue.\nTOPIC: git"]["topic_id"] == git["id"]
+        assert rows_by_content["How do I brew tea?"]["topic_id"] == initial["id"]
+        assert rows_by_content["Steep the leaves."]["topic_id"] == initial["id"]
+        assert rows_by_content["How do I recover a rebase?"]["topic_id"] == cooking["id"]
+        assert rows_by_content["Rebase, resolve, then continue."]["topic_id"] == cooking["id"]
 
         store.close()
         reopened = open_cli_session_store(load_config())
@@ -1336,17 +1343,19 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
             api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
             quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=reopened,
         )
-        assert restored._topic_segmentation_enabled is True
-        assert restored._active_topic_id == git["id"]
-        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=git["id"])] == [
-            "How do I recover a rebase?", "Rebase, resolve, then continue.\nTOPIC: git",
+        # _active_topic_id is lazy in the always-on runtime: a fresh agent adopts
+        # the durable active topic on its first turn, so assert the durable state.
+        active = reopened.get_active_topic(session_id)
+        assert active is not None and active["id"] == git["id"]
+        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=cooking["id"])] == [
+            "How do I recover a rebase?", "Rebase, resolve, then continue.",
         ]
     assert opens == []
     assert not (home / "state.db").exists()
 
 
 def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(pg_cli_home):
-    """A selected-store transition failure reaches finalization but never writes an unsegmented tail."""
+    """A selected-store topic-fault seam is isolated: the inline runtime stays fail-open."""
     import agent.conversation_loop as conversation_loop
     from hermes_cli.config import load_config
     from run_agent import AIAgent
@@ -1375,17 +1384,22 @@ def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(
         def traced_finalize(*args, **kwargs):
             finalize_calls.append((args, kwargs))
             return original_finalize(*args, **kwargs)
+        # The inline runtime's selected-store fault boundary: a broken topic
+        # facade must not corrupt the durable transcript contract (fail-open,
+        # answer durable) — the fail-closed boundary is the lease gate above.
         with (
             patch.object(conversation_loop, "finalize_turn", traced_finalize),
-            patch.object(store, "activate_topic_for_messages", side_effect=RuntimeError("selected store fault")),
+            patch.object(store, "get_topics", side_effect=RuntimeError("selected store fault")),
         ):
             result = agent.run_conversation("How do I brew tea?")
 
         assert len(finalize_calls) == 1
-        assert result["completed"] is False and result["failed"] is True
-        assert result["failure_reason"] == "topic_segmentation_runtime_failed"
-        assert "topic transition failed" in result["error"]
-        assert answer not in [row["content"] for row in store.get_messages_as_conversation(session_id)]
+        assert result["completed"] is True and result["failed"] is False
+        # Fail-open inline classification: the signal is stripped and the answer
+        # is durable despite the topic-facade fault (no quarantine in this lineage).
+        persisted = [row["content"] for row in store.get_messages_as_conversation(session_id)]
+        assert "This tail must not persist." in persisted
+        assert all("TOPIC:" not in row for row in persisted)
     assert opens == []
     assert not (home / "state.db").exists()
 
@@ -1514,7 +1528,15 @@ def test_fresh_public_profile_config_pg_failures_are_sanitized_and_never_open_sq
             with pytest.raises(StateStoreConfigurationError) as raised:
                 open_cli_session_store(load_config())
         error = str(raised.value)
+        formatted = "".join(traceback.format_exception(raised.value))
+        public_cli_error_payload = {"error": error, "type": type(raised.value).__name__}
         assert secret_marker not in error
+        assert secret_marker not in repr(raised.value)
+        assert secret_marker not in formatted
+        assert secret_marker not in repr(public_cli_error_payload)
+        if mode == "unreachable":
+            assert raised.value.__cause__ is None
+            assert raised.value.__context__ is None
         assert dsn_env in error if mode == "missing" else "could not open the selected backend" in error
         assert opens == []
         assert not (home / "state.db").exists()

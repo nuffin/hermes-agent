@@ -875,9 +875,10 @@ def open_state_store(
         return PostgreSQLStateStore(resolved.postgresql, str(dsn), schema=schema)
     except StateStoreConfigurationError:
         raise
-    except Exception as exc:
+    except Exception:
         # The selected-backend boundary must not expose the secret DSN through
         # driver errors, and must never fall back to a local SQLite store.
-        raise StateStoreConfigurationError(
-            "PostgreSQL state store could not open the selected backend"
-        ) from exc
+        # Exit the handler before raising: ``from None`` hides formatted
+        # context but still retains ``__context__`` for programmatic formatters.
+        pass
+    raise StateStoreConfigurationError("PostgreSQL state store could not open the selected backend")
