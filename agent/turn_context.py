@@ -738,11 +738,25 @@ def _emit_reaction(agent: Any, original_user_message: Any) -> None:
 
 
 def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
-    """Create the DB row now (system prompt populated => non-NULL) and BEFORE preflight
-    compression: compaction/rotation INSERTs reference this row under PRAGMA
-    foreign_keys=ON. Idempotent; the user-turn crash persist runs later."""
+    """Create the DB row before topic projection, withholding a selected-topic prompt.
+
+    A new selected-topic row is needed for topic lookup, but its prompt can encode the
+    dynamic capability surface.  Create the structural row with a NULL prompt and let
+    final capability admission publish the deferred snapshot.
+    """
+    def _ensure() -> None:
+        if getattr(agent, "_topic_segmentation_enabled", False) is not True:
+            agent._ensure_db_session()
+            return
+        prompt = getattr(agent, "_cached_system_prompt", None)
+        try:
+            agent._cached_system_prompt = None
+            agent._ensure_db_session()
+        finally:
+            agent._cached_system_prompt = prompt
+
     _persist_under_lock(
-        agent, agent._ensure_db_session,
+        agent, _ensure,
         "Turn-start session row creation failed for session=%s", pending_cli_message,
     )
 
@@ -1094,7 +1108,6 @@ def build_turn_context(
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
     should_review_memory = _tick_memory_nudge(agent)
-    _emit_reaction(agent, original_user_message)
 
     if not agent.quiet_mode:
         agent._safe_print(
@@ -1115,6 +1128,16 @@ def build_turn_context(
         ensure_message_agent_tool(agent)
     except Exception:
         logger.debug("message_agent injection skipped", exc_info=True)
+
+    # MCP refresh and Bot Mode injection have now assembled the complete dynamic
+    # tool surface.  Refuse before row creation, topic projection, compaction,
+    # callbacks, or crash persistence can publish a selected-topic candidate.
+    from agent.session_topics import (
+        TopicPrepublicationCapabilityError,
+        selected_topic_prepublication_capability_failure,
+    )
+    if (_topic_capability_failure := selected_topic_prepublication_capability_failure(agent)) is not None:
+        raise TopicPrepublicationCapabilityError(_topic_capability_failure)
 
     _ensure_session_row(agent, pending_cli_message)
 

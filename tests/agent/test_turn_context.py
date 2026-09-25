@@ -231,6 +231,40 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+def test_selected_topic_late_dynamic_tool_stops_before_session_or_candidate_publication(monkeypatch):
+    """The real prologue rejects MCP/Bot injection before durable setup or hooks."""
+    from agent.session_topics import TopicPrepublicationCapabilityError
+
+    def inject_mcp(agent):
+        agent.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
+        agent.valid_tool_names = {"mcp_late_tool"}
+
+    def inject_bot(agent):
+        agent.tools = [{"type": "function", "function": {"name": "message_agent"}}]
+        agent.valid_tool_names = {"message_agent"}
+
+    for injection in (inject_mcp, inject_bot):
+        agent = _FakeAgent()
+        agent._topic_segmentation_enabled = True
+        agent._session_db = MagicMock()
+        if injection is inject_mcp:
+            monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", injection)
+            monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+        else:
+            monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", lambda _agent: None)
+            monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", inject_bot)
+
+        with pytest.raises(TopicPrepublicationCapabilityError):
+            _build(agent)
+
+        assert agent._ensure_db_prompt_at_call == "<unset>"
+        assert agent._persist_calls == 0
+        assert not [
+            call for call in agent._session_db.method_calls
+            if call[0] in {"create_session", "update_system_prompt", "update_session_tool_names", "append_message"}
+        ]
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous

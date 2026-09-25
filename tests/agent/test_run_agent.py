@@ -113,6 +113,116 @@ def test_selected_topic_post_context_tool_injection_is_refused_before_provider_o
     assert sink.method_calls == []
 
 
+@pytest.mark.parametrize("pin_state", ("missing", "stale_rebuild"))
+@pytest.mark.parametrize("late_tool", ("mcp_late_tool", "message_agent"))
+def test_selected_topic_late_dynamic_tool_refusal_preserves_durable_prompt_and_pin_after_reopen(
+    agent, monkeypatch, tmp_path, pin_state, late_tool,
+):
+    """Prompt restore/rebuild must not pin a late capability before final admission.
+
+    This drives the historical order directly: restore/rebuild the prompt, inject a
+    late MCP/Bot-Mode schema, then let the final selected-topic gate refuse the
+    turn.  The row is read again through a fresh SessionDB handle so an in-memory
+    fake cannot hide a leaked durable write.
+    """
+    import agent.conversation_loop as conversation_loop
+    from hermes_state import SessionDB
+    from tools.mcp_tool_agent import tool_pin_version
+
+    session_id = f"late-tool-{pin_state}-{late_tool}"
+    db_path = tmp_path / "state.db"
+    legacy_prompt = "Model: old-model\nProvider: openrouter\nlegacy prompt bytes"
+    prior_pin = {
+        "version": tool_pin_version(),
+        "tools": _make_tool_defs("prior_legitimate_tool"),
+    }
+
+    with SessionDB(db_path=db_path) as db:
+        db.create_session(session_id, source="test")
+        db.update_system_prompt(session_id, legacy_prompt)
+        if pin_state == "stale_rebuild":
+            db.update_session_tool_names(session_id, prior_pin)
+        before = db.get_session(session_id)
+        before_prompt = before["system_prompt"]
+        before_pin = before["tool_names"]
+
+        agent._topic_segmentation_enabled = True
+        agent._session_db = db
+        agent.session_id = session_id
+        agent._cached_system_prompt = None
+        agent.model = "test-model"  # force the stored prompt down the rebuild path
+        agent.provider = "openrouter"
+        agent.tools = []
+        agent.valid_tool_names = set()
+
+        def restore_then_inject(*_args, **_kwargs):
+            conversation_loop._restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "earlier turn"}]
+            )
+            agent.tools = _make_tool_defs(late_tool)
+            agent.valid_tool_names = {late_tool}
+            return SimpleNamespace(
+                user_message="q", original_user_message="q", conversation_history=[], effective_task_id="task",
+                turn_id="turn", should_review_memory=False, plugin_user_context="", ext_prefetch_cache="",
+                messages=[{"role": "user", "content": "q"}], active_system_prompt=agent._cached_system_prompt,
+                current_turn_user_idx=0, preflight_compression_blocked=False,
+            )
+
+        monkeypatch.setattr(conversation_loop, "build_turn_context", restore_then_inject)
+        result = conversation_loop._run_conversation_turn(agent, "q", conversation_history=[])
+        after = db.get_session(session_id)
+        assert result["pre_admission_failure"] is True
+        assert result["api_calls"] == 0
+        assert after["system_prompt"] == before_prompt
+        assert after["tool_names"] == before_pin
+
+    with SessionDB(db_path=db_path) as reopened:
+        restored = reopened.get_session(session_id)
+    assert restored["system_prompt"] == before_prompt
+    assert restored["tool_names"] == before_pin
+
+
+@pytest.mark.parametrize("late_tool", ("mcp_late_tool", "message_agent"))
+def test_selected_topic_actual_prologue_refuses_late_tool_before_provider_callback_or_persistence(
+    agent, monkeypatch, late_tool,
+):
+    """The live prologue gate sits before every selected-topic publication sink."""
+    import agent.conversation_loop as conversation_loop
+
+    agent._topic_segmentation_enabled = True
+    agent._cached_system_prompt = "SYSTEM"
+    agent.tools = []
+    agent.valid_tool_names = set()
+    sink = MagicMock()
+    callback = MagicMock()
+    agent._session_db = sink
+
+    def inject(*_args, **_kwargs):
+        agent.tools = _make_tool_defs(late_tool)
+        agent.valid_tool_names = {late_tool}
+
+    if late_tool == "mcp_late_tool":
+        monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", inject)
+        monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+    else:
+        monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", lambda _agent: None)
+        monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", inject)
+
+    result = conversation_loop._run_conversation_turn(
+        agent, "q", conversation_history=[], stream_callback=callback,
+    )
+
+    assert result["pre_admission_failure"] is True
+    assert result["api_calls"] == 0
+    agent.client.chat.completions.create.assert_not_called()
+    callback.assert_not_called()
+    assert agent._inflight_turn_id is None
+    assert not [
+        call for call in sink.method_calls
+        if call[0] in {"create_session", "update_system_prompt", "update_session_tool_names", "append_message"}
+    ]
+
+
 def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     """A note-added multimodal API payload stores the original clean content."""
     clean_content = [

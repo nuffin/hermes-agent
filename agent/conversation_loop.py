@@ -33,7 +33,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from agent.turn_context import PreflightCompressionTimedOut, _emit_reaction, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
@@ -681,10 +681,8 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
         return False
 
 
-def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
-    """Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
-    (with ``failure_message``) because the gateway path (fresh AIAgent per turn) reads
-    this row every turn, so a silent failure breaks prefix-cache reuse."""
+def _write_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
+    """Write an already-admitted prompt/tool snapshot to the session row."""
     if not agent._session_db:
         return
     try:
@@ -694,6 +692,64 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
             persist_agent_tool_names(agent)
     except Exception as exc:
         logger.warning(failure_message, agent.session_id, exc)
+
+
+def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
+    """Persist a prompt unless selected-topic admission is still pending.
+
+    A restored/rebuilt prompt embeds the current capability surface and tools[] is a
+    session-level prefix pin.  Dynamic MCP/Bot Mode discovery runs during turn setup,
+    so selected-topic turns keep both writes in memory until the final capability gate
+    has accepted the complete surface.  The rejection path can then return without
+    externally publishing a new prompt or capability snapshot.
+    """
+    if getattr(agent, "_topic_segmentation_enabled", False) is True:
+        agent._selected_topic_deferred_prompt_persistence = True
+        if persist_tools:
+            agent._selected_topic_deferred_tool_pin = True
+        return
+    _write_system_prompt(agent, failure_message, persist_tools=persist_tools)
+
+
+def _admit_selected_topic_prompt_persistence(agent) -> None:
+    """Commit deferred selected-topic prompt/tool writes exactly once after admission."""
+    if getattr(agent, "_topic_segmentation_enabled", False) is not True:
+        return
+    deferred_prompt = bool(getattr(agent, "_selected_topic_deferred_prompt_persistence", False))
+    deferred_tool_pin = bool(getattr(agent, "_selected_topic_deferred_tool_pin", False))
+    if not (deferred_prompt or deferred_tool_pin):
+        return
+    # Clear before the write: a future retry may make a fresh deferred snapshot,
+    # but this accepted surface gets one and only one publication attempt.
+    agent._selected_topic_deferred_prompt_persistence = False
+    agent._selected_topic_deferred_tool_pin = False
+    _write_system_prompt(
+        agent,
+        "Session DB update_system_prompt failed after selected-topic capability admission "
+        "(session=%s): %s. The prompt will rebuild next turn.",
+        persist_tools=deferred_tool_pin,
+    )
+    if getattr(agent, "_selected_topic_deferred_session_start_side_effects", False):
+        agent._selected_topic_deferred_session_start_side_effects = False
+        _run_session_start_side_effects(agent)
+
+
+def _run_session_start_side_effects(agent) -> None:
+    """Run new-session hooks and credit seeding after the turn is admitted."""
+    if not getattr(agent, "_persist_disabled", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start", session_id=agent.session_id, model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
+    try:
+        from agent.credits_tracker import seed_credits_at_session_start
+        seed_credits_at_session_start(agent)
+    except Exception:
+        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
 
 def _restore_pinned_tools(agent, session_row) -> list:
@@ -711,8 +767,12 @@ def _restore_pinned_tools(agent, session_row) -> list:
             restore_agent_tool_prefix(agent, pin)
         elif session_row is not None and not getattr(agent, "_persist_disabled", False):
             # No usable pin (swept row, a session from before pins): pin what this turn sends,
-            # or every later hop re-derives tools[] until the next compaction.
-            persist_agent_tool_names(agent)
+            # or every later hop re-derives tools[] until the next compaction.  A selected-topic
+            # turn must wait for final dynamic-capability admission before it publishes this pin.
+            if getattr(agent, "_topic_segmentation_enabled", False) is True:
+                agent._selected_topic_deferred_tool_pin = True
+            else:
+                persist_agent_tool_names(agent)
     except Exception:
         logger.debug("tool prefix restore skipped", exc_info=True)
     if getattr(agent, "_memory_mode_explicit", False) is True:
@@ -833,24 +893,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
     note_inert_pinned_tools(agent, built_for_this_surface)
 
-    # Persistence-disabled forks share their parent's session ID and are not real sessions.
-    if not getattr(agent, "_persist_disabled", False):
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _invoke_hook(
-                "on_session_start", session_id=agent.session_id, model=agent.model,
-                platform=getattr(agent, "platform", None) or "",
-            )
-        except Exception as exc:
-            logger.warning("on_session_start hook failed: %s", exc)
-
-    # Cold-start credits seed (L3) fallback for the first-turn path; TUI/desktop seed at
-    # session open, so this is idempotent (skips when _credits_state exists). Fail-open.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+    # Selected-topic turns may still be refused by a late dynamic capability, so
+    # hooks/credits wait with the prompt/tool pin until final admission.
+    if getattr(agent, "_topic_segmentation_enabled", False) is True:
+        agent._selected_topic_deferred_session_start_side_effects = True
+    else:
+        _run_session_start_side_effects(agent)
 
     _persist_system_prompt(
         agent,
@@ -1605,7 +1653,14 @@ def _run_conversation_turn(
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
     except Exception as _topic_setup_exc:
-        from agent.session_topics import TopicSegmentationRuntimeError
+        from agent.session_topics import TopicPrepublicationCapabilityError, TopicSegmentationRuntimeError
+        if isinstance(_topic_setup_exc, TopicPrepublicationCapabilityError):
+            # _bind_turn_identity registered the in-flight marker before dynamic
+            # capabilities were assembled; this refused turn never reaches a
+            # persistence funnel to clear it.
+            from agent.agent_runtime_helpers import note_turn_persisted
+            note_turn_persisted(agent)
+            return _topic_pre_admission_result(agent, conversation_history, _topic_setup_exc.failure)
         if not isinstance(_topic_setup_exc, TopicSegmentationRuntimeError):
             raise
         # Topic setup is a fail-closed selected-store boundary.  It happens
@@ -1644,6 +1699,8 @@ def _run_conversation_turn(
     _post_admission_failure = selected_topic_prepublication_capability_failure(agent)
     if _post_admission_failure is not None:
         return _topic_pre_admission_result(agent, conversation_history, _post_admission_failure)
+    _emit_reaction(agent, _ctx.original_user_message)
+    _admit_selected_topic_prompt_persistence(agent)
 
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not

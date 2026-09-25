@@ -39,6 +39,14 @@ class TopicSegmentationRuntimeError(RuntimeError):
         super().__init__(TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE)
 
 
+class TopicPrepublicationCapabilityError(RuntimeError):
+    """Dynamic selected-topic capability refusal before any durable turn setup."""
+
+    def __init__(self, failure: tuple[str, str]) -> None:
+        self.failure = failure
+        super().__init__(failure[1])
+
+
 TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE = "topic_prepublication_capability_unsupported"
 TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE = (
     "This runtime cannot safely publish a selected-topic turn. Use a supported runtime or disable topic segmentation."

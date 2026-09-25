@@ -360,6 +360,34 @@ class TestLegitimateFreshBuild:
         assert agent._cached_system_prompt == "BUILT_PROMPT"
 
 
+def test_selected_topic_no_tool_rebuild_persists_once_after_admission(tmp_path, monkeypatch):
+    """The ordinary text-only selected-topic path persists once, only after its gate."""
+    from hermes_state import SessionDB
+    import agent.conversation_loop as conversation_loop
+
+    with SessionDB(db_path=tmp_path / "state.db") as db:
+        db.create_session("test-session-id", source="tui")
+        db.update_system_prompt("test-session-id", "Model: old-model\nProvider: openrouter")
+        agent = _make_agent(session_db=db, prebuilt_prompt="ADMITTED TOPIC PROMPT")
+        agent._topic_segmentation_enabled = True
+        agent._persist_disabled = False
+        agent.tools = []
+        agent.valid_tool_names = set()
+        monkeypatch.setattr(conversation_loop, "_run_session_start_side_effects", MagicMock())
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        before_admission = db.get_session("test-session-id")
+        assert before_admission["system_prompt"] == "Model: old-model\nProvider: openrouter"
+        assert before_admission["tool_names"] is None
+
+        conversation_loop._admit_selected_topic_prompt_persistence(agent)
+        admitted = db.get_session("test-session-id")
+        assert admitted["system_prompt"] == "ADMITTED TOPIC PROMPT"
+        assert json.loads(admitted["tool_names"])["tools"] == []
+        conversation_loop._admit_selected_topic_prompt_persistence(agent)
+        assert db.get_session("test-session-id") == admitted
+
+
 # ---------------------------------------------------------------------------
 # Silent-failure recovery — these are the new A/B logging paths
 # ---------------------------------------------------------------------------
