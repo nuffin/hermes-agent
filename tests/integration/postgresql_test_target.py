@@ -211,6 +211,38 @@ class OwnedPostgreSQLTestTarget:
             )
             cursor.execute(statement, tuple(parameters or ()))
 
+    def execute_referencing_owned_target(
+        self, statement: str, reference_target: "OwnedPostgreSQLTestTarget",
+    ) -> None:
+        """Permit one audited FK-drift mutation between two marker-owned schemas.
+
+        The peer schema may appear only as the exact ``session_topics`` FK target;
+        all allocation, marker validation, and teardown remain independently owned.
+        """
+        if not isinstance(reference_target, OwnedPostgreSQLTestTarget) or reference_target is self:
+            raise PostgreSQLTestTargetOwnershipError("foreign FK target must be a distinct owned fixture target")
+        if reference_target.dsn != self.dsn:
+            raise PostgreSQLTestTargetOwnershipError("foreign FK target must use the same PostgreSQL DSN")
+        primary = str(self.schema)
+        foreign = str(reference_target.schema)
+        expected = (
+            f"ALTER TABLE {primary}.messages ADD CONSTRAINT messages_topic_id_fkey "
+            f"FOREIGN KEY (session_id, topic_id) REFERENCES {foreign}.session_topics "
+            "(session_id, id) ON DELETE SET NULL (topic_id)"
+        )
+        if " ".join(statement.strip().split()) != expected:
+            raise PostgreSQLTestTargetOwnershipError(
+                "owned foreign references permit only the audited messages topic FK drift mutation"
+            )
+        self.verify()
+        reference_target.verify()
+        with _psycopg().connect(self.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_catalog.set_config('search_path', %s, false)",
+                (f'{primary}, pg_catalog',),
+            )
+            cursor.execute(statement)
+
     def drop(self) -> None:
         """Atomically drop only this exact marker-owned schema pair."""
         self._verify_identity()

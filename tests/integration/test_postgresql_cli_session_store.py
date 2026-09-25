@@ -13,6 +13,7 @@ import pytest
 
 import agent.skill_commands as skill_commands
 import tools.skills_tool as skills_tool
+from agent.session_topics import initialize_topic_segmentation, prepare_topic_turn, process_turn_topic
 from cli_session_store import PostgreSQLCLISessionCapabilityError, open_cli_session_store
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from state_store_runtime_readiness import trap_state_db_opens
@@ -53,6 +54,77 @@ def _open(stores):
     store = open_cli_session_store(_CONFIG)
     stores.append(store)
     return store
+
+
+
+def test_generic_topic_runtime_uses_selected_postgresql_cli_facade_without_sqlite(pg_cli_home):
+    """The generic topic runtime reaches the selected facade and durable PG topic API."""
+    home, stores = pg_cli_home
+    session_id = "pg-cli-topic-runtime"
+    with trap_state_db_opens(home) as opens:
+        store = _open(stores)
+        store.create_session(session_id, "cli")
+        store.append_message(session_id, "user", "legacy git question")
+        store.append_message(session_id, "assistant", "legacy git answer")
+        agent = SimpleNamespace(
+            _session_db=store, session_id=session_id, _topic_segmentation_enabled=False,
+            _topic_segmentation_default=False, _active_topic_id=None, _persist_user_message_idx=None,
+            _active_session_turn_lease_holder=None, _session_init_model_config={},
+            context_compressor=SimpleNamespace(),
+        )
+        with (
+            patch.object(store, "ensure_session_topic", wraps=store.ensure_session_topic) as ensure_topic,
+            patch.object(store, "activate_topic_for_messages", wraps=store.activate_topic_for_messages) as activate_topic,
+        ):
+            initialize_topic_segmentation(agent, {"session": {"topic_segmentation": {"enabled": True}}})
+            messages = store.get_messages_as_conversation(session_id, include_row_ids=True) + [
+                {"role": "user", "content": "how do I make ramen?"}
+            ]
+            rebuilt, current_index, history = prepare_topic_turn(
+                agent, messages, len(messages) - 1, "how do I make ramen?"
+            )
+            initial_topic = agent._active_topic_id
+            assert initial_topic is not None
+            assert [row["content"] for row in history] == ["legacy git question", "legacy git answer"]
+            assert {row["_topic_id"] for row in history} == {initial_topic}
+            current_id = store.append_message(
+                session_id, "user", "how do I make ramen?", topic_id=initial_topic
+            )
+            rebuilt[current_index]["_row_id"] = current_id
+            assistant = {"role": "assistant", "content": "Boil water.\nTOPIC: cooking"}
+            turn = [*rebuilt, assistant]
+            process_turn_topic(agent, turn, assistant["content"])
+            cooking_topic = agent._active_topic_id
+            assert cooking_topic is not None and cooking_topic != initial_topic
+            store.append_message(session_id, "assistant", assistant["content"], topic_id=cooking_topic)
+            assert ensure_topic.call_count == 1
+            assert activate_topic.call_count == 1
+
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=initial_topic)] == [
+            "legacy git question", "legacy git answer"
+        ]
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=cooking_topic)] == [
+            "how do I make ramen?", "Boil water.\nTOPIC: cooking"
+        ]
+        assert {topic["id"]: topic["message_count"] for topic in store.get_topics(session_id)} == {
+            initial_topic: 2, cooking_topic: 2
+        }
+        store.close()
+
+        reopened = _open(stores)
+        restored_agent = SimpleNamespace(
+            _session_db=reopened, session_id=session_id, _topic_segmentation_enabled=False,
+            _topic_segmentation_default=False, _active_topic_id=None, _persist_user_message_idx=None,
+            _active_session_turn_lease_holder=None, _session_init_model_config={},
+            context_compressor=SimpleNamespace(),
+        )
+        initialize_topic_segmentation(restored_agent, {"session": {"topic_segmentation": {"enabled": True}}})
+        assert restored_agent._active_topic_id == cooking_topic
+        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=cooking_topic)] == [
+            "how do I make ramen?", "Boil water.\nTOPIC: cooking"
+        ]
+    assert opens == []
+    assert not (home / "state.db").exists()
 
 
 def _install_skill_scaffold(tmp_path, monkeypatch):
