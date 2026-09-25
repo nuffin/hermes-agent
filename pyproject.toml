@@ -420,7 +420,11 @@ all = [
   "hermes-agent[youtube]",
 ]
 state-store = [
+    # PostgreSQL state storage is opt-in. The Alembic runner lazy-imports these
+    # packages only after a trusted DSN connection and tenant schema are resolved.
     "psycopg[binary]==3.3.3",
+    "SQLAlchemy==2.0.51",
+    "alembic==1.17.2",
 ]
 
 [build-system]
@@ -501,6 +505,7 @@ exclude-newer = "14 days"
 # requirements from build-system.requires ... maturin>=1.9,<2").
 [tool.uv.exclude-newer-package]
 agent-client-protocol = false
+alembic = false
 ai-edge-litert = false
 aiohttp = false
 aiohttp-socks = false
@@ -563,6 +568,7 @@ pathspec = false
 pillow = false
 prompt-toolkit = false
 psutil = false
+psycopg = false
 pvporcupine = false
 pyasn1 = false
 pydantic = false
@@ -588,6 +594,7 @@ slack-bolt = false
 slack-sdk = false
 snowballstemmer = false
 sounddevice = false
+sqlalchemy = false
 starlette = false
 supermemory = false
 tenacity = false
@@ -607,7 +614,7 @@ youtube-transcript-api = false
 # and the drift broke installed wheels. Do not add the list back.
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "hermes_platform", "hermes_platform.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "hermes_platform", "hermes_platform.*", "state_store_alembic", "state_store_alembic.*"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["observability/schemas/*.json", "data/*.json", "local_runtime/*.json"]
