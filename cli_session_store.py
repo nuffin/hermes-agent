@@ -78,6 +78,7 @@ class PostgreSQLCLISessionStore:
         effect_disposition: str | None = None, _compressed_summary: bool = False,
         timestamp: Any = None, api_content: str | None = None,
         display_kind: str | None = None, display_metadata: dict[str, Any] | None = None,
+        topic_id: int | None = None,
         **kwargs: Any,
     ) -> int:
         """Persist the SessionDB-compatible single-message CLI surface.
@@ -101,7 +102,7 @@ class PostgreSQLCLISessionStore:
             effect_disposition=effect_disposition,
             _compressed_summary=_compressed_summary, timestamp=timestamp,
             api_content=api_content, display_kind=display_kind,
-            display_metadata=display_metadata,
+            display_metadata=display_metadata, topic_id=topic_id,
         ))
 
     def append_messages_batch(self, session_id: str, messages: list[Mapping[str, Any]], **kwargs: Any) -> int:

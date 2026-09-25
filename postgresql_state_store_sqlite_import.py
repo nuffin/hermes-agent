@@ -296,6 +296,12 @@ def source_object_mapping_manifest() -> dict[str, Any]:
                 for name in _SUPPORTED_OBJECTS
             ),
             {
+                "source": "session_topics.state",
+                "target": "session_topics.state",
+                "classification": "canonical-supported-with-preflight",
+                "action": "every nonempty source session must have exactly one active topic; reject otherwise",
+            },
+            {
                 "source": "messages_fts*",
                 "target": "messages.search_document",
                 "classification": "derived-rebuildable",
@@ -467,6 +473,26 @@ def _assert_unknown_columns_unpopulated(connection: sqlite3.Connection, table: s
             )
 
 
+def _assert_single_active_topics(connection: sqlite3.Connection) -> None:
+    """Require PostgreSQL-compatible topic state before any target bootstrap.
+
+    SQLite historical data can contain several active topics or only warm topics.
+    Neither can be imported faithfully into the v27 singleton-active contract, so
+    reject the immutable snapshot rather than choosing or warming a topic.
+    """
+    invalid = connection.execute(
+        "SELECT session_id, count(*) AS topics, "
+        "count(*) FILTER (WHERE state='active') AS active_topics "
+        "FROM session_topics GROUP BY session_id "
+        "HAVING count(*) FILTER (WHERE state='active') <> 1 "
+        "ORDER BY session_id LIMIT 1"
+    ).fetchone()
+    if invalid is not None:
+        raise SQLitePostgreSQLImportError(
+            "SQLite import rejects session_topics without exactly one active topic"
+        )
+
+
 def _source_inventory(snapshot: Path) -> tuple[dict[str, int], dict[str, Any]]:
     with sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True) as connection:
         tables = _source_tables(connection)
@@ -514,6 +540,7 @@ def _source_inventory(snapshot: Path) -> tuple[dict[str, int], dict[str, Any]]:
             raise SQLitePostgreSQLImportError(
                 "SQLite import rejects message topic_id outside its session"
             )
+        _assert_single_active_topics(connection)
         counts = {
             table: int(
                 connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
