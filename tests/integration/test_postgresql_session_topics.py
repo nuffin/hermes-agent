@@ -6,7 +6,7 @@ import importlib
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Event
 
 import pytest
 
@@ -144,50 +144,90 @@ def test_topic_delete_nulls_its_messages_topic_id_without_deleting_messages(stor
         assert cursor.fetchall() == [(None, "retained")]
 
 
-def test_concurrent_topic_creators_serialize_to_one_active_topic(postgresql_test_target, store):
-    session_id = f"topics-concurrent-create-{uuid.uuid4()}"
+def test_topicless_session_remains_valid_for_runtime_and_doctor(store, postgresql_test_target):
+    session_id = f"topics-none-{uuid.uuid4()}"
     store.ensure_session(session_id, source="integration")
-    barrier = Barrier(2)
+    assert store.get_topics(session_id) == []
+    operations = PostgreSQLSandboxOperations(
+        PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2),
+        postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+    )
+    assert operations.doctor()["invariants"]["invalid_topic_sessions"] == 0
 
-    def create(title: str) -> int:
+
+def test_warm_only_topics_fail_closed_in_runtime_semantic_validation_and_doctor(store, postgresql_test_target):
+    session_id = f"topics-warm-only-{uuid.uuid4()}"
+    store.ensure_session(session_id, source="integration")
+    store.create_topic(session_id, "only")
+    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute(f"UPDATE {store._schema}.session_topics SET state='warm' WHERE session_id=%s", (session_id,))
+
+    with pytest.raises(ValueError, match="exactly one active topic"):
+        store.get_topics(session_id)
+    operations = PostgreSQLSandboxOperations(
+        PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2),
+        postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+    )
+    with pytest.raises(PostgreSQLSandboxOperationsError, match="Alembic/core catalog is unhealthy"):
+        operations.doctor()
+
+
+def _assert_topic_operation_blocks_on_session_lock(postgresql_test_target, store, session_id, operation):
+    """Hold the real parent lock until the public contender is visibly pending."""
+    started, completed = Event(), Event()
+
+    def contend():
         contender = PostgreSQLStateStore(
             PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=1),
             postgresql_test_target.dsn, schema=postgresql_test_target.schema,
         )
         try:
-            barrier.wait(timeout=15)
-            return contender.create_topic(session_id, title)
+            started.set()
+            return operation(contender)
         finally:
+            completed.set()
             contender.close()
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        created = list(executor.map(create, ("one", "two")))
-    assert len(set(created)) == 2
-    active = [topic for topic in store.get_topics(session_id) if topic["state"] == "active"]
-    assert len(active) == 1
+    with _psycopg().connect(postgresql_test_target.dsn) as holder, holder.cursor() as cursor:
+        cursor.execute(f"SELECT id FROM {store._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+        assert cursor.fetchone() == (session_id,)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(contend)
+            assert started.wait(timeout=2)
+            # The contender has entered the public method but cannot pass its
+            # first SELECT ... FOR UPDATE while this independent transaction owns
+            # the parent session row.
+            assert not completed.wait(timeout=0.3)
+            holder.commit()
+            return future.result(timeout=5)
 
 
-def test_concurrent_topic_switches_serialize_to_one_active_topic(postgresql_test_target, store):
+def test_create_topic_blocks_on_real_session_lock_then_leaves_one_active_topic(postgresql_test_target, store):
+    session_id = f"topics-concurrent-create-{uuid.uuid4()}"
+    store.ensure_session(session_id, source="integration")
+    first = store.create_topic(session_id, "one")
+
+    second = _assert_topic_operation_blocks_on_session_lock(
+        postgresql_test_target, store, session_id, lambda contender: contender.create_topic(session_id, "two"),
+    )
+
+    topics = _topics_by_id(store, session_id)
+    assert set(topics) == {first, second}
+    assert [topic["id"] for topic in topics.values() if topic["state"] == "active"] == [second]
+
+
+def test_switch_topic_blocks_on_real_session_lock_then_leaves_one_active_topic(postgresql_test_target, store):
     session_id = f"topics-concurrent-switch-{uuid.uuid4()}"
     store.ensure_session(session_id, source="integration")
     first, second = store.create_topic(session_id, "one"), store.create_topic(session_id, "two")
-    barrier = Barrier(2)
 
-    def switch(topic_id: int) -> bool:
-        contender = PostgreSQLStateStore(
-            PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=1),
-            postgresql_test_target.dsn, schema=postgresql_test_target.schema,
-        )
-        try:
-            barrier.wait(timeout=15)
-            return contender.set_active_topic(session_id, topic_id)
-        finally:
-            contender.close()
+    assert _assert_topic_operation_blocks_on_session_lock(
+        postgresql_test_target, store, session_id, lambda contender: contender.set_active_topic(session_id, first),
+    ) is True
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        assert list(executor.map(switch, (first, second))) == [True, True]
-    active = [topic for topic in store.get_topics(session_id) if topic["state"] == "active"]
-    assert len(active) == 1 and active[0]["id"] in {first, second}
+    topics = _topics_by_id(store, session_id)
+    assert topics[first]["state"] == "active"
+    assert topics[second]["state"] == "warm"
 
 
 def test_session_topics_cascade_when_session_is_deleted(store, postgresql_test_target):

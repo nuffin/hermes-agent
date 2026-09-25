@@ -230,6 +230,16 @@ def _validate_absent_behavior_objects(cursor: Any, schema: str) -> None:
             _fail(f"unexpected {label}")
 
 
+def _validate_active_topic_rows(cursor: Any, schema: str) -> None:
+    """Require one active row only for sessions that actually have topics."""
+    cursor.execute(
+        f"SELECT session_id FROM \"{schema}\".session_topics GROUP BY session_id "
+        "HAVING count(*) FILTER (WHERE state = 'active') <> 1 LIMIT 1"
+    )
+    if cursor.fetchone() is not None:
+        _fail("session_topics active-topic invariant differs")
+
+
 def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mapping[str, tuple[str, ...]], pks: Mapping[str, tuple[str, ...]], fks: Mapping[tuple[str, str], tuple[Any, ...]], checks: Mapping[tuple[str, str], tuple[str, bool]], indexes: Mapping[str, tuple[Any, ...]]) -> None:
     _validate_version_table(cursor, schema, revision)
     cursor.execute("SELECT relation.relname, relation.relkind FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=%s AND relation.relkind IN ('r','p','v','m','S','f') ORDER BY relation.relname", (schema,))
@@ -307,6 +317,7 @@ def validate_current_catalog_cursor(cursor: Any, schema: str) -> None:
     if not TENANT_SCHEMA_PATTERN.fullmatch(schema):
         _fail("untrusted tenant schema")
     _validate_catalog(cursor, schema, revision=V27_SESSION_TOPICS_REVISION, tables=_CURRENT_TABLES, pks=_PKS, fks=_FKS, checks=_CHECKS, indexes=_INDEXES)
+    _validate_active_topic_rows(cursor, schema)
 
 
 def validate_v26_sqlite_import_catalog_cursor(cursor: Any, schema: str) -> None:

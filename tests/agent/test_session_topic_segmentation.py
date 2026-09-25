@@ -150,6 +150,9 @@ def test_process_retags_only_current_turn_and_next_turn_loads_selected_topic(db:
 
     cooking = db.get_active_topic("session")
     assert cooking and cooking["title"] == "cooking"
+    topic_states = {row["title"]: row["state"] for row in db.get_topics("session")}
+    assert topic_states == {"git": "warm", "cooking": "active"}
+    assert sum(state == "active" for state in topic_states.values()) == 1
     assert agent._active_topic_id == cooking["id"]
     assert messages[len(prefix)]["_topic_id"] == cooking["id"]
     assert [m["content"] for m in db.get_messages_as_conversation(
