@@ -980,6 +980,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 "COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
                 (created_at, session_id),
             )
+            self._refresh_topic_message_counts(cursor, session_id)
             return int(message_id)
 
     def append_message_records(self, session_id: str, records: list[MessageRecord]) -> int:
@@ -1000,7 +1001,18 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     "COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
                     (created_at, session_id),
                 )
+            self._refresh_topic_message_counts(cursor, session_id)
         return len(records)
+
+    def _refresh_topic_message_counts(self, cursor: Any, session_id: str) -> None:
+        """Keep v27's materialized topic counters aligned with active message rows."""
+        cursor.execute(
+            f"UPDATE {self._schema}.session_topics AS topic SET message_count=("
+            f"SELECT COUNT(*) FROM {self._schema}.messages AS message "
+            "WHERE message.session_id=%s AND message.topic_id=topic.id AND message.active"
+            ") WHERE topic.session_id=%s",
+            (session_id, session_id),
+        )
 
     def create_topic(self, session_id: str, title: str, summary: str | None = None) -> int:
         """Create the sole active topic for a session in one transaction."""
@@ -1049,6 +1061,124 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             )
             row = cursor.fetchone()
             return None if row is None else dict(row)
+
+    def ensure_session_topic(self, session_id: str, title: str) -> dict[str, Any]:
+        """Return/create the active topic and atomically adopt topicless history."""
+        clean_title = " ".join(str(title or "session").strip().split())[:64] or "session"
+        now = time.time()
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                raise ValueError("cannot ensure topic for missing session")
+            self._assert_active_topic_invariant(cursor, session_id)
+            cursor.execute(
+                f"SELECT id, title, summary, message_count, state, created_at, last_active_at "
+                f"FROM {self._schema}.session_topics WHERE session_id=%s AND state='active' "
+                "ORDER BY last_active_at DESC, id DESC LIMIT 1 FOR UPDATE",
+                (session_id,),
+            )
+            active = cursor.fetchone()
+            if active is None:
+                cursor.execute(
+                    f"INSERT INTO {self._schema}.session_topics "
+                    "(session_id, title, summary, state, created_at, last_active_at) "
+                    "VALUES (%s, %s, NULL, 'active', %s, %s) "
+                    "RETURNING id, title, summary, message_count, state, created_at, last_active_at",
+                    (session_id, clean_title, now, now),
+                )
+                active = cursor.fetchone()
+            active_id = int(active["id"])
+            cursor.execute(
+                f"UPDATE {self._schema}.messages SET topic_id=%s "
+                "WHERE session_id=%s AND topic_id IS NULL",
+                (active_id, session_id),
+            )
+            self._refresh_topic_message_counts(cursor, session_id)
+            self._assert_active_topic_invariant(cursor, session_id)
+            cursor.execute(
+                f"SELECT id, title, summary, message_count, state, created_at, last_active_at "
+                f"FROM {self._schema}.session_topics WHERE id=%s",
+                (active_id,),
+            )
+            return dict(cursor.fetchone())
+
+    def activate_topic_for_messages(
+        self, session_id: str, *, topic_id: int | None = None, title: str | None = None,
+        summary: str | None = None, message_ids: list[int] | None = None,
+        turn_lease_holder: str | None = None,
+    ) -> dict[str, Any]:
+        """Activate/create one topic and retag exact durable current-turn rows."""
+        clean_title = " ".join(str(title or "").strip().split())[:64]
+        ids = list(dict.fromkeys(
+            row_id for row_id in (message_ids or [])
+            if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0
+        ))
+        if topic_id is not None and (isinstance(topic_id, bool) or not isinstance(topic_id, int) or topic_id <= 0):
+            raise ValueError("topic_id must be a positive integer")
+        now = time.time()
+        with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
+            self._transcript_write_guards(cursor, session_id, turn_lease_holder=turn_lease_holder)
+            cursor.execute(f"SELECT id FROM {self._schema}.sessions WHERE id=%s FOR UPDATE", (session_id,))
+            if cursor.fetchone() is None:
+                raise LookupError(f"session {session_id!r} does not exist")
+            self._assert_active_topic_invariant(cursor, session_id)
+            if topic_id is not None:
+                cursor.execute(
+                    f"SELECT id FROM {self._schema}.session_topics WHERE id=%s AND session_id=%s FOR UPDATE",
+                    (topic_id, session_id),
+                )
+                target = cursor.fetchone()
+                if target is None:
+                    raise LookupError(f"topic {topic_id} does not belong to session {session_id}")
+                target_id = int(target["id"])
+            else:
+                if not clean_title:
+                    raise ValueError("topic title must not be empty")
+                cursor.execute(
+                    f"SELECT id FROM {self._schema}.session_topics WHERE session_id=%s "
+                    "AND lower(title)=lower(%s) ORDER BY last_active_at DESC, id DESC LIMIT 1 FOR UPDATE",
+                    (session_id, clean_title),
+                )
+                target = cursor.fetchone()
+                if target is None:
+                    cursor.execute(
+                        f"INSERT INTO {self._schema}.session_topics "
+                        "(session_id, title, summary, state, created_at, last_active_at) "
+                        "VALUES (%s, %s, %s, 'warm', %s, %s) RETURNING id",
+                        (session_id, clean_title, summary, now, now),
+                    )
+                    target = cursor.fetchone()
+                target_id = int(target["id"])
+            if ids:
+                cursor.execute(
+                    f"SELECT id FROM {self._schema}.messages WHERE session_id=%s AND id=ANY(%s) FOR UPDATE",
+                    (session_id, ids),
+                )
+                if {int(row["id"]) for row in cursor.fetchall()} != set(ids):
+                    raise LookupError("message ids do not all belong to this session")
+            cursor.execute(
+                f"UPDATE {self._schema}.session_topics SET state='warm', last_active_at=%s "
+                "WHERE session_id=%s AND state='active' AND id<>%s",
+                (now, session_id, target_id),
+            )
+            cursor.execute(
+                f"UPDATE {self._schema}.session_topics SET state='active', last_active_at=%s "
+                "WHERE session_id=%s AND id=%s",
+                (now, session_id, target_id),
+            )
+            if ids:
+                cursor.execute(
+                    f"UPDATE {self._schema}.messages SET topic_id=%s WHERE session_id=%s AND id=ANY(%s)",
+                    (target_id, session_id, ids),
+                )
+            self._refresh_topic_message_counts(cursor, session_id)
+            self._assert_active_topic_invariant(cursor, session_id)
+            cursor.execute(
+                f"SELECT id, title, summary, message_count, state, created_at, last_active_at "
+                f"FROM {self._schema}.session_topics WHERE id=%s",
+                (target_id,),
+            )
+            return dict(cursor.fetchone())
 
     def set_active_topic(self, session_id: str, topic_id: int) -> bool:
         now = time.time()
@@ -1576,8 +1706,10 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 )
 
     def get_messages_as_conversation(self, session_id: str, include_inactive: bool = False,
+                                     include_ancestors: bool = False,
                                      repair_alternation: bool = False,
-                                     include_row_ids: bool = False) -> list[dict[str, Any]]:
+                                     include_row_ids: bool = False,
+                                     topic_id: int | None = None) -> list[dict[str, Any]]:
         """Load messages in OpenAI format, mirroring the SQLite oracle projection.
 
         Covers the gateway transcript read path: born-durable persistence marker,
@@ -1596,10 +1728,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "_compressed_summary, created_at AS timestamp, api_content, display_kind, display_metadata, topic_id"
         )
         active_clause = "" if include_inactive else " AND active"
+        topic_clause = "" if topic_id is None else " AND topic_id=%s"
+        parameters: tuple[Any, ...] = (session_id,) if topic_id is None else (session_id, topic_id)
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
             cursor.execute(
-                f"SELECT {columns} FROM {self._schema}.messages WHERE session_id=%s{active_clause} ORDER BY id",
-                (session_id,))
+                f"SELECT {columns} FROM {self._schema}.messages WHERE session_id=%s{active_clause}{topic_clause} ORDER BY id",
+                parameters,
+            )
             rows = list(cursor.fetchall())
         messages: list[dict[str, Any]] = []
         for row in rows:
@@ -1616,9 +1751,12 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                     msg["display_metadata"] = metadata
             msg.update(
                 (column, row[column])
-                for column in ("timestamp", "tool_call_id", "tool_name", "effect_disposition", "topic_id")
+                for column in ("timestamp", "tool_call_id", "tool_name", "effect_disposition")
                 if row[column] is not None
             )
+            if row["topic_id"] is not None:
+                msg["topic_id"] = int(row["topic_id"])
+                msg["_topic_id"] = int(row["topic_id"])
             if row["tool_calls"]:
                 tool_calls = self._record_json(row["tool_calls"])
                 msg["tool_calls"] = tool_calls if isinstance(tool_calls, list) else []
