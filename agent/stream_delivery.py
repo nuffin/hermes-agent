@@ -60,8 +60,11 @@ class StreamDeliveryMixin:
 
         def deliver(tail: str) -> None:
             if tail:
-                self._deliver_to_stream_callbacks(tail)
-                self._record_streamed_assistant_text(tail)
+                if getattr(self, "_defer_final_response_stream_delivery", False):
+                    self._record_streamed_assistant_text(tail)
+                else:
+                    self._deliver_to_stream_callbacks(tail)
+                    self._record_streamed_assistant_text(tail)
 
         # Flush any benign partial-tag tail held by the think scrubber first (#17924): an innocent '<' at
         # the end of the stream that turned out not to be a tag prefix should reach the UI. Then flush the
@@ -328,10 +331,32 @@ class StreamDeliveryMixin:
                 text = text.lstrip("\n")
         if not text:
             return
+        # A plugin registered for ``pre_final_response`` needs the entire candidate
+        # before any user-visible callback can receive it. Keep the regular in-memory
+        # recovery record, but defer callback and plugin stream publication until the
+        # candidate passes the terminal gate. Tool-call commentary is emitted later by
+        # the ordinary durable-before-interim path.
+        if getattr(self, "_defer_final_response_stream_delivery", False):
+            self._record_streamed_assistant_text(text)
+            return
         delivered = self._deliver_to_stream_callbacks(text)
         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
         if delivered:
             self._record_streamed_assistant_text(text)
+
+    def _release_deferred_final_response(self, text: str) -> None:
+        """Deliver an accepted buffered terminal response exactly once after final gating."""
+        if not getattr(self, "_defer_final_response_stream_delivery", False):
+            return
+        self._defer_final_response_stream_delivery = False
+        if not isinstance(text, str) or not text:
+            return
+        self._deliver_to_stream_callbacks(text)
+        self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
+
+    def _discard_deferred_final_response(self) -> None:
+        """Drop a rejected candidate's pending user-visible stream delivery."""
+        self._defer_final_response_stream_delivery = False
 
     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.

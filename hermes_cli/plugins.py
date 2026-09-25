@@ -124,6 +124,10 @@ VALID_HOOKS: Set[str] = {
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
+    # pre_final_response: after built-in stop gates but before terminal text is persisted or
+    # delivered. Return {"action": "continue", "message"} to re-prompt with ephemeral
+    # context, or {"action": "replace", "response"} for a safe terminal correction.
+    "pre_final_response",
     # pre_verify: once per turn when the agent edited code and is about to verify/finish. Return
     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
     # going; anything else finishes. Bounded by agent.max_verify_nudges.
@@ -2157,6 +2161,37 @@ def get_pre_verify_continue_message(
         if action in ("continue", "block") and isinstance(message, str) and message.strip():
             return message.strip()
     return None
+
+
+def get_pre_final_response_directive(
+    *, session_id: str = "", turn_id: str = "", task_id: str = "", platform: str = "",
+    model: str = "", provider: str = "", api_call_count: int = 0, finish_reason: str = "",
+    attempt: int = 0, candidate_response: str = "",
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the first valid terminal-response directive from ``pre_final_response`` hooks.
+
+    A ``continue`` directive supplies a non-empty synthetic user nudge. A ``replace``
+    directive supplies a non-empty safe terminal response. Plugin errors, malformed
+    values, and unsupported actions are ignored so this opt-in seam is fail-open.
+    """
+    hook_results = invoke_hook(
+        "pre_final_response", session_id=session_id, turn_id=turn_id, task_id=task_id,
+        platform=platform, model=model, provider=provider, api_call_count=api_call_count,
+        finish_reason=finish_reason, attempt=attempt, candidate_response=candidate_response,
+    )
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or "").strip().lower()
+        if action == "continue":
+            message = result.get("message")
+            if isinstance(message, str) and message.strip():
+                return "continue", message.strip()
+        elif action == "replace":
+            response = result.get("response")
+            if isinstance(response, str) and response.strip():
+                return "replace", response.strip()
+    return None, None
 
 
 def get_plugin_error_classification(

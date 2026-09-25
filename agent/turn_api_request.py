@@ -101,6 +101,14 @@ def build_api_request(
         _moa_client_consumes_prepared_request, _redecorate_prompt_cache_for_provider,
     )
 
+    # A registered terminal-response guard evaluates the complete candidate after
+    # streaming has ended. Set this before reset so any pending scrubber tail from
+    # a rejected candidate cannot leak while the next request is prepared.
+    try:
+        from hermes_cli.lifecycle import has_hook
+        agent._defer_final_response_stream_delivery = bool(has_hook("pre_final_response"))
+    except Exception:
+        agent._defer_final_response_stream_delivery = False
     agent._reset_stream_delivery_tracking()
     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
     agent._last_api_first_chunk_at = None
