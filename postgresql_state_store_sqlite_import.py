@@ -84,12 +84,15 @@ _SUPPORTED_SOURCE_COLUMNS = {
         "api_call_count", "profile_name", "archived", "pinned", "hidden",
         *_UNSUPPORTED_SESSION_COLUMNS,
     }),
+    "session_topics": frozenset({
+        "id", "session_id", "title", "summary", "state", "message_count", "created_at", "last_active_at",
+    }),
     "messages": frozenset({
         "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
         "effect_disposition", "timestamp", "token_count", "finish_reason", "reasoning",
         "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
         "platform_message_id", "observed", "_compressed_summary", "active", "compacted",
-        "api_content", "display_kind", "display_metadata", *_UNSUPPORTED_MESSAGE_COLUMNS,
+        "api_content", "display_kind", "display_metadata", "topic_id", *_UNSUPPORTED_MESSAGE_COLUMNS,
     }),
     "session_model_usage": frozenset({
         "session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task",

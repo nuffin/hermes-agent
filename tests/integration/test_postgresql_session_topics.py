@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from state_store import MessageRecord, PostgreSQLStateStoreConfig
+from postgresql_state_store_operations import PostgreSQLSandboxOperations, PostgreSQLSandboxOperationsError
 from state_store_postgresql import PostgreSQLStateStore
 
 
@@ -115,3 +116,36 @@ def test_session_topics_cascade_when_session_is_deleted(store, postgresql_test_t
         cursor.execute(f"DELETE FROM {store._schema}.sessions WHERE id = %s", (session_id,))
 
     assert store.get_topics(session_id) == []
+
+
+def test_topic_catalog_has_fks_checks_indexes_and_doctor_rejects_topic_drift(store, postgresql_test_target):
+    """The v27 semantic contract is real catalog evidence, not a revision marker."""
+    schema = store._schema
+    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT conname FROM pg_constraint WHERE conrelid=%s::regclass ORDER BY conname",
+            (f'{schema}.session_topics',),
+        )
+        assert {row[0] for row in cursor.fetchall()} >= {
+            "session_topics_pkey", "session_topics_session_id_fkey", "session_topics_state_check",
+            "session_topics_message_count_check",
+        }
+        cursor.execute(
+            "SELECT conname FROM pg_constraint WHERE conrelid=%s::regclass AND conname='messages_topic_id_fkey'",
+            (f'{schema}.messages',),
+        )
+        assert cursor.fetchone() == ("messages_topic_id_fkey",)
+        cursor.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname=%s AND indexname IN (%s, %s)",
+            (schema, "session_topics_session_last_active", "messages_topic_id"),
+        )
+        assert {row[0] for row in cursor.fetchall()} == {"session_topics_session_last_active", "messages_topic_id"}
+
+    operations = PostgreSQLSandboxOperations(
+        PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2),
+        postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+    )
+    assert operations.doctor()["schema"] == schema
+    postgresql_test_target.execute(f'DROP INDEX "{schema}".messages_topic_id')
+    with pytest.raises(PostgreSQLSandboxOperationsError, match="Alembic/core catalog is unhealthy"):
+        operations.doctor()
