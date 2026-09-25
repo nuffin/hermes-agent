@@ -29,13 +29,26 @@ def upgrade() -> None:
         "message_count bigint NOT NULL DEFAULT 0 CHECK (message_count >= 0), "
         "created_at double precision NOT NULL, last_active_at double precision NOT NULL)"
     )
+    op.execute(f"ALTER TABLE {q('messages')} ADD COLUMN topic_id bigint")
+    # A scalar topic FK would allow a message in one session to point at a
+    # topic from another. The supporting non-partial unique index is the
+    # PostgreSQL FK target; the SET NULL column list keeps messages in place.
     op.execute(
-        f"ALTER TABLE {q('messages')} ADD COLUMN topic_id bigint "
-        f"REFERENCES {q('session_topics')}(id) ON DELETE SET NULL"
+        f"CREATE UNIQUE INDEX session_topics_session_id_id_unique ON {q('session_topics')} "
+        "(session_id, id)"
+    )
+    op.execute(
+        f"ALTER TABLE {q('messages')} ADD CONSTRAINT messages_topic_id_fkey "
+        f"FOREIGN KEY (session_id, topic_id) REFERENCES {q('session_topics')} (session_id, id) "
+        "ON DELETE SET NULL (topic_id)"
     )
     op.execute(
         f"CREATE INDEX session_topics_session_last_active ON {q('session_topics')} "
         "(session_id, last_active_at DESC)"
+    )
+    op.execute(
+        f"CREATE UNIQUE INDEX session_topics_one_active_per_session ON {q('session_topics')} "
+        "(session_id) WHERE state = 'active'"
     )
     op.execute(
         f"CREATE INDEX messages_topic_id ON {q('messages')} (session_id, topic_id, id)"

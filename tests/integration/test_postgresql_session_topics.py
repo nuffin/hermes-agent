@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -106,6 +108,88 @@ def test_get_topic_messages_filters_by_topic_and_decodes_content(store):
     assert store.get_topic_messages(session_id, topic_b) == []
 
 
+def test_cross_session_topic_append_is_rejected_before_message_mutation(store, postgresql_test_target):
+    first_session, second_session = f"topics-first-{uuid.uuid4()}", f"topics-second-{uuid.uuid4()}"
+    store.ensure_session(first_session, source="integration")
+    store.ensure_session(second_session, source="integration")
+    foreign_topic = store.create_topic(first_session, "first")
+
+    with pytest.raises(ValueError, match="topic_id does not belong to session"):
+        store.append_message_records(
+            second_session, [MessageRecord(role="user", content="must not write", topic_id=foreign_topic)]
+        )
+    # The v27 composite FK independently rejects a direct PostgreSQL append.
+    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+        with pytest.raises(_psycopg().errors.ForeignKeyViolation):
+            cursor.execute(
+                f"INSERT INTO {store._schema}.messages (session_id, role, content, created_at, topic_id) "
+                "VALUES (%s, 'user', 'must not write directly', 0, %s)",
+                (second_session, foreign_topic),
+            )
+    assert store.get_messages_as_conversation(second_session) == []
+
+
+def test_topic_delete_nulls_its_messages_topic_id_without_deleting_messages(store, postgresql_test_target):
+    session_id = f"topics-delete-{uuid.uuid4()}"
+    store.ensure_session(session_id, source="integration")
+    topic_id = store.create_topic(session_id, "delete")
+    message_id = store.append_message_records(
+        session_id, [MessageRecord(role="user", content="retained", topic_id=topic_id)]
+    )
+    assert message_id == 1
+
+    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute(f"DELETE FROM {store._schema}.session_topics WHERE id=%s", (topic_id,))
+        cursor.execute(f"SELECT topic_id, content FROM {store._schema}.messages WHERE session_id=%s", (session_id,))
+        assert cursor.fetchall() == [(None, "retained")]
+
+
+def test_concurrent_topic_creators_serialize_to_one_active_topic(postgresql_test_target, store):
+    session_id = f"topics-concurrent-create-{uuid.uuid4()}"
+    store.ensure_session(session_id, source="integration")
+    barrier = Barrier(2)
+
+    def create(title: str) -> int:
+        contender = PostgreSQLStateStore(
+            PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=1),
+            postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+        )
+        try:
+            barrier.wait(timeout=15)
+            return contender.create_topic(session_id, title)
+        finally:
+            contender.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        created = list(executor.map(create, ("one", "two")))
+    assert len(set(created)) == 2
+    active = [topic for topic in store.get_topics(session_id) if topic["state"] == "active"]
+    assert len(active) == 1
+
+
+def test_concurrent_topic_switches_serialize_to_one_active_topic(postgresql_test_target, store):
+    session_id = f"topics-concurrent-switch-{uuid.uuid4()}"
+    store.ensure_session(session_id, source="integration")
+    first, second = store.create_topic(session_id, "one"), store.create_topic(session_id, "two")
+    barrier = Barrier(2)
+
+    def switch(topic_id: int) -> bool:
+        contender = PostgreSQLStateStore(
+            PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=1),
+            postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+        )
+        try:
+            barrier.wait(timeout=15)
+            return contender.set_active_topic(session_id, topic_id)
+        finally:
+            contender.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(switch, (first, second))) == [True, True]
+    active = [topic for topic in store.get_topics(session_id) if topic["state"] == "active"]
+    assert len(active) == 1 and active[0]["id"] in {first, second}
+
+
 def test_session_topics_cascade_when_session_is_deleted(store, postgresql_test_target):
     session_id = f"topics-cascade-{uuid.uuid4()}"
     store.ensure_session(session_id, source="integration")
@@ -131,15 +215,21 @@ def test_topic_catalog_has_fks_checks_indexes_and_doctor_rejects_topic_drift(sto
             "session_topics_message_count_check",
         }
         cursor.execute(
-            "SELECT conname FROM pg_constraint WHERE conrelid=%s::regclass AND conname='messages_topic_id_fkey'",
+            "SELECT pg_get_constraintdef(oid, true) FROM pg_constraint "
+            "WHERE conrelid=%s::regclass AND conname='messages_topic_id_fkey'",
             (f'{schema}.messages',),
         )
-        assert cursor.fetchone() == ("messages_topic_id_fkey",)
-        cursor.execute(
-            "SELECT indexname FROM pg_indexes WHERE schemaname=%s AND indexname IN (%s, %s)",
-            (schema, "session_topics_session_last_active", "messages_topic_id"),
+        assert cursor.fetchone() == (
+            f"FOREIGN KEY (session_id, topic_id) REFERENCES {schema}.session_topics(session_id, id) ON DELETE SET NULL (topic_id)",
         )
-        assert {row[0] for row in cursor.fetchall()} == {"session_topics_session_last_active", "messages_topic_id"}
+        cursor.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname=%s AND indexname IN (%s, %s, %s, %s)",
+            (schema, "session_topics_session_last_active", "session_topics_session_id_id_unique", "session_topics_one_active_per_session", "messages_topic_id"),
+        )
+        assert {row[0] for row in cursor.fetchall()} == {
+            "session_topics_session_last_active", "session_topics_session_id_id_unique",
+            "session_topics_one_active_per_session", "messages_topic_id",
+        }
 
     operations = PostgreSQLSandboxOperations(
         PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2),
@@ -149,3 +239,26 @@ def test_topic_catalog_has_fks_checks_indexes_and_doctor_rejects_topic_drift(sto
     postgresql_test_target.execute(f'DROP INDEX "{schema}".messages_topic_id')
     with pytest.raises(PostgreSQLSandboxOperationsError, match="Alembic/core catalog is unhealthy"):
         operations.doctor()
+
+
+def test_topic_catalog_rejects_same_name_fk_target_outside_tenant_schema(store, postgresql_test_target):
+    foreign_schema = f"topic_fk_foreign_{uuid.uuid4().hex}"
+    schema = store._schema
+    try:
+        with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{foreign_schema}"')
+            cursor.execute(f'CREATE TABLE "{foreign_schema}".session_topics (session_id text NOT NULL, id bigint NOT NULL, UNIQUE (session_id, id))')
+            cursor.execute(f'ALTER TABLE "{schema}".messages DROP CONSTRAINT messages_topic_id_fkey')
+            cursor.execute(
+                f'ALTER TABLE "{schema}".messages ADD CONSTRAINT messages_topic_id_fkey '
+                f'FOREIGN KEY (session_id, topic_id) REFERENCES "{foreign_schema}".session_topics (session_id, id) ON DELETE SET NULL (topic_id)'
+            )
+        operations = PostgreSQLSandboxOperations(
+            PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2),
+            postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+        )
+        with pytest.raises(PostgreSQLSandboxOperationsError, match="Alembic/core catalog is unhealthy"):
+            operations.doctor()
+    finally:
+        with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{foreign_schema}" CASCADE')

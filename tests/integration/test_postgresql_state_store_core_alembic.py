@@ -43,8 +43,8 @@ def _open_owned_store(monkeypatch, target):
     return open_state_store(_config())
 
 
-def _upgrade_target_to_v25(target) -> None:
-    """Create an authentic v25-only catalog without running the child migration."""
+def _upgrade_target_to_revision(target, revision: str) -> None:
+    """Create an authentic historic catalog through Alembic without stamping."""
     from alembic import command
     from alembic.config import Config
     from sqlalchemy import create_engine
@@ -57,7 +57,7 @@ def _upgrade_target_to_v25(target) -> None:
             config.attributes["tenant_schema"] = target.schema
             with resources.as_file(resources.files("state_store_alembic")) as script_location:
                 config.set_main_option("script_location", str(script_location))
-                command.upgrade(config, V25_CORE_REVISION)
+                command.upgrade(config, revision)
     finally:
         engine.dispose()
 
@@ -178,7 +178,7 @@ def test_core_revisions_have_no_session_topic_production_ddl():
 
 
 def test_valid_v25_catalog_upgrades_to_the_current_head(postgresql_test_target):
-    _upgrade_target_to_v25(postgresql_test_target)
+    _upgrade_target_to_revision(postgresql_test_target, V25_CORE_REVISION)
     _assert_version(postgresql_test_target, V25_CORE_REVISION)
     with postgresql_test_target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(
@@ -202,6 +202,26 @@ def test_valid_v25_catalog_upgrades_to_the_current_head(postgresql_test_target):
             (postgresql_test_target.schema,),
         )
         assert cursor.fetchone() == (True,)
+
+
+def test_valid_v26_catalog_upgrades_to_v27_and_reopens_through_the_real_path(postgresql_test_target):
+    """An Alembic-created non-topic v26 tenant upgrades, validates, and reopens at v27."""
+    from state_store_alembic.semantic_catalog import validate_current_catalog, validate_v26_sqlite_import_catalog
+
+    _upgrade_target_to_revision(postgresql_test_target, V26_SQLITE_IMPORT_MANIFEST_REVISION)
+    _assert_version(postgresql_test_target, V26_SQLITE_IMPORT_MANIFEST_REVISION)
+    with postgresql_test_target.connect() as connection:
+        validate_v26_sqlite_import_catalog(connection, postgresql_test_target.schema)
+        result = upgrade_new_tenant_to_v25(connection, postgresql_test_target.schema)
+    assert result.revision == V27_SESSION_TOPICS_REVISION
+    _assert_version(postgresql_test_target, V27_SESSION_TOPICS_REVISION)
+    with postgresql_test_target.connect() as connection:
+        validate_current_catalog(connection, postgresql_test_target.schema)
+    reopened = PostgreSQLStateStore(
+        PostgreSQLStateStoreConfig(dsn_env=_DSN_ENV, connect_timeout_seconds=5, pool_max_size=1),
+        postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+    )
+    reopened.close()
 
 
 def test_legacy_numeric_ledger_fails_closed_before_alembic_bootstrap(monkeypatch, postgresql_test_target):

@@ -12,7 +12,7 @@ python -m postgresql_state_store_sqlite_import \
 
 The standalone importer has no `--schema` option. It refuses the active default `HERMES_HOME/state.db`; the source must be explicitly supplied, and the importer allocates its own newly created marker-owned PostgreSQL tenant schema. `hermes state-store sqlite-import` follows the same allocation rule while resolving the selected profile's PostgreSQL secret through the maintenance boundary. Neither command accepts an operator-selected destination schema, and neither ever imports into the selected runtime tenant or a historic `hermes_state_store_slice` schema.
 
-Each allocated target reaches the current non-topic head `state_store_v26_sqlite_import` through the only supported linear chain: **v25 immutable historic core baseline -> v26 non-topic sqlite import manifest head** (`state_store_v25_core` → `state_store_v26_sqlite_import`). **v26 is NOT historic session-topic v26**: it creates no `session_topics` relation and no `messages.topic_id` column. Session-topic DDL belongs only to the separate session-topic branch.
+Each allocated target reaches the current topic-owned head `state_store_v27_session_topics` through the only supported linear chain: **v25 immutable historic core baseline -> v26 non-topic sqlite import manifest -> v27 topic-owned catalog** (`state_store_v25_core` → `state_store_v26_sqlite_import` → `state_store_v27_session_topics`). v26 remains the distinct non-topic Alembic manifest revision; historic raw numeric v26 is separate. Only v27 creates `session_topics` and `messages.topic_id`.
 
 ## Mapping and fail-closed policy
 
@@ -20,7 +20,7 @@ Each allocated target reaches the current non-topic head `state_store_v26_sqlite
 
 | SQLite object | Classification | Rehearsal action |
 |---|---|---|
-| `system_prompts`, `sessions`, `messages`, `session_model_usage`, `conversation_generations`, `session_runtime_owners`, `session_runtime_turns` | canonical-supported | Import in FK order with explicit JSON, boolean, timestamp, ID, and identity-sequence conversion. Runtime ownership records remain direct-test-only; this does not route runtime ownership. |
+| `system_prompts`, `sessions`, `session_topics`, `messages`, `session_model_usage`, `conversation_generations`, `session_runtime_owners`, `session_runtime_turns` | canonical-supported | Import in FK order with explicit JSON, boolean, timestamp, ID, and identity-sequence conversion. `messages.topic_id` is accepted only when its topic belongs to the same session; runtime ownership records remain direct-test-only; this does not route runtime ownership. |
 | `messages_fts*` | derived-rebuildable | Never import rows. PostgreSQL's generated `search_document` and GIN index are validated/rebuilt through its own catalog. SQLite FTS equivalence is not claimed. |
 | `schema_version`, `state_meta`, `gateway_*`, `compression_locks`, `session_turn_leases`, `async_delegations` | intentionally process-local/non-migrated | Must be empty. Populated rows fail before target import. This includes the SQLite async-delivery state; PostgreSQL delivery ledger is independently owned and not synthesized from it. |
 | Unrepresented `sessions` fields and `messages.display_order/display_identity` | canonical-unimplemented | Must retain their default/null values. Any populated value rejects import rather than truncating it. |
