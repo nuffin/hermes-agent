@@ -967,6 +967,14 @@ def _persist_turn_start(
     """Crash-resilience: persist the inbound user turn once, with final api_content,
     before the first LLM call. Same critical section as CLI close persistence; retries
     the row create if the pre-compression attempt failed transiently."""
+    # A selected-topic turn is not publishable until its complete response has
+    # classified the topic and finalization has accepted the append.  In
+    # particular, do not leave a crash-recoverable user row that a fresh process
+    # could replay after a failed transition.  The normal final flush releases
+    # this buffer only after ``process_turn_topic`` succeeds.
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        agent._topic_turn_publication_allowed = False
+        return
     def _ensure_and_persist() -> None:
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)

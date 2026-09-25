@@ -1404,6 +1404,74 @@ def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(
     assert not (home / "state.db").exists()
 
 
+def test_selected_topic_transition_failure_cannot_replay_after_postgresql_reopen(pg_cli_home):
+    """A facade-faulted inline topic turn stays fail-open: durable, stripped, and replay-safe after a real PG reopen."""
+    from hermes_cli.config import load_config
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    _write_topic_enabled_postgresql_config(home)
+    session_id = "pg-topic-reopen-quarantine"
+    accepted = "Steep the leaves.\nTOPIC: cooking"
+    faulted = "This answer must survive restart.\nTOPIC: secrets"
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        store = open_cli_session_store(load_config())
+        stores.append(store)
+        first = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        first.client = MagicMock()
+        first.client.chat.completions.create.return_value = _offline_text_response(accepted)
+        assert first.run_conversation("How do I brew tea?")["completed"] is True
+
+        # The inline runtime's transition seam is create_topic (TOPIC: tail -> new
+        # topic owning the NEXT turn's rows).  Fault it: this lineage fails OPEN —
+        # the cleaned answer must still publish and never leak the raw signal.
+        failing = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        failing.client = MagicMock()
+        failing.client.chat.completions.create.return_value = _offline_text_response(faulted)
+        with patch.object(store, "create_topic", side_effect=RuntimeError("transition fault")):
+            faulted_turn = failing.run_conversation("Tell me a secret")
+        assert faulted_turn["completed"] is True and faulted_turn["failed"] is False
+
+        store.close()
+        reopened = open_cli_session_store(load_config())
+        stores.append(reopened)
+        before = reopened.get_messages_as_conversation(session_id)
+        assert [row["content"] for row in before] == [
+            "How do I brew tea?", "Steep the leaves.",
+            "Tell me a secret", "This answer must survive restart.",
+        ]
+        assert all("TOPIC:" not in row["content"] for row in before)
+        # The faulted "secrets" transition left no durable topic behind.
+        assert {topic["title"] for topic in reopened.get_topics(session_id)} == {"new session", "cooking"}
+        assert reopened.get_active_topic(session_id)["title"] == "cooking"
+
+        restored = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=reopened,
+        )
+        restored.client = MagicMock()
+        restored.client.chat.completions.create.return_value = _offline_text_response("Fresh answer.\nTOPIC: cooking")
+        assert restored.run_conversation("What water temperature?")["completed"] is True
+        # Whatever history a cold agent assembles, the raw "TOPIC: secrets" signal
+        # never reaches a later request (the system prompt legitimately documents
+        # the convention itself, so only the concrete signal is asserted).
+        request = restored.client.chat.completions.create.call_args.kwargs["messages"]
+        assert "TOPIC: secrets" not in repr(request)
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
 def test_public_topic_turn_rejects_stale_selected_postgresql_lease_before_mutation(pg_cli_home, monkeypatch):
     """The normal public facade rejects a held PG session before provider work or topic writes."""
     from hermes_cli.config import load_config
