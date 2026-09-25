@@ -28,7 +28,12 @@ logger = logging.getLogger("agent.conversation_loop")
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
-    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_nudge", "_pre_final_response_candidate", "_pre_final_response_synthetic",
+)
+_PRE_FINAL_RESPONSE_NUDGE_LIMIT = 3
+_PRE_FINAL_RESPONSE_LIMIT_FALLBACK = (
+    "Execution has not been confirmed: the final-response guard repeatedly requested "
+    "additional action but reached its safety limit. No further execution claim is being made."
 )
 
 
@@ -331,6 +336,61 @@ def finish_text_response(
         final_response = None
         return _verdict("continue")
 
+    # Plugin-controlled execution-evidence gate. Unlike ``pre_verify``, this
+    # runs before candidate persistence and delivery. Its synthetic pair is
+    # explicitly ephemeral so a subsequent tool-call flush cannot make an
+    # unsupported claim durable or visible on session replay.
+    try:
+        from hermes_cli.plugins import get_pre_final_response_directive
+        _pre_final_attempt = int(getattr(agent, "_pre_final_response_nudges", 0) or 0)
+        _pre_final_action, _pre_final_payload = get_pre_final_response_directive(
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            task_id=effective_task_id or "",
+            platform=getattr(agent, "platform", "") or "",
+            model=getattr(agent, "model", "") or "",
+            provider=getattr(agent, "provider", "") or "",
+            api_call_count=int(api_call_count or 0),
+            finish_reason=str(finish_reason or ""),
+            attempt=_pre_final_attempt,
+            candidate_response=final_response or "",
+        )
+    except Exception:
+        _pre_final_action, _pre_final_payload = None, None
+        _pre_final_attempt = 0
+
+    if _pre_final_action == "continue":
+        if _pre_final_attempt < _PRE_FINAL_RESPONSE_NUDGE_LIMIT:
+            agent._pre_final_response_nudges = _pre_final_attempt + 1
+            final_msg["finish_reason"] = "pre_final_response_continue"
+            final_msg["_pre_final_response_candidate"] = True
+            append_message(messages, final_msg)
+            append_message(messages, {
+                "role": "user", "content": _pre_final_payload,
+                "_pre_final_response_synthetic": True,
+            })
+            _discard = getattr(agent, "_discard_deferred_final_response", None)
+            if callable(_discard):
+                _discard()
+            agent._session_messages = messages
+            final_response = None
+            return _verdict("continue")
+        # Never expose the original candidate when a plugin misconfigures its
+        # own attempt budget and keeps requesting continuation indefinitely.
+        final_response = _PRE_FINAL_RESPONSE_LIMIT_FALLBACK
+        if _promoted:
+            final_msg["api_content"] = final_response
+        else:
+            final_msg["content"] = final_response
+    elif _pre_final_action == "replace":
+        final_response = _pre_final_payload
+        if _promoted:
+            final_msg["api_content"] = final_response
+        else:
+            final_msg["content"] = final_response
+    else:
+        agent._pre_final_response_nudges = 0
+
     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
     # assistant row as settled, so a transform after this write would reach the user but never
     # the stored/replayed transcript (#44239). finalize_turn reads the recorded outcome; like
@@ -359,6 +419,10 @@ def finish_text_response(
             getattr(agent, "session_id", None) or "none",
             exc_info=True,
         )
+
+    _release = getattr(agent, "_release_deferred_final_response", None)
+    if callable(_release):
+        _release(final_response)
 
     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
     if not agent.quiet_mode:
