@@ -2,7 +2,8 @@
 
 import pytest
 
-from state_store import StateStoreConfigurationError, resolve_state_store_config
+import state_store
+from state_store import StateStoreConfigurationError, open_state_store, resolve_state_store_config
 
 
 def test_default_configuration_keeps_sqlite_backend_without_postgresql_secret():
@@ -50,6 +51,33 @@ def test_postgresql_without_its_configured_secret_fails_closed():
             {"state_store": {"backend": "postgresql", "postgresql": {"dsn_env": "HERMES_STATE_STORE_POSTGRES_DSN"}}},
             secret_lookup=lambda _name: None,
         )
+
+
+def test_selected_postgresql_driver_failure_has_no_public_exception_chain(monkeypatch):
+    """The selected-PG public boundary does not retain a DSN-bearing driver error."""
+    import traceback
+    from types import SimpleNamespace
+
+    secret_marker = "postgres-driver-secret-marker"
+
+    class ExplodingPostgreSQLStore:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError(f"driver rejected postgresql://user:{secret_marker}@db/private")
+
+    monkeypatch.setattr("state_store_postgresql.PostgreSQLStateStore", ExplodingPostgreSQLStore)
+    monkeypatch.setattr(state_store, "_resolve_postgresql_tenant_schema", lambda: SimpleNamespace(name="safe_schema"))
+    monkeypatch.setattr(state_store, "_is_default_state_store_profile", lambda: False)
+    config = {"state_store": {"backend": "postgresql", "postgresql": {"dsn_env": "TEST_PG_DSN"}}}
+
+    with pytest.raises(StateStoreConfigurationError) as raised:
+        open_state_store(config, secret_lookup=lambda _name: f"postgresql://user:{secret_marker}@db/private")
+
+    exc = raised.value
+    public_cli_payload = {"error": str(exc), "type": type(exc).__name__}
+    public = "\n".join((str(exc), repr(exc), "".join(traceback.format_exception(exc)), repr(public_cli_payload)))
+    assert str(exc) == "PostgreSQL state store could not open the selected backend"
+    assert exc.__cause__ is None and exc.__context__ is None
+    assert secret_marker not in public
 
 
 def test_config_structure_reports_invalid_state_store_shape():
