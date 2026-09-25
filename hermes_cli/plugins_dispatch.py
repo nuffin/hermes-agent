@@ -42,11 +42,13 @@ logger = logging.getLogger("hermes_cli.plugins")
 _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "post_tool_call", "transform_terminal_output", "transform_tool_result", "transform_llm_output",
     "pre_llm_call", "post_llm_call", "pre_api_request", "post_api_request", "api_request_error",
-    "pre_auxiliary_call", "post_auxiliary_call", "pre_verify", "on_session_start", "on_session_end",
+    "pre_auxiliary_call", "post_auxiliary_call", "pre_verify", "pre_final_response", "on_session_start", "on_session_end",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+# Policy hooks: timeout / still-running must fail closed. ``pre_tool_call`` returns a
+# block directive; ``pre_final_response`` returns a safe replacement because its wire
+# contract has no block action and must never expose an unchecked candidate.
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call", "pre_final_response"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
@@ -54,6 +56,10 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+_PRE_FINAL_RESPONSE_FAILURE_CORRECTION = (
+    "Execution has not been confirmed because the final-response policy hook did not return safely. "
+    "No execution claim is being made."
+)
 
 
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> Dict[str, str]:
@@ -229,8 +235,11 @@ class PluginDispatchMixin:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
-                        if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                        if fail_closed:
+                            if hook_name == "pre_final_response":
+                                results.append({"action": "replace", "response": _PRE_FINAL_RESPONSE_FAILURE_CORRECTION})
+                            else:
+                                results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -238,8 +247,11 @@ class PluginDispatchMixin:
                     results.append(ret)
             except (Exception, SystemExit) as exc:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
-                if fail_closed:  # a guard that raised made no decision: same veto as a timeout
-                    results.append(_policy_error_block_directive(hook_name, cb, exc))
+                if fail_closed:
+                    if hook_name == "pre_final_response":
+                        results.append({"action": "replace", "response": _PRE_FINAL_RESPONSE_FAILURE_CORRECTION})
+                    else:
+                        results.append(_policy_error_block_directive(hook_name, cb, exc))
         return results
 
     def _report_hook_failure(

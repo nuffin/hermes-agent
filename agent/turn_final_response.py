@@ -144,6 +144,55 @@ def finish_text_response(
 
     agent._empty_content_retries = 0
     agent._thinking_prefill_retries = 0
+
+    # Plugin-controlled execution-evidence gate. This must run before every
+    # built-in continuation path: several built-ins deliberately create interim
+    # assistant rows, so they cannot be allowed to receive an unsupported claim.
+    # The complete candidate is already stream-buffered when this hook exists.
+    final_response = agent._strip_think_blocks(final_response).strip()
+    try:
+        from hermes_cli.plugins import get_pre_final_response_directive
+        _pre_final_attempt = int(getattr(agent, "_pre_final_response_nudges", 0) or 0)
+        _pre_final_action, _pre_final_payload = get_pre_final_response_directive(
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            task_id=effective_task_id or "",
+            platform=getattr(agent, "platform", "") or "",
+            model=getattr(agent, "model", "") or "",
+            provider=getattr(agent, "provider", "") or "",
+            api_call_count=int(api_call_count or 0),
+            finish_reason=str(finish_reason or ""),
+            attempt=_pre_final_attempt,
+            candidate_response=final_response,
+        )
+    except Exception:
+        _pre_final_action, _pre_final_payload = None, None
+        _pre_final_attempt = 0
+
+    if _pre_final_action == "continue":
+        if _pre_final_attempt < _PRE_FINAL_RESPONSE_NUDGE_LIMIT:
+            agent._pre_final_response_nudges = _pre_final_attempt + 1
+            _candidate_msg = agent._build_assistant_message(assistant_message, "pre_final_response_continue")
+            if _promoted:
+                _candidate_msg["api_content"] = final_response
+            _candidate_msg["_pre_final_response_candidate"] = True
+            append_message(messages, _candidate_msg)
+            append_message(messages, {
+                "role": "user", "content": _pre_final_payload,
+                "_pre_final_response_synthetic": True,
+            })
+            _discard = getattr(agent, "_discard_deferred_final_response", None)
+            if callable(_discard):
+                _discard()
+            agent._session_messages = messages
+            final_response = None
+            return _verdict("continue")
+        final_response = _PRE_FINAL_RESPONSE_LIMIT_FALLBACK
+    elif _pre_final_action == "replace":
+        final_response = _pre_final_payload
+    else:
+        agent._pre_final_response_nudges = 0
+
     # Surface the one-shot fallback switch notice before dropping the retry buffer so a
     # provider/model switch stays visible on success.
     agent._emit_pending_fallback_notice()
@@ -280,6 +329,10 @@ def finish_text_response(
         # Replay sidecar only: ``content`` stays empty so the row is never mistaken for a
         # real reply; ``build_api_messages`` substitutes ``api_content`` on the wire.
         final_msg["api_content"] = final_response
+    else:
+        # The pre-final gate may have replaced or normalized the candidate before
+        # this durable row is built; never retain the raw provider text.
+        final_msg["content"] = final_response
 
     # Dropped tool-call recovery (copilot/Claude): finish_reason="tool_calls" with empty
     # tool_calls would end the turn unstarted; re-prompt (max 3 CONSECUTIVE stalls).
@@ -323,6 +376,16 @@ def finish_text_response(
         and any(messages[-1].get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
     ):
         messages.pop()
+    # A previous pre-final candidate/nudge can be separated from the tail by
+    # provider bookkeeping on the next attempt. Remove all such private rows
+    # before allowing any accepted response to become durable.
+    messages[:] = [
+        message for message in messages
+        if not (
+            isinstance(message, dict)
+            and (message.get("_pre_final_response_candidate") or message.get("_pre_final_response_synthetic"))
+        )
+    ]
 
     _sg = apply_stop_gates(
         agent, final_msg, final_response=final_response, messages=messages,
@@ -335,61 +398,6 @@ def finish_text_response(
     if _sg.continue_turn:
         final_response = None
         return _verdict("continue")
-
-    # Plugin-controlled execution-evidence gate. Unlike ``pre_verify``, this
-    # runs before candidate persistence and delivery. Its synthetic pair is
-    # explicitly ephemeral so a subsequent tool-call flush cannot make an
-    # unsupported claim durable or visible on session replay.
-    try:
-        from hermes_cli.plugins import get_pre_final_response_directive
-        _pre_final_attempt = int(getattr(agent, "_pre_final_response_nudges", 0) or 0)
-        _pre_final_action, _pre_final_payload = get_pre_final_response_directive(
-            session_id=getattr(agent, "session_id", "") or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            task_id=effective_task_id or "",
-            platform=getattr(agent, "platform", "") or "",
-            model=getattr(agent, "model", "") or "",
-            provider=getattr(agent, "provider", "") or "",
-            api_call_count=int(api_call_count or 0),
-            finish_reason=str(finish_reason or ""),
-            attempt=_pre_final_attempt,
-            candidate_response=final_response or "",
-        )
-    except Exception:
-        _pre_final_action, _pre_final_payload = None, None
-        _pre_final_attempt = 0
-
-    if _pre_final_action == "continue":
-        if _pre_final_attempt < _PRE_FINAL_RESPONSE_NUDGE_LIMIT:
-            agent._pre_final_response_nudges = _pre_final_attempt + 1
-            final_msg["finish_reason"] = "pre_final_response_continue"
-            final_msg["_pre_final_response_candidate"] = True
-            append_message(messages, final_msg)
-            append_message(messages, {
-                "role": "user", "content": _pre_final_payload,
-                "_pre_final_response_synthetic": True,
-            })
-            _discard = getattr(agent, "_discard_deferred_final_response", None)
-            if callable(_discard):
-                _discard()
-            agent._session_messages = messages
-            final_response = None
-            return _verdict("continue")
-        # Never expose the original candidate when a plugin misconfigures its
-        # own attempt budget and keeps requesting continuation indefinitely.
-        final_response = _PRE_FINAL_RESPONSE_LIMIT_FALLBACK
-        if _promoted:
-            final_msg["api_content"] = final_response
-        else:
-            final_msg["content"] = final_response
-    elif _pre_final_action == "replace":
-        final_response = _pre_final_payload
-        if _promoted:
-            final_msg["api_content"] = final_response
-        else:
-            final_msg["content"] = final_response
-    else:
-        agent._pre_final_response_nudges = 0
 
     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
     # assistant row as settled, so a transform after this write would reach the user but never
