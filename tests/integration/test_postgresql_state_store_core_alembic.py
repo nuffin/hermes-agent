@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from importlib import resources
+from pathlib import Path
+import re
 from threading import Barrier
 from typing import Any, cast
 
@@ -16,7 +18,7 @@ from state_store_alembic import (
     V26_SQLITE_IMPORT_MANIFEST_REVISION,
     upgrade_new_tenant_to_v25,
 )
-from state_store_alembic.semantic_catalog import _CURRENT_TABLES
+from state_store_alembic.semantic_catalog import V27_SESSION_TOPICS_REVISION, _CURRENT_TABLES
 from state_store_postgresql import PostgreSQLStateStore
 
 _DSN_ENV = "HERMES_STATE_STORE_TEST_DSN"
@@ -80,8 +82,8 @@ def test_owned_fixture_keeps_tenant_empty_before_production_bootstrap(postgresql
 def test_fresh_owned_tenant_has_current_head_and_no_legacy_ledger(monkeypatch, postgresql_test_target):
     store = cast(Any, _open_owned_store(monkeypatch, postgresql_test_target))
     try:
-        assert CURRENT_STATE_STORE_REVISION == V26_SQLITE_IMPORT_MANIFEST_REVISION
-        _assert_version(postgresql_test_target, V26_SQLITE_IMPORT_MANIFEST_REVISION)
+        assert CURRENT_STATE_STORE_REVISION == V27_SESSION_TOPICS_REVISION
+        _assert_version(postgresql_test_target, V27_SESSION_TOPICS_REVISION)
         with store._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class AS relation "
@@ -151,28 +153,28 @@ def test_two_independent_cold_tenant_openers_converge_on_one_head_and_catalog(po
                 (postgresql_test_target.schema,),
             )
             actual_catalog = dict(cursor.fetchall())
-        expected_catalog = {**{name: "r" for name in _CURRENT_TABLES}, "alembic_version": "r", "messages_id_seq": "S"}
+        expected_catalog = {**{name: "r" for name in _CURRENT_TABLES}, "alembic_version": "r", "messages_id_seq": "S", "session_topics_id_seq": "S"}
         assert actual_catalog == expected_catalog
     finally:
         for store in stores:
             store.close()
 
 
-def test_current_core_catalog_excludes_later_session_topic_ddl(monkeypatch, postgresql_test_target):
-    """v26 session-topic DDL is intentionally reserved for the later topic branch."""
-    store = cast(Any, _open_owned_store(monkeypatch, postgresql_test_target))
-    try:
-        with postgresql_test_target.connect() as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT to_regclass(%s)", (f'"{postgresql_test_target.schema}".session_topics',))
-            assert cursor.fetchone() == (None,)
-            cursor.execute(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
-                "WHERE table_schema=%s AND table_name='messages' AND column_name='topic_id')",
-                (postgresql_test_target.schema,),
-            )
-            assert cursor.fetchone() == (False,)
-    finally:
-        store.close()
+def test_core_revisions_have_no_session_topic_production_ddl():
+    """Only the topic-owned v27 revision may define topic storage DDL."""
+    from state_store_alembic.versions import v25_core_baseline, v26_sqlite_import_manifest, v27_session_topics
+    import inspect
+
+    core_source = inspect.getsource(v25_core_baseline) + inspect.getsource(v26_sqlite_import_manifest)
+    assert "session_topics" not in core_source
+    assert "topic_id" not in core_source
+    topic_source = inspect.getsource(v27_session_topics)
+    assert "session_topics" in topic_source
+    assert "topic_id" in topic_source
+    versions = Path(v27_session_topics.__file__).parent
+    ddl_pattern = re.compile(r"(?:CREATE\s+(?:TABLE|INDEX).*session_topics|ALTER\s+TABLE.*topic_id|ADD\s+COLUMN\s+topic_id)", re.IGNORECASE | re.DOTALL)
+    owners = [path.name for path in versions.glob("*.py") if ddl_pattern.search(path.read_text(encoding="utf-8"))]
+    assert owners == ["v27_session_topics.py"]
 
 
 def test_valid_v25_catalog_upgrades_to_the_current_head(postgresql_test_target):
@@ -190,8 +192,8 @@ def test_valid_v25_catalog_upgrades_to_the_current_head(postgresql_test_target):
     with postgresql_test_target.connect() as connection:
         result = upgrade_new_tenant_to_v25(connection, postgresql_test_target.schema)
 
-    assert result.revision == V26_SQLITE_IMPORT_MANIFEST_REVISION
-    _assert_version(postgresql_test_target, V26_SQLITE_IMPORT_MANIFEST_REVISION)
+    assert result.revision == V27_SESSION_TOPICS_REVISION
+    _assert_version(postgresql_test_target, V27_SESSION_TOPICS_REVISION)
     with postgresql_test_target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class relation "
