@@ -14,6 +14,7 @@ from state_store_alembic.errors import BaselineMigrationContractError
 from state_store_alembic.migration_helpers import TENANT_SCHEMA_PATTERN, V25_CORE_REVISION
 
 V26_SQLITE_IMPORT_MANIFEST_REVISION = "state_store_v26_sqlite_import"
+V27_SESSION_TOPICS_REVISION = "state_store_v27_session_topics"
 
 # Compact form: name:type[:notnull][:default].  Types are format_type() results.
 _CORE_TABLES: Mapping[str, tuple[str, ...]] = {
@@ -46,7 +47,19 @@ _CORE_TABLES: Mapping[str, tuple[str, ...]] = {
 _MANIFEST_TABLES: Mapping[str, tuple[str, ...]] = {
     "sqlite_import_manifests": ("import_id:text:notnull", "source_fingerprint:text:notnull", "source_counts:jsonb:notnull", "source_schema:jsonb:notnull", "pre_import_target:jsonb:notnull", "destination_counts:jsonb", "status:text:notnull", "error:text", "created_at:double precision:notnull", "updated_at:double precision:notnull"),
 }
-_CURRENT_TABLES = {**_CORE_TABLES, **_MANIFEST_TABLES}
+_TOPIC_TABLES: Mapping[str, tuple[str, ...]] = {
+    "session_topics": (
+        "id:bigint:notnull:identity", "session_id:text:notnull", "title:text:notnull", "summary:text",
+        "state:text:notnull:'active'", "message_count:bigint:notnull:0", "created_at:double precision:notnull",
+        "last_active_at:double precision:notnull",
+    ),
+}
+_V26_TABLES = {**_CORE_TABLES, **_MANIFEST_TABLES}
+_CURRENT_TABLES = {
+    **_V26_TABLES,
+    **_TOPIC_TABLES,
+    "messages": (*_CORE_TABLES["messages"], "topic_id:bigint"),
+}
 
 _CORE_PKS = {
     "alembic_version": ("version_num",),
@@ -57,11 +70,12 @@ _CORE_PKS = {
     "compression_locks": ("session_id",), "session_turn_leases": ("conversation_id",), "compression_rotation_receipts": ("request_id",),
     "session_control_state": ("session_id", "control_kind"), "rewind_receipts": ("request_id",), "foreign_import_receipts": ("origin_fingerprint",), "gateway_session_routes": ("tenant_namespace", "session_key"),
 }
-_PKS = {**_CORE_PKS, "sqlite_import_manifests": ("import_id",)}
+_V26_PKS = {**_CORE_PKS, "sqlite_import_manifests": ("import_id",)}
+_PKS = {**_V26_PKS, "session_topics": ("id",)}
 # table, columns, target table, target columns, delete action, update action,
 # match type, validated, deferrable, initially deferred.  PostgreSQL stores the
 # action/match fields as their catalog single-character codes.
-_FKS = {
+_CORE_FKS = {
     ("messages", "messages_session_id_fkey"): (("session_id",), "sessions", ("id",), "a", "a", "s", True, False, False),
     ("sessions", "sessions_parent_session_id_fkey"): (("parent_session_id",), "sessions", ("id",), "a", "a", "s", False, False, False),
     ("sessions", "sessions_system_prompt_hash_fkey"): (("system_prompt_hash",), "system_prompts", ("hash",), "a", "a", "s", True, False, False),
@@ -73,6 +87,11 @@ _FKS = {
     ("rewind_receipts", "rewind_receipts_session_id_fkey"): (("session_id",), "sessions", ("id",), "a", "a", "s", True, False, False),
     ("foreign_import_receipts", "foreign_import_receipts_session_id_fkey"): (("session_id",), "sessions", ("id",), "a", "a", "s", True, False, False),
     ("gateway_session_routes", "gateway_session_routes_session_id_fkey"): (("session_id",), "sessions", ("id",), "a", "a", "s", True, False, False),
+}
+_FKS = {
+    **_CORE_FKS,
+    ("session_topics", "session_topics_session_id_fkey"): (("session_id",), "sessions", ("id",), "c", "a", "s", True, False, False),
+    ("messages", "messages_topic_id_fkey"): (("topic_id",), "session_topics", ("id",), "n", "a", "s", True, False, False),
 }
 # CHECK name -> canonical pg_get_constraintdef() expression and convalidated state.
 _CORE_CHECKS = {
@@ -87,7 +106,12 @@ _CORE_CHECKS = {
     ("session_control_state", "session_control_state_revision_check"): ("CHECK (revision > 0)", True),
     ("gateway_session_routes", "gateway_session_routes_generation_check"): ("CHECK (generation > 0)", True),
 }
-_CHECKS = {**_CORE_CHECKS, ("sqlite_import_manifests", "sqlite_import_manifests_status_check"): ("CHECK (status = ANY (ARRAY['running', 'failed', 'complete']))", True)}
+_V26_CHECKS = {**_CORE_CHECKS, ("sqlite_import_manifests", "sqlite_import_manifests_status_check"): ("CHECK (status = ANY (ARRAY['running', 'failed', 'complete']))", True)}
+_CHECKS = {
+    **_V26_CHECKS,
+    ("session_topics", "session_topics_state_check"): ("CHECK (state = ANY (ARRAY['active', 'warm']))", True),
+    ("session_topics", "session_topics_message_count_check"): ("CHECK (message_count >= 0)", True),
+}
 # name: table, access method, (key column, indoption) pairs, unique, predicate.
 _INDEXES = {
     "messages_session_id_id": ("messages", "btree", (("session_id", 0), ("id", 0)), False, None),
@@ -107,6 +131,12 @@ _INDEXES = {
     "rewind_receipts_session_committed": ("rewind_receipts", "btree", (("session_id", 0), ("committed_at", 0)), False, None), "foreign_import_receipts_session_unique": ("foreign_import_receipts", "btree", (("session_id", 0),), True, None),
     "gateway_session_routes_session_unique": ("gateway_session_routes", "btree", (("tenant_namespace", 0), ("session_id", 0)), True, None),
     "messages_platform_message_id_unique": ("messages", "btree", (("platform_message_id", 0),), True, "platform_message_id is not null"), "messages_session_platform_message_id": ("messages", "btree", (("session_id", 0), ("platform_message_id", 0)), False, "platform_message_id is not null"),
+    "session_topics_session_last_active": ("session_topics", "btree", (("session_id", 0), ("last_active_at", 3)), False, None),
+    "messages_topic_id": ("messages", "btree", (("session_id", 0), ("topic_id", 0), ("id", 0)), False, None),
+}
+_V26_INDEXES = {
+    name: value for name, value in _INDEXES.items()
+    if name not in {"session_topics_session_last_active", "messages_topic_id"}
 }
 
 
@@ -125,16 +155,17 @@ def _parse(spec: str) -> tuple[str, str, bool, str | None]:
     return name, typ, notnull, default
 
 
-def _expected_index_signatures() -> dict[str, tuple[Any, ...]]:
+def _expected_index_signatures(indexes: Mapping[str, tuple[Any, ...]] | None = None) -> dict[str, tuple[Any, ...]]:
     """Immutable index semantics, including all default-only catalog options."""
+    indexes = _INDEXES if indexes is None else indexes
     return {
         name: (*value[:4], True, True, True, False, True, True, True, (), _norm(value[4]))
-        for name, value in _INDEXES.items()
+        for name, value in indexes.items()
     }
 
 
-def _validate_identity_sequence(cursor: Any, schema: str) -> None:
-    """Prove the sole identity sequence is internal, owned, and unmodified."""
+def _validate_identity_sequence(cursor: Any, schema: str, *, table: str, sequence: str) -> None:
+    """Prove an identity sequence is internal, owned, and unmodified."""
     cursor.execute(
         "SELECT sequence_relation.relkind, sequence_relation.relpersistence, "
         "format_type(sequence_row.seqtypid, NULL), sequence_row.seqstart, "
@@ -147,16 +178,16 @@ def _validate_identity_sequence(cursor: Any, schema: str) -> None:
         "AND column_row.attnum=dependency.refobjsubid "
         "WHERE dependency.classid='pg_class'::regclass AND dependency.objid=sequence_relation.oid "
         "AND dependency.refclassid='pg_class'::regclass AND dependency.deptype='i' "
-        "AND table_namespace.nspname=%s AND table_relation.relname='messages' "
+        "AND table_namespace.nspname=%s AND table_relation.relname=%s "
         "AND column_row.attname='id') "
         "FROM pg_catalog.pg_class sequence_relation "
         "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=sequence_relation.relnamespace "
         "JOIN pg_catalog.pg_sequence sequence_row ON sequence_row.seqrelid=sequence_relation.oid "
-        "WHERE namespace.nspname=%s AND sequence_relation.relname='messages_id_seq'",
-        (schema, schema),
+        "WHERE namespace.nspname=%s AND sequence_relation.relname=%s",
+        (schema, table, schema, sequence),
     )
     if cursor.fetchall() != [("S", "p", "bigint", 1, 1, 9223372036854775807, 1, 1, False, True)]:
-        _fail("messages.id identity sequence ownership or options differ")
+        _fail(f"{table}.id identity sequence ownership or options differ")
 
 
 def _validate_version_table(cursor: Any, schema: str, revision: str) -> None:
@@ -194,10 +225,12 @@ def _validate_absent_behavior_objects(cursor: Any, schema: str) -> None:
             _fail(f"unexpected {label}")
 
 
-def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mapping[str, tuple[str, ...]], pks: Mapping[str, tuple[str, ...]], checks: Mapping[tuple[str, str], tuple[str, bool]]) -> None:
+def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mapping[str, tuple[str, ...]], pks: Mapping[str, tuple[str, ...]], fks: Mapping[tuple[str, str], tuple[Any, ...]], checks: Mapping[tuple[str, str], tuple[str, bool]], indexes: Mapping[str, tuple[Any, ...]]) -> None:
     _validate_version_table(cursor, schema, revision)
     cursor.execute("SELECT relation.relname, relation.relkind FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=%s AND relation.relkind IN ('r','p','v','m','S','f') ORDER BY relation.relname", (schema,))
     allowed_relations = {**{name: "r" for name in tables}, "alembic_version": "r", "messages_id_seq": "S"}
+    if "session_topics" in tables:
+        allowed_relations["session_topics_id_seq"] = "S"
     relations = {str(name): str(kind) for name, kind in cursor.fetchall()}
     if relations != allowed_relations:
         _fail(f"unexpected, missing, or invalid relations {sorted(set(relations) ^ set(allowed_relations))}")
@@ -223,7 +256,9 @@ def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mappin
                     _fail(f"{table}.{column} generated expression contract differs")
             elif identity or generated or _norm(actual_default) != _norm(default):
                 _fail(f"{table}.{column} default/generated contract differs")
-    _validate_identity_sequence(cursor, schema)
+    _validate_identity_sequence(cursor, schema, table="messages", sequence="messages_id_seq")
+    if "session_topics" in tables:
+        _validate_identity_sequence(cursor, schema, table="session_topics", sequence="session_topics_id_seq")
     cursor.execute("SELECT constraint_table.relname, constraint_row.conname, constraint_row.contype, array_agg(source_column.attname ORDER BY source_key.ordinality), target_table.relname, array_agg(target_column.attname ORDER BY target_key.ordinality), constraint_row.confdeltype, constraint_row.confupdtype, constraint_row.confmatchtype, constraint_row.convalidated, constraint_row.condeferrable, constraint_row.condeferred FROM pg_catalog.pg_constraint constraint_row JOIN pg_catalog.pg_class constraint_table ON constraint_table.oid=constraint_row.conrelid LEFT JOIN pg_catalog.pg_class target_table ON target_table.oid=constraint_row.confrelid LEFT JOIN unnest(constraint_row.conkey) WITH ORDINALITY source_key(attnum, ordinality) ON true LEFT JOIN pg_catalog.pg_attribute source_column ON source_column.attrelid=constraint_row.conrelid AND source_column.attnum=source_key.attnum LEFT JOIN unnest(constraint_row.confkey) WITH ORDINALITY target_key(attnum, ordinality) ON target_key.ordinality=source_key.ordinality LEFT JOIN pg_catalog.pg_attribute target_column ON target_column.attrelid=constraint_row.confrelid AND target_column.attnum=target_key.attnum JOIN pg_catalog.pg_namespace namespace ON namespace.oid=constraint_table.relnamespace WHERE namespace.nspname=%s AND constraint_row.contype IN ('p','u','f') GROUP BY constraint_table.relname, constraint_row.conname, constraint_row.contype, target_table.relname, constraint_row.confdeltype, constraint_row.confupdtype, constraint_row.confmatchtype, constraint_row.convalidated, constraint_row.condeferrable, constraint_row.condeferred", (schema,))
     actual_pks: dict[str, tuple[str, ...]] = {}
     actual_fks: dict[tuple[str, str], tuple[tuple[str, ...], str, tuple[str, ...], str, str, str, bool, bool, bool]] = {}
@@ -237,7 +272,7 @@ def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mappin
             )
         else:
             _fail(f"unexpected unique constraint {name}")
-    if actual_pks != pks or actual_fks != _FKS:
+    if actual_pks != pks or actual_fks != fks:
         _fail("primary-key, unique, or foreign-key semantics differ")
     cursor.execute("SELECT constraint_table.relname, constraint_row.conname, pg_get_constraintdef(constraint_row.oid, true), constraint_row.convalidated FROM pg_catalog.pg_constraint constraint_row JOIN pg_catalog.pg_class constraint_table ON constraint_table.oid=constraint_row.conrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid=constraint_table.relnamespace WHERE namespace.nspname=%s AND constraint_row.contype='c'", (schema,))
     actual_checks = {(str(table), str(name)): (str(definition), bool(validated)) for table, name, definition, validated in cursor.fetchall()}
@@ -246,8 +281,8 @@ def _validate_catalog(cursor: Any, schema: str, *, revision: str, tables: Mappin
     if normalized_checks != expected_checks:
         _fail(f"check constraint name, expression, or validation semantics differ: expected {expected_checks}, actual {normalized_checks}")
     cursor.execute("SELECT index_relation.relname, table_relation.relname, access_method.amname, index_row.indisunique, index_row.indisvalid, index_row.indisready, index_row.indislive, index_row.indnullsnotdistinct, index_row.indnkeyatts=index_row.indnatts, bool_and(attribute.attname IS NOT NULL AND operator_class.opcdefault AND operator_class.opcintype=attribute.atttypid AND operator_class.opcmethod=index_relation.relam), bool_and(COALESCE(index_collation.oid, 0)=attribute.attcollation), COALESCE(index_relation.reloptions, ARRAY[]::text[]), array_agg(COALESCE(attribute.attname::text, '<expression:' || pg_get_indexdef(index_row.indexrelid, key_column.ordinality::int, true) || '>') ORDER BY key_column.ordinality), array_agg(key_option.option ORDER BY key_column.ordinality), pg_get_expr(index_row.indpred, index_row.indrelid) FROM pg_catalog.pg_index index_row JOIN pg_catalog.pg_class index_relation ON index_relation.oid=index_row.indexrelid JOIN pg_catalog.pg_class table_relation ON table_relation.oid=index_row.indrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid=table_relation.relnamespace JOIN pg_catalog.pg_am access_method ON access_method.oid=index_relation.relam JOIN unnest(index_row.indkey) WITH ORDINALITY key_column(attnum, ordinality) ON true JOIN unnest(index_row.indoption) WITH ORDINALITY key_option(option, ordinality) ON key_option.ordinality=key_column.ordinality JOIN unnest(index_row.indclass) WITH ORDINALITY key_class(opclass, ordinality) ON key_class.ordinality=key_column.ordinality JOIN unnest(index_row.indcollation) WITH ORDINALITY key_collation(collation_oid, ordinality) ON key_collation.ordinality=key_column.ordinality LEFT JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid=index_row.indrelid AND attribute.attnum=key_column.attnum LEFT JOIN pg_catalog.pg_opclass operator_class ON operator_class.oid=key_class.opclass LEFT JOIN pg_catalog.pg_collation index_collation ON index_collation.oid=key_collation.collation_oid WHERE namespace.nspname=%s AND NOT index_row.indisprimary GROUP BY index_relation.relname, table_relation.relname, access_method.amname, index_row.indisunique, index_row.indisvalid, index_row.indisready, index_row.indislive, index_row.indnullsnotdistinct, index_row.indnkeyatts, index_row.indnatts, index_relation.reloptions, index_row.indpred, index_row.indrelid", (schema,))
-    indexes = {str(name): (str(table), str(method), tuple(zip(keys, (int(option) for option in options))), bool(unique), bool(valid), bool(ready), bool(live), bool(nulls_not_distinct), bool(keys_only), bool(default_opclasses), bool(default_collations), tuple(sorted(reloptions)), _norm(predicate)) for name, table, method, unique, valid, ready, live, nulls_not_distinct, keys_only, default_opclasses, default_collations, reloptions, keys, options, predicate in cursor.fetchall()}
-    if indexes != _expected_index_signatures():
+    actual_indexes = {str(name): (str(table), str(method), tuple(zip(keys, (int(option) for option in options))), bool(unique), bool(valid), bool(ready), bool(live), bool(nulls_not_distinct), bool(keys_only), bool(default_opclasses), bool(default_collations), tuple(sorted(reloptions)), _norm(predicate)) for name, table, method, unique, valid, ready, live, nulls_not_distinct, keys_only, default_opclasses, default_collations, reloptions, keys, options, predicate in cursor.fetchall()}
+    if actual_indexes != _expected_index_signatures(indexes):
         _fail("index method, key direction/options, opclasses, collations, NULLS NOT DISTINCT, reloptions, predicate, unique, or validity semantics differ")
 
 
@@ -255,14 +290,21 @@ def validate_v25_core_catalog_cursor(cursor: Any, schema: str) -> None:
     """Validate precisely the immutable v25 core before a child migration writes."""
     if not TENANT_SCHEMA_PATTERN.fullmatch(schema):
         _fail("untrusted tenant schema")
-    _validate_catalog(cursor, schema, revision=V25_CORE_REVISION, tables=_CORE_TABLES, pks=_CORE_PKS, checks=_CORE_CHECKS)
+    _validate_catalog(cursor, schema, revision=V25_CORE_REVISION, tables=_CORE_TABLES, pks=_CORE_PKS, fks=_CORE_FKS, checks=_CORE_CHECKS, indexes=_V26_INDEXES)
 
 
 def validate_current_catalog_cursor(cursor: Any, schema: str) -> None:
     """Validate precisely the current Alembic head, including child receipts."""
     if not TENANT_SCHEMA_PATTERN.fullmatch(schema):
         _fail("untrusted tenant schema")
-    _validate_catalog(cursor, schema, revision=V26_SQLITE_IMPORT_MANIFEST_REVISION, tables=_CURRENT_TABLES, pks=_PKS, checks=_CHECKS)
+    _validate_catalog(cursor, schema, revision=V27_SESSION_TOPICS_REVISION, tables=_CURRENT_TABLES, pks=_PKS, fks=_FKS, checks=_CHECKS, indexes=_INDEXES)
+
+
+def validate_v26_sqlite_import_catalog_cursor(cursor: Any, schema: str) -> None:
+    """Validate the immutable non-topic v26 child before topic DDL runs."""
+    if not TENANT_SCHEMA_PATTERN.fullmatch(schema):
+        _fail("untrusted tenant schema")
+    _validate_catalog(cursor, schema, revision=V26_SQLITE_IMPORT_MANIFEST_REVISION, tables=_V26_TABLES, pks=_V26_PKS, fks=_CORE_FKS, checks=_V26_CHECKS, indexes=_V26_INDEXES)
 
 
 def validate_core_v25_catalog_cursor(cursor: Any, schema: str) -> None:
@@ -274,6 +316,8 @@ def validate_core_v25_catalog_cursor(cursor: Any, schema: str) -> None:
     if versions == [(V25_CORE_REVISION,)]:
         validate_v25_core_catalog_cursor(cursor, schema)
     elif versions == [(V26_SQLITE_IMPORT_MANIFEST_REVISION,)]:
+        validate_v26_sqlite_import_catalog_cursor(cursor, schema)
+    elif versions == [(V27_SESSION_TOPICS_REVISION,)]:
         validate_current_catalog_cursor(cursor, schema)
     else:
         _fail("Alembic version table contains an unsupported revision")
@@ -295,6 +339,10 @@ def validate_v25_core_catalog(connection: Any, schema: str) -> None:
 
 def validate_current_catalog(connection: Any, schema: str) -> None:
     _validate_with_cursor(connection, schema, validate_current_catalog_cursor)
+
+
+def validate_v26_sqlite_import_catalog(connection: Any, schema: str) -> None:
+    _validate_with_cursor(connection, schema, validate_v26_sqlite_import_catalog_cursor)
 
 
 def validate_core_v25_catalog(connection: Any, schema: str) -> None:

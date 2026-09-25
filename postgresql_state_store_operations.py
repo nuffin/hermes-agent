@@ -36,7 +36,7 @@ _REQUIRED_TABLES = (
     "conversation_generations", "search_index_maintenance", "session_runtime_owners",
     "session_runtime_turns", "compression_locks", "session_turn_leases",
     "compression_rotation_receipts", "session_control_state", "rewind_receipts",
-    "foreign_import_receipts", "gateway_session_routes", "sqlite_import_manifests",
+    "foreign_import_receipts", "gateway_session_routes", "sqlite_import_manifests", "session_topics",
 )
 _OPTIMIZE_TABLES = _REQUIRED_TABLES
 _OPTIMIZE_STATEMENT_TIMEOUT_MS = 30_000
