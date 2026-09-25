@@ -18,6 +18,7 @@ from hermes_cli.plugins import (
     PluginManifest,
     _dispatch_pre_tool_call_hooks,
     get_pre_tool_call_block_message,
+    get_pre_final_response_directive,
     get_pre_verify_continue_message,
     has_middleware,
     resolve_plugin_command_result,
@@ -2718,3 +2719,20 @@ class TestAsyncHookOnCallerLoop:
             results = asyncio.run(mgr.ainvoke_hook("pre_gateway_dispatch", event="e", gateway="g"))
         assert results == [{"seen": "e"}, {"seen_async": "e"}]
         assert "async plugin blew up" in caplog.text
+
+
+def test_pre_final_response_directive_uses_first_valid_response(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "invoke_hook",
+        lambda *_args, **_kwargs: [
+            {"action": "continue"},
+            {"action": "replace", "response": "safe correction"},
+            {"action": "continue", "message": "later nudge"},
+        ],
+    )
+    assert get_pre_final_response_directive(
+        session_id="s", turn_id="t", candidate_response="I am working"
+    ) == ("replace", "safe correction")
