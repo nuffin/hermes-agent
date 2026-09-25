@@ -993,8 +993,19 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                                turn_lease_holder: str | None = None,
                                turn_lease_ttl_seconds: float = 300.0,
                                reject_active_turn_lease: bool = False) -> int:
+        return len(self.append_message_records_with_ids(
+            session_id, records, turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            reject_active_turn_lease=reject_active_turn_lease,
+        ))
+
+    def append_message_records_with_ids(self, session_id: str, records: list[MessageRecord], *,
+                                        turn_lease_holder: str | None = None,
+                                        turn_lease_ttl_seconds: float = 300.0,
+                                        reject_active_turn_lease: bool = False) -> list[int]:
         if not records:
-            return 0
+            return []
+        message_ids: list[int] = []
         with self._connection() as connection, connection.cursor() as cursor:
             # Batch append is the normal turn persistence path. Serialize on the
             # session before coordination or topic rows, then validate its fence.
@@ -1009,17 +1020,18 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             for record in records:
                 cursor.execute(
                     f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) "
-                    f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING created_at",
+                    f"VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id, created_at",
                     self._record_params(session_id, record),
                 )
-                created_at = cursor.fetchone()[0]
+                message_id, created_at = cursor.fetchone()
+                message_ids.append(int(message_id))
                 cursor.execute(
                     f"UPDATE {self._schema}.sessions SET last_activity_at = GREATEST("
                     "COALESCE(last_activity_at, started_at), %s) WHERE id = %s",
                     (created_at, session_id),
                 )
             self._refresh_topic_message_counts(cursor, session_id)
-        return len(records)
+        return message_ids
 
     def _refresh_topic_message_counts(self, cursor: Any, session_id: str) -> None:
         """Keep v27's materialized topic counters aligned with active message rows."""

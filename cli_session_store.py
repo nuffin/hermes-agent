@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
 
 from state_store import MessageRecord, open_state_store, resolve_state_store_config
 
@@ -120,12 +120,20 @@ class PostgreSQLCLISessionStore:
         if kwargs:
             raise PostgreSQLCLISessionCapabilityError(
                 "PostgreSQL CLI persistence does not support batch controls: " + ", ".join(sorted(kwargs)))
-        return self._store.append_message_records(
+        message_ids = self._store.append_message_records_with_ids(
             session_id, [self._record(message) for message in messages],
             turn_lease_holder=turn_lease_holder,
             turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             reject_active_turn_lease=reject_active_turn_lease,
         )
+        # The agent's normal crash-persistence path must later retag these exact
+        # rows when the final response selects a topic. SQLite writes row ids
+        # back to the live dictionaries; preserve that facade contract for PG.
+        if isinstance(message_ids, list):
+            for message, message_id in zip(messages, message_ids):
+                if isinstance(message, MutableMapping):
+                    message["_row_id"] = int(message_id)
+        return len(messages)
 
     def _topic_capability(self, name: str) -> Any:
         method = getattr(self._store, name, None)
