@@ -23,10 +23,10 @@ def test_core_v25_revision_is_the_single_public_baseline_identifier():
     assert V25_CORE_REVISION == "state_store_v25_core"
 
 
-def test_current_bootstrap_name_distinguishes_the_v25_baseline_from_v26_head():
+def test_current_bootstrap_name_distinguishes_the_v25_baseline_from_topic_head():
     from state_store_alembic import CURRENT_STATE_STORE_REVISION
 
-    assert CURRENT_STATE_STORE_REVISION == "state_store_v26_sqlite_import"
+    assert CURRENT_STATE_STORE_REVISION == "state_store_v27_session_topics"
     assert upgrade_new_tenant_to_current is not upgrade_new_tenant_to_v25
 
 
