@@ -303,9 +303,8 @@ def test_pg_selection_never_creates_or_opens_state_db(switch_home):
     os.environ[_DSN_ENV] = "postgresql://hermes_state_store_test@127.0.0.1:1/unreachable"
     try:
         with trap_state_db_opens(home) as opens:
-            with pytest.raises(Exception, match="refused|timed out|[Cc]onnection"):
-                store = open_state_store(_pg_config())
-                store.ensure_session("never-created", "cli")
+            with pytest.raises(StateStoreConfigurationError, match="could not open the selected backend"):
+                open_state_store(_pg_config())
         assert opens == []
     finally:
         os.environ[_DSN_ENV] = TEST_DSN

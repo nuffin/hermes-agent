@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 import json
+from functools import wraps
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -28,8 +29,8 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture
 def pg_cli_home(tmp_path, monkeypatch, postgresql_test_target):
-    home = tmp_path / ".hermes-dev-postgresql-state-store"
-    home.mkdir()
+    home = tmp_path / "profiles" / "pg-cli-postgresql-state-store"
+    home.mkdir(parents=True)
     (home / "config.yaml").write_text(
         "state_store:\n  backend: postgresql\n  postgresql:\n    dsn_env: HERMES_STATE_STORE_TEST_DSN\n    connect_timeout_seconds: 5\n    pool_max_size: 2\n",
         encoding="utf-8",
@@ -1216,3 +1217,307 @@ def test_selected_postgresql_facade_fences_batch_append_and_exposes_blocking_tur
         assert [row["content"] for row in store.get_messages_as_conversation(session_id)] == ["owned"]
     finally:
         store.close()
+
+
+def _write_topic_enabled_postgresql_config(home: Path) -> None:
+    """Configure the selected test profile through the normal config loader."""
+    (home / "config.yaml").write_text(
+        "state_store:\n"
+        "  backend: postgresql\n"
+        "  postgresql:\n"
+        "    dsn_env: HERMES_STATE_STORE_TEST_DSN\n"
+        "    connect_timeout_seconds: 5\n"
+        "    pool_max_size: 2\n"
+        "session:\n"
+        "  topic_segmentation:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+
+def _offline_text_response(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=content, reasoning_content=None, reasoning=None, tool_calls=None,
+        ), finish_reason="stop")],
+        model="oracle/model",
+        usage=None,
+    )
+
+
+def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_cli_home):
+    """A normal public turn owns the PG lease and persists durable topic transitions."""
+    import agent.conversation_loop as conversation_loop
+    from hermes_cli.config import load_config
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    _write_topic_enabled_postgresql_config(home)
+    session_id = "pg-public-topic-normal-turn"
+    replies = [
+        _offline_text_response("Steep the leaves.\nTOPIC: cooking"),
+        _offline_text_response("Rebase, resolve, then continue.\nTOPIC: git"),
+    ]
+    api_messages = []
+
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        config = load_config()
+        store = open_cli_session_store(config)
+        stores.append(store)
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        assert agent._topic_segmentation_enabled is True
+        assert agent._session_db is store
+
+        def complete(**kwargs):
+            api_messages.append(kwargs["messages"])
+            return replies.pop(0)
+
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.side_effect = complete
+        build_context_calls, finalize_calls = [], []
+        original_build_context = conversation_loop.build_turn_context
+        original_finalize = conversation_loop.finalize_turn
+
+        def traced_build_context(*args, **kwargs):
+            build_context_calls.append((args, kwargs))
+            return original_build_context(*args, **kwargs)
+
+        @wraps(original_finalize)
+        def traced_finalize(*args, **kwargs):
+            finalize_calls.append((args, kwargs))
+            return original_finalize(*args, **kwargs)
+        with (
+            patch.object(conversation_loop, "build_turn_context", traced_build_context),
+            patch.object(conversation_loop, "finalize_turn", traced_finalize),
+            patch.object(store, "acquire_session_turn_lease", wraps=store.acquire_session_turn_lease) as acquire_lease,
+            patch.object(store, "ensure_session_topic", wraps=store.ensure_session_topic) as ensure_topic,
+            patch.object(store, "activate_topic_for_messages", wraps=store.activate_topic_for_messages) as activate_topic,
+        ):
+            first = agent.run_conversation("How do I brew tea?")
+            second = agent.run_conversation("How do I recover a rebase?")
+
+        assert first["completed"] is True and second["completed"] is True
+        assert len(build_context_calls) == 2
+        assert len(finalize_calls) == 2
+        assert acquire_lease.call_count >= 1
+        assert ensure_topic.call_count == 2
+        assert activate_topic.call_count == 2
+        assert any(call.kwargs["turn_lease_holder"] for call in activate_topic.call_args_list)
+        assert any("[SESSION TOPICS" in str(message) for batch in api_messages for message in batch)
+
+        topics = {topic["title"]: topic for topic in store.get_topics(session_id)}
+        cooking, git = topics["cooking"], topics["git"]
+        assert git["state"] == "active"
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=cooking["id"])] == [
+            "How do I brew tea?", "Steep the leaves.\nTOPIC: cooking",
+        ]
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=git["id"])] == [
+            "How do I recover a rebase?", "Rebase, resolve, then continue.\nTOPIC: git",
+        ]
+        records = store._store.get_message_records(session_id)
+        rows_by_content = {row["content"]: row for row in records}
+        assert rows_by_content["How do I brew tea?"]["topic_id"] == cooking["id"]
+        assert rows_by_content["Steep the leaves.\nTOPIC: cooking"]["topic_id"] == cooking["id"]
+        assert rows_by_content["How do I recover a rebase?"]["topic_id"] == git["id"]
+        assert rows_by_content["Rebase, resolve, then continue.\nTOPIC: git"]["topic_id"] == git["id"]
+
+        store.close()
+        reopened = open_cli_session_store(load_config())
+        stores.append(reopened)
+        restored = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=reopened,
+        )
+        assert restored._topic_segmentation_enabled is True
+        assert restored._active_topic_id == git["id"]
+        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=git["id"])] == [
+            "How do I recover a rebase?", "Rebase, resolve, then continue.\nTOPIC: git",
+        ]
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(pg_cli_home):
+    """A selected-store transition failure reaches finalization but never writes an unsegmented tail."""
+    import agent.conversation_loop as conversation_loop
+    from hermes_cli.config import load_config
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    _write_topic_enabled_postgresql_config(home)
+    session_id, answer = "pg-public-topic-finalizer-failure", "This tail must not persist.\nTOPIC: cooking"
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        store = open_cli_session_store(load_config())
+        stores.append(store)
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = _offline_text_response(answer)
+        finalize_calls = []
+        original_finalize = conversation_loop.finalize_turn
+
+        @wraps(original_finalize)
+        def traced_finalize(*args, **kwargs):
+            finalize_calls.append((args, kwargs))
+            return original_finalize(*args, **kwargs)
+        with (
+            patch.object(conversation_loop, "finalize_turn", traced_finalize),
+            patch.object(store, "activate_topic_for_messages", side_effect=RuntimeError("selected store fault")),
+        ):
+            result = agent.run_conversation("How do I brew tea?")
+
+        assert len(finalize_calls) == 1
+        assert result["completed"] is False and result["failed"] is True
+        assert result["failure_reason"] == "topic_segmentation_runtime_failed"
+        assert "topic transition failed" in result["error"]
+        assert answer not in [row["content"] for row in store.get_messages_as_conversation(session_id)]
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_public_topic_turn_rejects_stale_selected_postgresql_lease_before_mutation(pg_cli_home, monkeypatch):
+    """The normal public facade rejects a held PG session before provider work or topic writes."""
+    from hermes_cli.config import load_config
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    _write_topic_enabled_postgresql_config(home)
+    session_id = "pg-public-topic-rejected-lease"
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        store = open_cli_session_store(load_config())
+        stores.append(store)
+        store.create_session(session_id, "cli")
+        assert store.acquire_session_turn_lease(session_id, "existing-holder", wait_seconds=0.01, poll_interval_seconds=0.01)
+        monkeypatch.setattr("agent.turn_facade_lease.LEASE_WAIT_SECONDS", 0.01)
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        agent.client = MagicMock()
+        result = agent.run_conversation("This must not mutate the transcript")
+        assert result["completed"] is False and result["failed"] is True
+        assert result["failure_reason"] == "session_busy"
+        assert agent.client.chat.completions.create.call_count == 0
+        assert store.get_topics(session_id) == []
+        assert store.get_messages_as_conversation(session_id) == []
+        store.release_session_turn_lease(session_id, "existing-holder")
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_fresh_public_profile_config_opens_canonical_owned_postgresql_store_without_sqlite(tmp_path):
+    """Fresh config -> scoped secret -> canonical tenant -> public factory survives reopen."""
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_cli.config import load_config
+    from state_store import _canonical_postgresql_tenant_schema_name
+    from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
+
+    home = tmp_path / "profiles" / "fresh-public-profile-postgresql"
+    home.mkdir(parents=True)
+    dsn_env = "HERMES_PUBLIC_PROFILE_POSTGRESQL_DSN"
+    (home / "config.yaml").write_text(
+        "state_store:\n"
+        "  backend: postgresql\n"
+        "  postgresql:\n"
+        f"    dsn_env: {dsn_env}\n"
+        "    connect_timeout_seconds: 5\n"
+        "    pool_max_size: 2\n",
+        encoding="utf-8",
+    )
+    # The scoped lookup consumes this test-only target from the profile file;
+    # the value is intentionally never logged or compared in the assertions.
+    (home / ".env").write_text(f"{dsn_env}={_DSN}\n", encoding="utf-8")
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+    target = None
+    try:
+        canonical_schema = _canonical_postgresql_tenant_schema_name()
+        target = OwnedPostgreSQLTestTarget(_DSN, identity=canonical_schema.removeprefix("hermes_state_store_tenant_")).allocate()
+        config = load_config()
+        assert config["state_store"]["backend"] == "postgresql"
+        with trap_state_db_opens(home) as opens:
+            store = open_cli_session_store(config)
+            try:
+                assert store.__class__.__name__ == "PostgreSQLCLISessionStore"
+                assert str(store._store._schema) == canonical_schema
+                store.create_session("fresh-public-profile", "cli")
+                store.append_message("fresh-public-profile", "user", "durable public config path")
+            finally:
+                store.close()
+            reopened = open_cli_session_store(load_config())
+            try:
+                assert [row["content"] for row in reopened.get_messages_as_conversation("fresh-public-profile")] == [
+                    "durable public config path"
+                ]
+            finally:
+                reopened.close()
+        assert opens == []
+        assert not (home / "state.db").exists()
+    finally:
+        if target is not None:
+            target.drop()
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+@pytest.mark.parametrize("mode", ("missing", "unreachable"))
+def test_fresh_public_profile_config_pg_failures_are_sanitized_and_never_open_sqlite(tmp_path, mode):
+    """The public selected-PG boundary fails closed for absent and refused profile secrets."""
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_cli.config import load_config
+    from state_store import StateStoreConfigurationError
+
+    home = tmp_path / "profiles" / f"fresh-public-profile-pg-{mode}"
+    home.mkdir(parents=True)
+    dsn_env = "HERMES_PUBLIC_PROFILE_POSTGRESQL_DSN"
+    (home / "config.yaml").write_text(
+        "state_store:\n"
+        "  backend: postgresql\n"
+        "  postgresql:\n"
+        f"    dsn_env: {dsn_env}\n"
+        "    connect_timeout_seconds: 1\n"
+        "    pool_max_size: 1\n",
+        encoding="utf-8",
+    )
+    # Port 1 is deliberately refused locally; the marker verifies that the
+    # public error never exposes the credential portion of this profile secret.
+    secret_marker = "profile-config-secret-marker"
+    if mode == "unreachable":
+        (home / ".env").write_text(
+            f"{dsn_env}=postgresql://state:{secret_marker}@127.0.0.1:1/unreachable\n",
+            encoding="utf-8",
+        )
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+    try:
+        with trap_state_db_opens(home) as opens:
+            with pytest.raises(StateStoreConfigurationError) as raised:
+                open_cli_session_store(load_config())
+        error = str(raised.value)
+        assert secret_marker not in error
+        assert dsn_env in error if mode == "missing" else "could not open the selected backend" in error
+        assert opens == []
+        assert not (home / "state.db").exists()
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
