@@ -1356,6 +1356,33 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any
     )
 
 
+def _topic_pre_admission_result(agent, conversation_history, failure: tuple[str, str]) -> Dict[str, Any]:
+    """Stable zero-publication envelope for selected-topic capability refusal."""
+    failure_reason, failure_message = failure
+    return {
+        "final_response": None,
+        "last_reasoning": None,
+        "messages": list(conversation_history or []),
+        "api_calls": 0,
+        "completed": False,
+        "turn_exit_reason": failure_reason,
+        "failed": True,
+        "partial": False,
+        "interrupted": False,
+        "response_transformed": False,
+        "pre_transform_response": None,
+        "response_previewed": False,
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "last_prompt_tokens": 0,
+        "service_tier": None,
+        "error": failure_message,
+        "failure_reason": failure_reason,
+        "pre_admission_failure": True,
+    }
+
+
 @dataclass
 class _LoopState:
     """Every local the turn loop threads through the phase helpers in ``agent/turn_*.py``.
@@ -1540,29 +1567,7 @@ def _run_conversation_turn(
         or selected_topic_prepublication_capability_failure(agent)
     )
     if _topic_pre_admission_failure is not None:
-        _failure_reason, _failure_message = _topic_pre_admission_failure
-        return {
-            "final_response": None,
-            "last_reasoning": None,
-            "messages": list(conversation_history or []),
-            "api_calls": 0,
-            "completed": False,
-            "turn_exit_reason": _failure_reason,
-            "failed": True,
-            "partial": False,
-            "interrupted": False,
-            "response_transformed": False,
-            "pre_transform_response": None,
-            "response_previewed": False,
-            "model": agent.model,
-            "provider": agent.provider,
-            "base_url": agent.base_url,
-            "last_prompt_tokens": 0,
-            "service_tier": None,
-            "error": _failure_message,
-            "failure_reason": _failure_reason,
-            "pre_admission_failure": True,
-        }
+        return _topic_pre_admission_result(agent, conversation_history, _topic_pre_admission_failure)
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
@@ -1632,6 +1637,13 @@ def _run_conversation_turn(
             "failure_reason": TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
             "pre_admission_failure": True,
         }
+
+    # Turn context may dynamically refresh MCP/Bot Mode capabilities after the
+    # initial check. Validate that final surface before request assembly,
+    # provider hooks, tool execution, or continuation handling can observe it.
+    _post_admission_failure = selected_topic_prepublication_capability_failure(agent)
+    if _post_admission_failure is not None:
+        return _topic_pre_admission_result(agent, conversation_history, _post_admission_failure)
 
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not

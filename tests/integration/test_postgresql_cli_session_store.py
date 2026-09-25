@@ -1403,6 +1403,63 @@ def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(
     assert not (home / "state.db").exists()
 
 
+def test_selected_topic_transition_failure_cannot_replay_after_postgresql_reopen(pg_cli_home):
+    """A failed buffered turn leaves only accepted history after a real PG close/reopen."""
+    from hermes_cli.config import load_config
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    _write_topic_enabled_postgresql_config(home)
+    session_id = "pg-topic-reopen-quarantine"
+    accepted = "Steep the leaves.\nTOPIC: cooking"
+    rejected = "This candidate must not survive restart.\nTOPIC: secrets"
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        store = open_cli_session_store(load_config())
+        stores.append(store)
+        first = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        first.client = MagicMock()
+        first.client.chat.completions.create.return_value = _offline_text_response(accepted)
+        assert first.run_conversation("How do I brew tea?")["completed"] is True
+
+        failing = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        failing.client = MagicMock()
+        failing.client.chat.completions.create.return_value = _offline_text_response(rejected)
+        with patch.object(store, "activate_topic_for_messages", side_effect=RuntimeError("transition fault")):
+            failed = failing.run_conversation("Tell me a secret")
+        assert failed["failure_reason"] == "topic_segmentation_runtime_failed"
+        assert rejected not in repr(failed)
+
+        store.close()
+        reopened = open_cli_session_store(load_config())
+        stores.append(reopened)
+        restored = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=reopened,
+        )
+        restored.client = MagicMock()
+        restored.client.chat.completions.create.return_value = _offline_text_response("Fresh answer.\nTOPIC: cooking")
+        before = reopened.get_messages_as_conversation(session_id)
+        assert [row["content"] for row in before] == ["How do I brew tea?", accepted]
+        assert rejected not in repr(before)
+
+        assert restored.run_conversation("What water temperature?")["completed"] is True
+        request = restored.client.chat.completions.create.call_args.kwargs["messages"]
+        assert rejected not in repr(request)
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
 def test_public_topic_turn_rejects_stale_selected_postgresql_lease_before_mutation(pg_cli_home, monkeypatch):
     """The normal public facade rejects a held PG session before provider work or topic writes."""
     from hermes_cli.config import load_config

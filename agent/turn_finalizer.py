@@ -611,9 +611,15 @@ def finalize_turn(
                 agent._deferred_pre_final_response = None
                 agent._topic_segmentation_runtime_error = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
                 return
-        if final_response and not interrupted and not topic_segmentation_runtime_failed:
-            # Topic activation is the publication barrier. Only a successful
-            # transition may expose the assistant text to transform hooks.
+        # Non-topic turns preserve the historical transform-before-persist
+        # contract. Selected-topic turns defer it until their transition and
+        # final append have both succeeded.
+        if (
+            final_response
+            and not interrupted
+            and not topic_segmentation_runtime_failed
+            and not getattr(agent, "_topic_segmentation_enabled", False)
+        ):
             untransformed_response = final_response
             final_response, _, _ = apply_llm_output_transform(
                 agent, final_response, turn_id=turn_id, logger=logger,
@@ -629,6 +635,11 @@ def finalize_turn(
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
         try:
+            # The topic transition selects the only durable destination for the
+            # buffered turn.  Open the central persistence gate immediately
+            # before this final append; all earlier flush paths remain inert.
+            if getattr(agent, "_topic_segmentation_enabled", False) and not topic_segmentation_runtime_failed:
+                agent._topic_turn_publication_allowed = True
             persisted = agent._persist_session(messages, conversation_history)
         except Exception as exc:
             from agent.session_persistence import SessionPersistenceError
@@ -636,6 +647,7 @@ def finalize_turn(
                 raise
             persisted = False
         if persisted is False:
+            agent._topic_turn_publication_allowed = False
             persistence_failed = True
             failed = True
             completed = False

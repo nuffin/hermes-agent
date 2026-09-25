@@ -82,6 +82,37 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
     assert messages == [{"role": "user", "content": "hello"}]
 
 
+@pytest.mark.parametrize("tool_name", ("mcp_late_tool", "message_agent"))
+def test_selected_topic_post_context_tool_injection_is_refused_before_provider_or_sink(agent, monkeypatch, tool_name):
+    """The post-context admission check closes the late MCP/Bot Mode tool gap."""
+    import agent.conversation_loop as conversation_loop
+
+    agent._topic_segmentation_enabled = True
+    agent.tools = []
+    agent.valid_tool_names = set()
+    sink = MagicMock()
+    agent._session_db = sink
+
+    def inject_dynamic_tool(*_args, **_kwargs):
+        agent.tools = _make_tool_defs(tool_name)
+        agent.valid_tool_names = {tool_name}
+        return SimpleNamespace(
+            user_message="q", original_user_message="q", conversation_history=[], effective_task_id="task",
+            turn_id="turn", should_review_memory=False, plugin_user_context="", ext_prefetch_cache="",
+            messages=[{"role": "user", "content": "q"}], active_system_prompt="", current_turn_user_idx=0,
+            preflight_compression_blocked=False,
+        )
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", inject_dynamic_tool)
+    result = conversation_loop._run_conversation_turn(agent, "q", conversation_history=[])
+
+    assert result["pre_admission_failure"] is True
+    assert result["failure_reason"] == "topic_prepublication_capability_unsupported"
+    assert result["api_calls"] == 0
+    agent.client.chat.completions.create.assert_not_called()
+    assert sink.method_calls == []
+
+
 def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     """A note-added multimodal API payload stores the original clean content."""
     clean_content = [

@@ -138,7 +138,10 @@ def refresh_agent_mcp_tools(
         staged_engine_names=staged_engine_names, content_aware=content_aware, prefix_registered=prefix_registered)
     if added is None:
         return set()
-    persist_agent_tool_names(agent)  # re-pin so a rebuild after agent-cache eviction restores this order
+    # The selected-topic final admission gate runs after this dynamic refresh.
+    # Do not persist an unadmitted MCP capability snapshot.
+    if not getattr(agent, "_topic_segmentation_enabled", False):
+        persist_agent_tool_names(agent)  # re-pin so a rebuild after agent-cache eviction restores this order
     return added
 
 
@@ -241,7 +244,7 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
         with _agent_tools_lock:
             agent.tools = merged
             agent.valid_tool_names = merged_names
-    if not same_code or merged != list(pinned):
+    if (not same_code or merged != list(pinned)) and not getattr(agent, "_topic_segmentation_enabled", False):
         persist_agent_tool_names(agent)
     return changed
 

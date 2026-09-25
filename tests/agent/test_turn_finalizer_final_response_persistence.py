@@ -619,6 +619,39 @@ def test_selected_topic_append_false_discards_deferred_response_and_sinks(monkey
     assert agent.sync_calls == [] and agent.trajectory_calls == [] and agent.cleanup_calls == []
 
 
+def test_selected_topic_transform_runs_only_after_the_durable_append(monkeypatch):
+    """The transform hook cannot observe a rejected selected-topic candidate."""
+    class Store:
+        def get_topics(self, _session_id):
+            return []
+
+        def activate_topic_for_messages(self, *_args, **_kwargs):
+            return {"id": 1}
+
+    events = []
+    agent = _TopicTransitionFailureAgent()
+    object.__setattr__(agent, "_session_db", Store())
+
+    def persist(messages, conversation_history):
+        events.append(("append", [dict(message) for message in messages]))
+        agent.persisted_messages = [dict(message) for message in messages]
+
+    agent._persist_session = persist
+
+    def hooks(name, *_args, **kwargs):
+        if name == "transform_llm_output":
+            events.append(("transform", kwargs["response_text"]))
+            return ["transformed response"]
+        return []
+
+    monkeypatch.setattr("agent.turn_finalizer._invoke_hook_safely", hooks)
+    result = _finalize_topic_transition(agent)
+
+    assert [kind for kind, _value in events[:2]] == ["append", "transform"]
+    assert "private assistant tail" in events[0][1][-1]["content"]
+    assert result["final_response"] == "transformed response"
+
+
 def test_selected_topic_retraction_failure_is_indeterminate_not_quarantined(monkeypatch):
     """A failed exact-ID retraction blocks publication and records a retry address."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
