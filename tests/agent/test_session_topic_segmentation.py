@@ -387,3 +387,47 @@ def test_topic_runtime_errors_are_exact_and_identifier_free(operation):
     assert exc.__cause__ is None
     assert exc.__context__ is None
     assert session_id not in public and marker not in public
+
+
+def test_selected_topic_prepublication_capability_gate_rejects_memory_and_codex():
+    from agent.session_topics import (
+        TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
+        selected_topic_prepublication_capability_failure,
+    )
+
+    memory_tool_agent = SimpleNamespace(
+        _topic_segmentation_enabled=True,
+        api_mode="chat_completions",
+        _memory_manager=None,
+        _memory_store=object(),
+        _memory_enabled=True,
+        _user_profile_enabled=False,
+        tools=[{"type": "function", "function": {"name": "memory"}}],
+    )
+    codex_agent = SimpleNamespace(
+        _topic_segmentation_enabled=True,
+        api_mode="codex_app_server",
+        _memory_manager=None,
+        tools=[],
+    )
+    responses_agent = SimpleNamespace(
+        _topic_segmentation_enabled=True,
+        api_mode="codex_responses",
+        _memory_manager=None,
+        tools=[],
+    )
+    tool_agent = SimpleNamespace(
+        _topic_segmentation_enabled=True,
+        api_mode="chat_completions",
+        _memory_manager=None,
+        tools=[{"type": "function", "function": {"name": "terminal"}}],
+    )
+    memory_failure = selected_topic_prepublication_capability_failure(memory_tool_agent)
+    codex_failure = selected_topic_prepublication_capability_failure(codex_agent)
+    responses_failure = selected_topic_prepublication_capability_failure(responses_agent)
+    tool_failure = selected_topic_prepublication_capability_failure(tool_agent)
+    assert memory_failure is not None and memory_failure[0] == TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE
+    assert codex_failure is not None and codex_failure[0] == TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE
+    assert responses_failure is not None and responses_failure[0] == TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE
+    assert tool_failure is not None and tool_failure[0] == TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE
+    assert selected_topic_prepublication_capability_failure(SimpleNamespace(_topic_segmentation_enabled=False)) is None

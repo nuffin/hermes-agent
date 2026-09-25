@@ -116,6 +116,40 @@ def _relay_thinking(agent: Any, content: str) -> None:
             pass
 
 
+def _publish_response_intake(
+    agent: Any, response: Any, assistant_message: Any, finish_reason: Any, *, api_messages: Any,
+    api_call_count: Any, api_duration: Any, api_start_time: Any, api_request_id: Any,
+    effective_task_id: Any, turn_id: Any,
+) -> None:
+    """Deliver candidate-bearing intake sinks only after selected-topic admission."""
+    _fire_post_api_request_hook(
+        agent, response, assistant_message, finish_reason, api_messages=api_messages,
+        api_call_count=api_call_count, api_duration=api_duration, api_start_time=api_start_time,
+        api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
+    )
+    content = assistant_message.content
+    if content and not agent.quiet_mode:
+        if agent.verbose_logging:
+            agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content}")
+        else:
+            agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content[:100]}{'...' if len(content) > 100 else ''}")
+    if content and agent.tool_progress_callback:
+        _relay_thinking(agent, content)
+
+
+def release_deferred_response_intake(agent: Any) -> None:
+    """Release one admitted selected-topic candidate's response-facing callbacks."""
+    deferred = getattr(agent, "_deferred_response_intake", None)
+    agent._deferred_response_intake = None
+    if deferred is not None:
+        _publish_response_intake(agent, **deferred)
+
+
+def discard_deferred_response_intake(agent: Any) -> None:
+    """Forget a rejected selected-topic candidate without touching any sink."""
+    agent._deferred_response_intake = None
+
+
 def normalize_model_response(
     agent: Any, *, response: Any, messages: Any, api_messages: Any, conversation_history: Any,
     api_call_count: Any, api_duration: Any, api_start_time: Any, api_request_id: Any,
@@ -139,20 +173,19 @@ def normalize_model_response(
     # call/result rows before this turn's assistant message; no-op for ordinary providers.
     splice_provider_projection(agent, response, messages)
 
-    _fire_post_api_request_hook(
-        agent, response, assistant_message, finish_reason, api_messages=api_messages,
-        api_call_count=api_call_count, api_duration=api_duration, api_start_time=api_start_time,
-        api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
+    intake = dict(
+        response=response, assistant_message=assistant_message, finish_reason=finish_reason,
+        api_messages=api_messages, api_call_count=api_call_count, api_duration=api_duration,
+        api_start_time=api_start_time, api_request_id=api_request_id,
+        effective_task_id=effective_task_id, turn_id=turn_id,
     )
-
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        # First raw-response fan-out: retain only in process until finalizer has
+        # selected and durably appended the current turn.
+        agent._deferred_response_intake = intake
+    else:
+        _publish_response_intake(agent, **intake)
     content = assistant_message.content
-    if content and not agent.quiet_mode:
-        if agent.verbose_logging:
-            agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content}")
-        else:
-            agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content[:100]}{'...' if len(content) > 100 else ''}")
-    if content and agent.tool_progress_callback:
-        _relay_thinking(agent, content)
 
     # Incomplete <REASONING_SCRATCHPAD> (opened, never closed): the model ran out of
     # output tokens mid-reasoning — retry up to 2 times, then save as partial.

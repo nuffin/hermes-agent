@@ -153,24 +153,36 @@ def finish_text_response(
     # a continuation fragment can intentionally start with whitespace, and stripping it
     # before `_join_truncated_parts()` turns a natural word boundary into a newline.
     _pre_final_candidate = agent._strip_think_blocks(final_response).strip()
-    try:
-        from hermes_cli.plugins import get_pre_final_response_directive
-        _pre_final_attempt = int(getattr(agent, "_pre_final_response_nudges", 0) or 0)
-        _pre_final_action, _pre_final_payload = get_pre_final_response_directive(
-            session_id=getattr(agent, "session_id", "") or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            task_id=effective_task_id or "",
-            platform=getattr(agent, "platform", "") or "",
-            model=getattr(agent, "model", "") or "",
-            provider=getattr(agent, "provider", "") or "",
-            api_call_count=int(api_call_count or 0),
-            finish_reason=str(finish_reason or ""),
-            attempt=_pre_final_attempt,
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        # This plugin receives raw candidate text. Selected-topic turns notify it
+        # only after finalizer has selected and durably appended the full turn.
+        # Pre-publication directives cannot safely run in that mode.
+        agent._deferred_pre_final_response = dict(
             candidate_response=_pre_final_candidate,
+            effective_task_id=effective_task_id,
+            api_call_count=api_call_count,
+            finish_reason=finish_reason,
         )
-    except Exception:
-        _pre_final_action, _pre_final_payload = None, None
-        _pre_final_attempt = 0
+        _pre_final_action, _pre_final_payload, _pre_final_attempt = None, None, 0
+    else:
+        try:
+            from hermes_cli.plugins import get_pre_final_response_directive
+            _pre_final_attempt = int(getattr(agent, "_pre_final_response_nudges", 0) or 0)
+            _pre_final_action, _pre_final_payload = get_pre_final_response_directive(
+                session_id=getattr(agent, "session_id", "") or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                task_id=effective_task_id or "",
+                platform=getattr(agent, "platform", "") or "",
+                model=getattr(agent, "model", "") or "",
+                provider=getattr(agent, "provider", "") or "",
+                api_call_count=int(api_call_count or 0),
+                finish_reason=str(finish_reason or ""),
+                attempt=_pre_final_attempt,
+                candidate_response=_pre_final_candidate,
+            )
+        except Exception:
+            _pre_final_action, _pre_final_payload = None, None
+            _pre_final_attempt = 0
 
     if _pre_final_action == "continue":
         if _pre_final_attempt < _PRE_FINAL_RESPONSE_NUDGE_LIMIT:
@@ -408,7 +420,12 @@ def finish_text_response(
     # there, an interrupted turn keeps the raw text.
     from agent.turn_finalizer import apply_llm_output_transform
     _transformed = False
-    if not getattr(agent, "_interrupt_requested", False):
+    # Selected-topic turns defer this hook until the durable topic transition in
+    # finalize_turn succeeds; a rejected candidate must not reach plugin code.
+    if (
+        not getattr(agent, "_interrupt_requested", False)
+        and not getattr(agent, "_topic_segmentation_enabled", False)
+    ):
         final_response, _transformed, _ = apply_llm_output_transform(
             agent, final_response, turn_id=getattr(agent, "_current_turn_id", "") or "", logger=logger,
         )

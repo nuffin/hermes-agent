@@ -351,6 +351,10 @@ class StreamDeliveryMixin:
         if not getattr(self, "_defer_final_response_stream_delivery", False):
             return
         self._defer_final_response_stream_delivery = False
+        deferred_reasoning = list(getattr(self, "_deferred_reasoning_deltas", []) or [])
+        self._deferred_reasoning_deltas = []
+        for reasoning, inline in deferred_reasoning:
+            self._fire_reasoning_delta(reasoning, inline=inline)
         if not isinstance(text, str) or not text:
             return
         self._deliver_to_stream_callbacks(text)
@@ -359,6 +363,7 @@ class StreamDeliveryMixin:
     def _discard_deferred_final_response(self) -> None:
         """Drop a rejected candidate's pending user-visible stream delivery."""
         self._defer_final_response_stream_delivery = False
+        self._deferred_reasoning_deltas = []
 
     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.
@@ -371,6 +376,12 @@ class StreamDeliveryMixin:
             # Single-writer guard (#65991): fence out a superseded stream's reasoning deltas the same way as
             # content deltas.
             self._note_dropped_stream_writer("_fire_reasoning_delta")
+            return
+        if getattr(self, "_defer_final_response_stream_delivery", False):
+            self._deferred_reasoning_deltas = [
+                *(getattr(self, "_deferred_reasoning_deltas", []) or []),
+                (text, inline),
+            ]
             return
         self._call_quietly(self.reasoning_callback, text)
         # Resolve the opt-in once per stream, not per token: each lookup took _CONFIG_LOCK and

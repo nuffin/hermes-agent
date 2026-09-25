@@ -200,6 +200,10 @@ class TestRunConversationCodexPath:
 
     def test_projected_messages_are_synced_to_external_memory(self, fake_session):
         agent = _make_codex_agent()
+        # Ordinary non-topic Codex behavior remains unchanged; selected-topic
+        # Codex is rejected before this persistent-memory path.
+        setattr(agent, "_topic_segmentation_enabled", False)
+        setattr(agent, "_memory_provider_lifecycle_enabled", True)
         agent._memory_manager = MagicMock()
         agent._memory_manager.build_system_prompt.return_value = ""
 
@@ -812,3 +816,22 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+def test_selected_topic_codex_is_rejected_before_context_or_subprocess(monkeypatch):
+    agent = _make_codex_agent()
+    setattr(agent, "_topic_segmentation_enabled", True)
+    history = [{"role": "user", "content": "historical prompt"}]
+    codex_turn = MagicMock()
+    agent._run_codex_app_server_turn = codex_turn
+    build = MagicMock()
+    monkeypatch.setattr("agent.conversation_loop.build_turn_context", build)
+
+    result = agent.run_conversation("new prompt", conversation_history=history)
+
+    assert result["pre_admission_failure"] is True
+    assert result["failure_reason"] == "topic_prepublication_capability_unsupported"
+    assert result["messages"] == history
+    assert result["messages"] is not history
+    build.assert_not_called()
+    codex_turn.assert_not_called()

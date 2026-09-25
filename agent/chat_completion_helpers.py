@@ -2915,7 +2915,9 @@ class _StreamingCall(StreamingWaitMonitor):
         reasoning tags inside it must still reach the display: route through
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
-        if self.agent.stream_delta_callback:
+        if getattr(self.agent, "_defer_final_response_stream_delivery", False):
+            self.agent._fire_stream_delta(text)
+        elif self.agent.stream_delta_callback:
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:

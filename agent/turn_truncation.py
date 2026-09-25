@@ -229,6 +229,23 @@ class _Trunc(TruncationVerdict):
         the ``(failure_reason, retryable)`` verdict for the UI descriptor.
         """
         agent = self.agent
+        if getattr(agent, "_topic_segmentation_enabled", False):
+            # A truncated candidate has no complete topic signal and this path
+            # bypasses finalizer. Do not persist, return, or replay its content.
+            # Drop the whole current turn from the in-memory result as well.
+            start = getattr(agent, "_persist_user_message_idx", None)
+            if isinstance(start, int) and 0 <= start < len(self.messages):
+                del self.messages[start:]
+            discard = getattr(agent, "_discard_deferred_final_response", None)
+            if callable(discard):
+                discard()
+            from agent.turn_response_intake import discard_deferred_response_intake
+            discard_deferred_response_intake(agent)
+            return self.done("return", stamp_failure(partial_result(
+                self.messages, self.api_call_count,
+                "The selected-topic response could not be finalized safely.",
+                "selected-topic publication requires a complete response", failed=True,
+            ), "topic_segmentation_runtime_failed", False))
         if cleanup:
             agent._cleanup_task_resources(self.effective_task_id)
         agent._persist_session(self.messages, self.conversation_history)

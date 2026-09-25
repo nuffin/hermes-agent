@@ -112,6 +112,16 @@ def apply_stop_gates(
     holds. Hook lookups are imported lazily from their origin modules (tests patch them
     there)."""
 
+    # These gates call plugins or persist/emit an interim candidate before their
+    # continuation request. The selected-topic transition+append barrier comes
+    # later, so bypass the unsafe continuation paths entirely.
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        return StopGateVerdict(
+            continue_turn=False, final_response=final_response,
+            pending_verification_response=pending_verification_response,
+            pending_verification_response_previewed=pending_verification_response_previewed,
+        )
+
     def _continue(nudge: str, flag: str) -> StopGateVerdict:
         """Append the synthetic nudge row and hand the turn back to the loop."""
         append_message(messages, {"role": "user", "content": nudge, flag: True})

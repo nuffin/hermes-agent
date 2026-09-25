@@ -39,6 +39,71 @@ class TopicSegmentationRuntimeError(RuntimeError):
         super().__init__(TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE)
 
 
+TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE = "topic_prepublication_capability_unsupported"
+TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE = (
+    "This runtime cannot safely publish a selected-topic turn. Use a supported runtime or disable topic segmentation."
+)
+
+
+def selected_topic_prepublication_capability_failure(agent: Any) -> tuple[str, str] | None:
+    """Return a stable pre-admission refusal for paths that cannot defer publication."""
+    if not getattr(agent, "_topic_segmentation_enabled", False):
+        return None
+    if getattr(agent, "api_mode", None) in {"codex_app_server", "codex_responses"}:
+        return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+    # Tool calls (including provider-native calls) persist before execution and
+    # can publish commentary/results before topic activation. Selected-topic
+    # turns therefore support text-only runtimes until deferred execution exists.
+    if getattr(agent, "tools", None):
+        return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+    # Provider memory and the built-in writable memory tool can persist before
+    # final topic activation. There is no deferred execution contract for them.
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is not None:
+        try:
+            from agent.memory_manager import memory_provider_tools_exposed
+            if memory_provider_tools_exposed(agent):
+                return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+        except Exception:
+            # An uninspectable external memory surface is not safe to admit.
+            return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+    builtin_memory_writable = bool(
+        getattr(agent, "_memory_store", None) is not None
+        and (getattr(agent, "_memory_enabled", False) or getattr(agent, "_user_profile_enabled", False))
+    )
+    for tool in getattr(agent, "tools", None) or ():
+        if (
+            builtin_memory_writable
+            and isinstance(tool, dict)
+            and tool.get("function", {}).get("name") == "memory"
+        ):
+            return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+    return None
+
+
+def retry_pending_topic_retraction(agent: Any) -> tuple[str, str] | None:
+    """Retry only an exact prior failed-turn retraction before admitting another turn."""
+    pending = getattr(agent, "_pending_topic_retraction", None)
+    if not isinstance(pending, dict):
+        return None
+    ids = pending.get("message_ids")
+    db = getattr(agent, "_session_db", None)
+    retract = getattr(db, "retract_topic_turn_messages", None)
+    if not (isinstance(ids, list) and ids and callable(retract)):
+        return "topic_segmentation_retraction_indeterminate", "Topic segmentation cleanup must be retried before continuing."
+    try:
+        retracted = retract(
+            pending.get("session_id"), ids, turn_lease_holder=pending.get("turn_lease_holder"),
+        )
+    except Exception:
+        logger.warning("selected-topic retraction retry failed", exc_info=True)
+        return "topic_segmentation_retraction_indeterminate", "Topic segmentation cleanup must be retried before continuing."
+    if retracted != len(list(dict.fromkeys(ids))):
+        return "topic_segmentation_retraction_indeterminate", "Topic segmentation cleanup must be retried before continuing."
+    delattr(agent, "_pending_topic_retraction")
+    return None
+
+
 def _topic_runtime_failure(operation: str, exc: Exception | None = None) -> TopicSegmentationRuntimeError:
     """Classify a topic failure without retaining identifier-bearing exception text."""
     if exc is None:

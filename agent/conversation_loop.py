@@ -1531,6 +1531,39 @@ def _run_conversation_turn(
             user_message, persist_user_message
         )
 
+    from agent.session_topics import (
+        retry_pending_topic_retraction,
+        selected_topic_prepublication_capability_failure,
+    )
+    _topic_pre_admission_failure = (
+        retry_pending_topic_retraction(agent)
+        or selected_topic_prepublication_capability_failure(agent)
+    )
+    if _topic_pre_admission_failure is not None:
+        _failure_reason, _failure_message = _topic_pre_admission_failure
+        return {
+            "final_response": None,
+            "last_reasoning": None,
+            "messages": list(conversation_history or []),
+            "api_calls": 0,
+            "completed": False,
+            "turn_exit_reason": _failure_reason,
+            "failed": True,
+            "partial": False,
+            "interrupted": False,
+            "response_transformed": False,
+            "pre_transform_response": None,
+            "response_previewed": False,
+            "model": agent.model,
+            "provider": agent.provider,
+            "base_url": agent.base_url,
+            "last_prompt_tokens": 0,
+            "service_tier": None,
+            "error": _failure_message,
+            "failure_reason": _failure_reason,
+            "pre_admission_failure": True,
+        }
+
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
@@ -1597,6 +1630,7 @@ def _run_conversation_turn(
             "service_tier": None,
             "error": TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
             "failure_reason": TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+            "pre_admission_failure": True,
         }
 
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
@@ -1737,8 +1771,9 @@ def run_conversation(
             moa_config=moa_config,
             turn_author=turn_author,
         )
-    result = export_current_turn_boundary(agent, result, user_message)
-    _close_durable_failed_turn(agent, result)
+    if not result.get("pre_admission_failure"):
+        result = export_current_turn_boundary(agent, result, user_message)
+        _close_durable_failed_turn(agent, result)
     return result
 
 
@@ -1761,6 +1796,8 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
     """
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
+            return
+        if result.get("pre_admission_failure") or result.get("durable_quarantine_indeterminate"):
             return
         if (
             result.get("compression_exhausted") or result.get("compression_deferred")

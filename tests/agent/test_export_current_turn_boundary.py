@@ -116,3 +116,27 @@ def test_run_conversation_exports_the_pair_on_a_success_envelope(loop_agent):
     assert idx > 0  # the historical identical prompt at index 0 is never the export
     assert result["turn_id"] == loop_agent._current_turn_id
     assert result["messages"][-1]["content"] == "new answer"
+
+
+def test_pre_admission_topic_failure_bypasses_export_and_failed_turn_closer(monkeypatch):
+    from agent.conversation_loop import run_conversation
+
+    history = [{"role": "user", "content": "same prompt"}]
+    agent = SimpleNamespace()
+    envelope = {
+        "messages": list(history), "completed": False, "failed": True,
+        "pre_admission_failure": True, "failure_reason": "topic_segmentation_runtime_failed",
+    }
+    monkeypatch.setattr("agent.conversation_loop._run_conversation_turn", lambda *_a, **_kw: envelope)
+    monkeypatch.setattr(
+        "agent.turn_context.export_current_turn_boundary",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("must not export historical row")),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._close_durable_failed_turn",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("must not close historical row")),
+    )
+
+    result = run_conversation(agent, "same prompt", conversation_history=history)
+    assert result["messages"] == history
+    assert result["messages"] is not history

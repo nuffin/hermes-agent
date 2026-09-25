@@ -591,3 +591,115 @@ def test_hard_failure_exit_reasons_still_fail_the_turn(monkeypatch):
     result = _finalize(FakeAgent(), exit_reason="repeated_outer_errors(RuntimeError)", final_response="stopped")
     assert result["failed"] is True and result["completed"] is False
     assert result["failure_reason"] == "loop_error" and result["error"] == "stopped"
+
+
+def test_selected_topic_append_false_discards_deferred_response_and_sinks(monkeypatch):
+    """A false append result is a terminal publication failure, not a successful cleanup."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    class Store:
+        def get_topics(self, _session_id):
+            return []
+
+        def activate_topic_for_messages(self, *_args, **_kwargs):
+            return {"id": 1}
+
+    agent = _TopicTransitionFailureAgent()
+    agent._session_db = Store()
+    released = []
+    agent._release_deferred_final_response = released.append
+    agent._discard_deferred_final_response = lambda: released.append("discarded")
+    agent._persist_session = lambda *_args: False
+    result = _finalize_topic_transition(agent)
+
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["final_response"] is None
+    assert released == ["discarded"]
+    assert agent.sync_calls == [] and agent.trajectory_calls == [] and agent.cleanup_calls == []
+
+
+def test_selected_topic_retraction_failure_is_indeterminate_not_quarantined(monkeypatch):
+    """A failed exact-ID retraction blocks publication and records a retry address."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    class Store(_TopicTransitionFailureStore):
+        def retract_topic_turn_messages(self, *_args, **_kwargs):
+            raise RuntimeError("retraction unavailable")
+
+    agent = _TopicTransitionFailureAgent()
+    agent._session_db = Store()
+    released = []
+    agent._release_deferred_final_response = released.append
+    agent._discard_deferred_final_response = lambda: released.append("discarded")
+    result = finalize_turn(
+        agent, final_response="secret\nTOPIC: cooking", api_call_count=1, interrupted=False, failed=False,
+        messages=[{"role": "user", "content": "secret", "_row_id": 7},
+                  {"role": "assistant", "content": "secret\nTOPIC: cooking"}],
+        conversation_history=[], effective_task_id="task", turn_id="turn", user_message="secret",
+        original_user_message="secret", _should_review_memory=False, _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["final_response"] is None
+    assert result["failure_reason"] == "topic_segmentation_retraction_indeterminate"
+    assert result["durable_quarantine_indeterminate"] is True
+    assert released == ["discarded"]
+    assert agent._pending_topic_retraction["message_ids"] == [7]
+    assert agent.sync_calls == [] and agent.trajectory_calls == [] and agent.cleanup_calls == []
+
+
+def test_selected_topic_releases_candidate_callbacks_only_after_transition_and_append(monkeypatch):
+    """Response intake and pre-final observers are post-commit selected-topic sinks."""
+    class Store:
+        def get_topics(self, _session_id):
+            return []
+
+        def activate_topic_for_messages(self, *_args, **_kwargs):
+            return {"id": 1}
+
+    events = []
+    agent = _TopicTransitionFailureAgent()
+    agent._session_db = Store()
+    agent._deferred_response_intake = {"candidate": "private"}
+    agent._deferred_pre_final_response = {
+        "candidate_response": "private assistant tail\nTOPIC: cooking",
+        "effective_task_id": "task", "api_call_count": 1, "finish_reason": "stop",
+    }
+
+    def released(seen_agent):
+        assert seen_agent.persisted_messages is not None
+        events.append("post_api")
+        seen_agent._deferred_response_intake = None
+
+    def observed(**kwargs):
+        assert agent.persisted_messages is not None
+        assert kwargs["candidate_response"] == "private assistant tail\nTOPIC: cooking"
+        events.append("pre_final")
+        return None, None
+
+    monkeypatch.setattr("agent.turn_response_intake.release_deferred_response_intake", released)
+    monkeypatch.setattr("hermes_cli.plugins.get_pre_final_response_directive", observed)
+    result = _finalize_topic_transition(agent)
+
+    assert result["completed"] is True
+    assert events == ["post_api", "pre_final"]
+
+
+def test_selected_topic_failed_transition_never_releases_candidate_callbacks(monkeypatch):
+    agent = _TopicTransitionFailureAgent()
+    agent._deferred_response_intake = {"candidate": "private"}
+    agent._deferred_pre_final_response = {"candidate_response": "private"}
+    monkeypatch.setattr(
+        "agent.turn_response_intake.release_deferred_response_intake",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("candidate callback leaked")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_pre_final_response_directive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("pre-final leaked")),
+    )
+
+    result = _finalize_topic_transition(agent)
+
+    assert result["failed"] is True
+    assert agent._deferred_response_intake is None
+    assert agent._deferred_pre_final_response is None

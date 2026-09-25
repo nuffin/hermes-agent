@@ -326,6 +326,10 @@ def _db_flush_failed(agent, e: Exception, batch_rows: List[Dict[str, Any]], adop
     return False
 
 
+class SessionPersistenceError(RuntimeError):
+    """A required session append did not become durable."""
+
+
 class SessionPersistenceMixin:
     """Session DB flush and trajectory persistence (see module docstring)."""
 
@@ -363,11 +367,16 @@ class SessionPersistenceMixin:
             # the reason to record.
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
-            # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
+            persisted = self._flush_messages_to_session_db(messages, conversation_history)
+            if persisted is False:
+                if getattr(self, "_last_persistence_error_cause", None) is None:
+                    self._last_persistence_error_cause = "unknown"
+                raise SessionPersistenceError("session message append failed")
+            # Drain async token-accounting deltas only after the transcript append succeeded.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return True
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Pop empty-response retry scaffolding from the tail. The

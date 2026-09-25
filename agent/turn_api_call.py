@@ -203,9 +203,18 @@ def handle_api_interrupt(
             "api_content": _INTERRUPTED_PLACEHOLDER,
         })
         final_response = REPETITION_LOOP_INTERRUPTED
-    elif _partial:
+    elif _partial and not getattr(agent, "_topic_segmentation_enabled", False):
         append_message(messages, {"role": "assistant", "content": _partial})
         final_response = _partial
+    elif _partial:
+        # An interrupted selected-topic candidate was never classified. Drop it
+        # rather than append/replay/persist an unselected fragment.
+        discard = getattr(agent, "_discard_deferred_final_response", None)
+        if callable(discard):
+            discard()
+        from agent.turn_response_intake import discard_deferred_response_intake
+        discard_deferred_response_intake(agent)
+        final_response = "Interrupted before the selected-topic response could be finalized."
     else:
         final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
     agent._persist_session(messages, conversation_history)

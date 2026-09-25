@@ -530,13 +530,16 @@ def finalize_turn(
 
     _cleanup_errors: List[str] = []
     topic_segmentation_runtime_failed = False
+    topic_retraction_indeterminate = False
+    persistence_failed = False
     # Persist only after the transcript tail is shaped and scaffolding removed. Each
     # sub-step runs in the same order as the original inline block, and the
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
-        nonlocal final_response, failed, completed, _turn_exit_reason, topic_segmentation_runtime_failed
+        nonlocal final_response, failed, completed, _turn_exit_reason
+        nonlocal topic_segmentation_runtime_failed, topic_retraction_indeterminate, persistence_failed
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -573,12 +576,26 @@ def finalize_turn(
                     # exact durable id and active lease before their in-memory
                     # mirrors are quarantined. Never use a suffix/broad delete.
                     retract = getattr(getattr(agent, "_session_db", None), "retract_topic_turn_messages", None)
-                    if row_ids and callable(retract):
+                    unique_row_ids = list(dict.fromkeys(row_ids))
+                    retracted = False
+                    if unique_row_ids and callable(retract):
                         try:
-                            retract(agent.session_id, row_ids,
-                                    turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+                            retracted = retract(
+                                agent.session_id, unique_row_ids,
+                                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                            ) == len(unique_row_ids)
                         except Exception:
                             logger.warning("selected-topic turn retraction failed", exc_info=True)
+                    if unique_row_ids and not retracted:
+                        # Do not pretend the durable quarantine succeeded. Keep the exact
+                        # address for a later safe retry and refuse every publication sink.
+                        topic_retraction_indeterminate = True
+                        _turn_exit_reason = "topic_segmentation_retraction_indeterminate"
+                        agent._pending_topic_retraction = {
+                            "session_id": agent.session_id,
+                            "message_ids": unique_row_ids,
+                            "turn_lease_holder": getattr(agent, "_active_session_turn_lease_holder", None),
+                        }
                     del messages[start:]
                 else:
                     messages[:] = [
@@ -589,6 +606,9 @@ def finalize_turn(
                 discard = getattr(agent, "_discard_deferred_final_response", None)
                 if callable(discard):
                     discard()
+                from agent.turn_response_intake import discard_deferred_response_intake
+                discard_deferred_response_intake(agent)
+                agent._deferred_pre_final_response = None
                 agent._topic_segmentation_runtime_error = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
                 return
         if final_response and not interrupted and not topic_segmentation_runtime_failed:
@@ -608,7 +628,29 @@ def finalize_turn(
                     agent._db_flush_scan_prefix = None
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
-        agent._persist_session(messages, conversation_history)
+        try:
+            persisted = agent._persist_session(messages, conversation_history)
+        except Exception as exc:
+            from agent.session_persistence import SessionPersistenceError
+            if not isinstance(exc, SessionPersistenceError):
+                raise
+            persisted = False
+        if persisted is False:
+            persistence_failed = True
+            failed = True
+            completed = False
+            _turn_exit_reason = "session_persistence_failed"
+            final_response = None
+            start = getattr(agent, "_persist_user_message_idx", None)
+            if isinstance(start, int) and 0 <= start < len(messages):
+                del messages[start:]
+            discard = getattr(agent, "_discard_deferred_final_response", None)
+            if callable(discard):
+                discard()
+            from agent.turn_response_intake import discard_deferred_response_intake
+            discard_deferred_response_intake(agent)
+            agent._deferred_pre_final_response = None
+            return
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 
@@ -623,6 +665,31 @@ def finalize_turn(
         and not failed
         and not _cleanup_errors
     ):
+        # Candidate-bearing intake/plugin callbacks are released only after both
+        # the topic transition and append have succeeded. Their directives are
+        # observer-only for selected-topic turns (pre-commit directives would
+        # reintroduce an unsafe continuation path).
+        from agent.turn_response_intake import release_deferred_response_intake
+        release_deferred_response_intake(agent)
+        deferred_pre_final = getattr(agent, "_deferred_pre_final_response", None)
+        agent._deferred_pre_final_response = None
+        if deferred_pre_final is not None:
+            try:
+                from hermes_cli.plugins import get_pre_final_response_directive
+                get_pre_final_response_directive(
+                    session_id=getattr(agent, "session_id", "") or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    task_id=deferred_pre_final["effective_task_id"] or "",
+                    platform=getattr(agent, "platform", "") or "",
+                    model=getattr(agent, "model", "") or "",
+                    provider=getattr(agent, "provider", "") or "",
+                    api_call_count=int(deferred_pre_final["api_call_count"] or 0),
+                    finish_reason=str(deferred_pre_final["finish_reason"] or ""),
+                    attempt=0,
+                    candidate_response=deferred_pre_final["candidate_response"],
+                )
+            except Exception:
+                pass
         release = getattr(agent, "_release_deferred_final_response", None)
         if callable(release):
             release(final_response)
@@ -632,8 +699,14 @@ def finalize_turn(
                 agent, original_user_message, allow_selected_topic_publication=True,
             )
             agent._topic_memory_start_deferred = False
+    elif getattr(agent, "_topic_segmentation_enabled", False):
+        # Interrupted/failed selected-topic responses never cross any deferred
+        # callback boundary.
+        from agent.turn_response_intake import discard_deferred_response_intake
+        discard_deferred_response_intake(agent)
+        agent._deferred_pre_final_response = None
 
-    if not topic_segmentation_runtime_failed:
+    if not topic_segmentation_runtime_failed and not persistence_failed:
         # Do not publish post-turn auxiliary artifacts before a selected topic
         # store has accepted the transition. Successful and disabled-topic turns
         # keep their ordinary hooks, trajectory, and cleanup behavior.
@@ -659,9 +732,9 @@ def finalize_turn(
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
     # Response transforms apply only to real, uninterrupted responses.
-    if not topic_segmentation_runtime_failed and final_response and not interrupted:
+    if not topic_segmentation_runtime_failed and not persistence_failed and final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not topic_segmentation_runtime_failed and not interrupted:
+    if not topic_segmentation_runtime_failed and not persistence_failed and not interrupted:
         final_response = _explain_abnormal_exit(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
@@ -669,7 +742,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if not topic_segmentation_runtime_failed and final_response and not interrupted:
+    if not topic_segmentation_runtime_failed and not persistence_failed and final_response and not interrupted:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -678,7 +751,7 @@ def finalize_turn(
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.
-    if not topic_segmentation_runtime_failed:
+    if not topic_segmentation_runtime_failed and not persistence_failed:
         try:
             from agent.conversation_loop import _notify_context_engine_turn_complete
             _notify_context_engine_turn_complete(
@@ -749,6 +822,10 @@ def finalize_turn(
         )
         _cause = getattr(agent, "_last_persistence_error_cause", None)
         result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
+    elif failed and str(_turn_exit_reason) == "topic_segmentation_retraction_indeterminate":
+        result["error"] = "Topic segmentation failed and durable cleanup must be retried before continuing."
+        result["failure_reason"] = "topic_segmentation_retraction_indeterminate"
+        result["durable_quarantine_indeterminate"] = True
     elif failed and str(_turn_exit_reason) == "topic_segmentation_runtime_failed":
         from agent.session_topics import TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
         result["error"] = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
@@ -781,7 +858,7 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    if not topic_segmentation_runtime_failed:
+    if not topic_segmentation_runtime_failed and not persistence_failed:
         agent._sync_external_memory_for_turn(
             original_user_message=original_user_message, final_response=final_response,
             interrupted=interrupted, messages=messages,
