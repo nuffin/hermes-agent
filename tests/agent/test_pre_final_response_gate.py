@@ -45,8 +45,11 @@ def agent(tmp_path, monkeypatch):
     return instance
 
 
-def test_unsupported_candidate_is_never_interim_or_durable_before_safe_replacement(agent):
-    answers = iter([_response("I am working on the fix."), _response("I am still working on the fix.")])
+def test_unsupported_candidate_precedes_builtin_interim_paths(agent):
+    # This shape would otherwise enter the built-in stall continuation and emit
+    # an interim assistant row. The final-response gate must run first.
+    agent.valid_tool_names = {"read_file"}
+    answers = iter([_response("I will now run the read_file tool."), _response("I am still working on the fix.")])
     agent._interruptible_api_call = lambda _kwargs: next(answers)
     interim = []
     streamed = []
