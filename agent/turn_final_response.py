@@ -149,7 +149,10 @@ def finish_text_response(
     # built-in continuation path: several built-ins deliberately create interim
     # assistant rows, so they cannot be allowed to receive an unsupported claim.
     # The complete candidate is already stream-buffered when this hook exists.
-    final_response = agent._strip_think_blocks(final_response).strip()
+    # Keep ``final_response`` byte-preserving until the normal continuation join below:
+    # a continuation fragment can intentionally start with whitespace, and stripping it
+    # before `_join_truncated_parts()` turns a natural word boundary into a newline.
+    _pre_final_candidate = agent._strip_think_blocks(final_response).strip()
     try:
         from hermes_cli.plugins import get_pre_final_response_directive
         _pre_final_attempt = int(getattr(agent, "_pre_final_response_nudges", 0) or 0)
@@ -163,7 +166,7 @@ def finish_text_response(
             api_call_count=int(api_call_count or 0),
             finish_reason=str(finish_reason or ""),
             attempt=_pre_final_attempt,
-            candidate_response=final_response,
+            candidate_response=_pre_final_candidate,
         )
     except Exception:
         _pre_final_action, _pre_final_payload = None, None
