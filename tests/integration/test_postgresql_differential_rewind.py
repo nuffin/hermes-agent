@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 
+from agent.context_compressor import SUMMARY_PREFIX, _SUMMARY_END_MARKER
 from hermes_state import SessionDB
 from hermes_state_rewind import RewindIndeterminateError, RewindTargetUnavailableError, rewind_user_turn
 from state_store import MessageRecord, PostgreSQLStateStoreConfig
@@ -150,6 +151,44 @@ def test_rewind_receipt_visibility(backend):
         assert receipt is not None and receipt["retired_count"] == 2
     else:
         assert getattr(store, "get_rewind_receipt", None) is None
+
+
+def test_postgresql_composite_rewind_replaces_carrier_with_same_topic(
+    postgresql_test_target: OwnedPostgreSQLTestTarget,
+):
+    """The replacement handoff retains its carrier's same-session topic FK."""
+    sid = f"rewind-topic-carrier-{uuid.uuid4()}"
+    store = PostgreSQLStateStore(_SETTINGS, _DSN, schema=postgresql_test_target.schema)
+    try:
+        store.ensure_session(sid, source="test")
+        topic_id = store.create_topic(sid, "rewind topic")
+        carrier = (
+            f"{SUMMARY_PREFIX}\nsummary context\n\n{_SUMMARY_END_MARKER}\n\n"
+            "the surviving user request"
+        )
+        store.append_message_records(
+            sid,
+            [
+                MessageRecord(role="user", content=carrier, topic_id=topic_id),
+                MessageRecord(role="assistant", content="tail", topic_id=topic_id),
+            ],
+        )
+        outcome = rewind_user_turn(store, sid, -1, require_composite=True)
+        assert outcome.live_view["topic_id"] == topic_id
+        assert outcome.prefix[-1]["topic_id"] == topic_id
+        rows = store.get_message_records(sid)
+        assert len(rows) == 1
+        assert rows[0]["display_kind"] == "hidden"
+        assert rows[0]["topic_id"] == topic_id
+        with postgresql_test_target.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT active, topic_id FROM {store._schema}.messages "
+                "WHERE session_id=%s ORDER BY id",
+                (sid,),
+            )
+            assert cursor.fetchall() == [(False, topic_id), (False, topic_id), (True, topic_id)]
+    finally:
+        store.close()
 
 
 def test_rewind_error_class_hierarchy_is_backend_neutral():
