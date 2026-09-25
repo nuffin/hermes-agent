@@ -261,6 +261,12 @@ def finish_text_response(
         _continuation_kind = "ack"
     else:
         _continuation_kind = None
+    # A selected-topic candidate cannot be made interim or fed back through a
+    # second request before it has been classified and accepted durably.  Take
+    # the terminal finalization route instead; truncation has its own safe
+    # terminal path.
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        _continuation_kind = None
     if _continuation_kind:
         if _continuation_kind == "stall":
             logger.info(
@@ -343,6 +349,7 @@ def finish_text_response(
         finish_reason == "tool_calls"
         and not assistant_message.tool_calls
         and getattr(agent, "_dropped_toolcall_retries", 0) < 3
+        and not getattr(agent, "_topic_segmentation_enabled", False)
     ):
         agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
         logger.warning(

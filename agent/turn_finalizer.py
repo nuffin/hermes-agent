@@ -563,6 +563,8 @@ def finalize_turn(
     _rollback_interrupted_preflight_display(agent, interrupted)
 
     _cleanup_errors: List[str] = []
+    topic_segmentation_runtime_failed = False
+    topic_retraction_indeterminate = False
     # The model has answered (or the loop gave up): a title upgrade held back because it shares a
     # self-hosted endpoint with the main request (#117296) may go out now.
     from agent.turn_context import start_deferred_title_upgrade
@@ -583,23 +585,96 @@ def finalize_turn(
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, failed, completed, _turn_exit_reason
+        nonlocal topic_segmentation_runtime_failed, topic_retraction_indeterminate
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
         )
-        # Recovery paths (stream-recovered / prior-turn text) reach here with a response no
-        # earlier seam transformed; the normal text turn already did this before its flush and
-        # gets the recorded outcome back. Either way the tail close below writes the text the
-        # user will see, never the raw model text (#44239).
-        if final_response and not interrupted:
-            final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if final_response and not interrupted and not failed:
             from agent.session_topics import process_turn_topic
-            process_turn_topic(agent, messages, final_response)
+            try:
+                process_turn_topic(agent, messages, final_response)
+            except Exception as exc:
+                from agent.session_topics import (
+                    TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+                    TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+                    TopicSegmentationRuntimeError,
+                )
+                if not isinstance(exc, TopicSegmentationRuntimeError):
+                    raise
+                failed = True
+                completed = False
+                topic_segmentation_runtime_failed = True
+                _turn_exit_reason = TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE
+                # A selected-store topic transition is the publication boundary:
+                # discard the current in-memory turn and return only a stable
+                # failure envelope.  No unsegmented assistant text may reach a
+                # non-PG persistence, observation, memory, review, or hook sink.
+                start = getattr(agent, "_persist_user_message_idx", None)
+                if isinstance(start, int) and 0 <= start < len(messages):
+                    row_ids = [
+                        row["_row_id"] for row in messages[start:]
+                        if isinstance(row, dict) and isinstance(row.get("_row_id"), int)
+                        and row["_row_id"] > 0
+                    ]
+                    # Crash-persisted current-turn rows must be retired by
+                    # exact durable id and active lease before their in-memory
+                    # mirrors are quarantined. Never use a suffix/broad delete.
+                    retract = getattr(getattr(agent, "_session_db", None), "retract_topic_turn_messages", None)
+                    unique_row_ids = list(dict.fromkeys(row_ids))
+                    retracted = False
+                    if unique_row_ids and callable(retract):
+                        try:
+                            retracted = retract(
+                                agent.session_id, unique_row_ids,
+                                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                            ) == len(unique_row_ids)
+                        except Exception:
+                            logger.warning("selected-topic turn retraction failed", exc_info=True)
+                    if unique_row_ids and not retracted:
+                        # Do not pretend the durable quarantine succeeded. Keep the exact
+                        # address for a later safe retry and refuse every publication sink.
+                        topic_retraction_indeterminate = True
+                        _turn_exit_reason = "topic_segmentation_retraction_indeterminate"
+                        agent._pending_topic_retraction = {
+                            "session_id": agent.session_id,
+                            "message_ids": unique_row_ids,
+                            "turn_lease_holder": getattr(agent, "_active_session_turn_lease_holder", None),
+                        }
+                    del messages[start:]
+                else:
+                    messages[:] = [
+                        message for message in messages
+                        if not (isinstance(message, dict) and message.get("role") == "assistant")
+                    ]
+                final_response = None
+                discard = getattr(agent, "_discard_deferred_final_response", None)
+                if callable(discard):
+                    discard()
+                agent._deferred_pre_final_response = None
+                agent._topic_segmentation_runtime_error = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+                return
+        # Non-topic turns preserve the historical transform-before-persist
+        # contract. Selected-topic turns defer it until their transition and
+        # final append have both succeeded.
+        if (
+            final_response
+            and not interrupted
+            and not topic_segmentation_runtime_failed
+            and not getattr(agent, "_topic_segmentation_enabled", False)
+        ):
+            final_response, _, _ = apply_llm_output_transform(
+                agent, final_response, turn_id=turn_id, logger=logger,
+            )
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
+        # The topic transition selects the only durable destination for the
+        # buffered turn.  Open the central persistence gate immediately
+        # before this final append; all earlier flush paths remain inert.
+        if getattr(agent, "_topic_segmentation_enabled", False) and not topic_segmentation_runtime_failed:
+            agent._topic_turn_publication_allowed = True
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
@@ -682,8 +757,9 @@ def finalize_turn(
         "service_tier": (
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
-        "session_id": agent.session_id,
     }
+    if not topic_segmentation_runtime_failed:
+        result["session_id"] = agent.session_id
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway
@@ -700,6 +776,14 @@ def finalize_turn(
         )
         _cause = getattr(agent, "_last_persistence_error_cause", None)
         result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
+    elif failed and str(_turn_exit_reason) == "topic_segmentation_retraction_indeterminate":
+        result["error"] = "Topic segmentation failed and durable cleanup must be retried before continuing."
+        result["failure_reason"] = "topic_segmentation_retraction_indeterminate"
+        result["durable_quarantine_indeterminate"] = True
+    elif failed and str(_turn_exit_reason) == "topic_segmentation_runtime_failed":
+        from agent.session_topics import TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+        result["error"] = TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+        result["failure_reason"] = "topic_segmentation_runtime_failed"
     elif _exit_failure is not None:
         if failed:
             result["error"] = final_response or str(_turn_exit_reason)

@@ -193,11 +193,6 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
     role = msg.get("role", "unknown")
     content = msg.get("content")
-    topic_id = getattr(agent, "_active_topic_id", None)
-    if topic_id is None and role == "user":
-        topic_id = agent._auto_create_first_topic(content if isinstance(content, str) else "")
-    if role == "assistant" and isinstance(content, str):
-        content = agent._process_topic_signals(content)
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
@@ -243,6 +238,17 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
     batch_msgs: List[Dict] = []
     for msg_idx in range(_db_flush_scan_start(agent, messages), len(messages)):
         msg = messages[msg_idx]
+        # Selected-topic turns retain every current-turn row in process until the
+        # finalizer has classified the completed response and explicitly opened
+        # the publication gate.  This is a defense in depth for all mid-turn
+        # persistence callers, not just the turn-start flush.
+        if (
+            getattr(agent, "_topic_segmentation_enabled", False)
+            and not getattr(agent, "_topic_turn_publication_allowed", False)
+            and isinstance(ov_idx, int)
+            and msg_idx >= ov_idx
+        ):
+            continue
         # Append-only flush: a mid-turn persist of scaffolding would commit a synthetic turn the end-of-turn
         # drop cannot un-write. Skip regardless of position.
         if not isinstance(msg, dict) or _is_ephemeral_scaffolding(msg) or msg.get(_DB_PERSISTED_MARKER):
@@ -370,7 +376,6 @@ class SessionPersistenceMixin:
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
-        self._ensure_topic_for_session()
         with _persist_lock(self):
             # Only the scaffolding goes here. Closing a tool tail this uncovers is the exit
             # owner's job (``_close_transcript_tail``, ``abort_turn_on_interrupt``): only it knows

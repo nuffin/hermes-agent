@@ -511,6 +511,17 @@ def recover_from_truncation(
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
         return st.end_turn(user_response, error)
 
+    # A partial selected-topic candidate is not a classifiable/public turn.
+    # Do not seed continuation fragments or nudges that could reach a later
+    # request or durable replay; ``end_turn`` drops the buffered current turn.
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        return st.end_turn(
+            "The selected-topic response could not be finalized safely.",
+            "selected-topic publication requires a complete response",
+            failed=True,
+            failure=("topic_segmentation_runtime_failed", False),
+        )
+
     if agent.api_mode in _CONTINUABLE_MODES:
         cf = _content_filter_fallback(st, _retry)
         if cf is not None:

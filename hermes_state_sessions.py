@@ -1596,7 +1596,7 @@ class SessionSessionsMixin:
         def _do(conn):
             cursor = conn.execute(
                 """
-                SELECT 1 FROM sessions
+                DELETE FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (

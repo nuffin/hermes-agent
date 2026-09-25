@@ -1273,6 +1273,7 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
             api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
             quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
         )
+        assert agent._topic_segmentation_enabled is True
         assert agent._session_db is store
 
         def complete(**kwargs):
@@ -1297,8 +1298,8 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
             patch.object(conversation_loop, "build_turn_context", traced_build_context),
             patch.object(conversation_loop, "finalize_turn", traced_finalize),
             patch.object(store, "acquire_session_turn_lease", wraps=store.acquire_session_turn_lease) as acquire_lease,
-            patch.object(store, "create_topic", wraps=store.create_topic) as create_topic,
-            patch.object(store, "set_active_topic", wraps=store.set_active_topic) as set_active_topic,
+            patch.object(store, "ensure_session_topic", wraps=store.ensure_session_topic) as ensure_topic,
+            patch.object(store, "activate_topic_for_messages", wraps=store.activate_topic_for_messages) as activate_topic,
         ):
             first = agent.run_conversation("How do I brew tea?")
             second = agent.run_conversation("How do I recover a rebase?")
@@ -1306,35 +1307,27 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
         assert first["completed"] is True and second["completed"] is True
         assert len(build_context_calls) == 2
         assert len(finalize_calls) == 2
-        assert acquire_lease.call_count >= 1  # durable session exists from turn 2 on
-        # Always-on inline runtime: the first user row auto-creates the initial
-        # topic (_auto_create_first_topic); each TOPIC: tail signal then switches
-        # through create_topic + set_active_topic (_create_topic_from_shift).
-        assert create_topic.call_count == 3
-        assert set_active_topic.call_count == 2
+        assert acquire_lease.call_count >= 1
+        assert ensure_topic.call_count == 2
+        assert activate_topic.call_count == 2
+        assert any(call.kwargs["turn_lease_holder"] for call in activate_topic.call_args_list)
+        assert any("[SESSION TOPICS" in str(message) for batch in api_messages for message in batch)
 
         topics = {topic["title"]: topic for topic in store.get_topics(session_id)}
         cooking, git = topics["cooking"], topics["git"]
         assert git["state"] == "active"
-        # Always-on inline layout: the first turn lands in the bootstrapped
-        # topic; each TOPIC: tail signal creates the topic that owns the NEXT
-        # turn's rows (_create_topic_from_shift runs after the tail row is
-        # tagged), so the final signal leaves an empty active topic.
-        initial = topics["new session"]
-        assert initial["state"] == "warm" and cooking["state"] == "warm"
-        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=initial["id"])] == [
-            "How do I brew tea?", "Steep the leaves.",
-        ]
         assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=cooking["id"])] == [
-            "How do I recover a rebase?", "Rebase, resolve, then continue.",
+            "How do I brew tea?", "Steep the leaves.\nTOPIC: cooking",
         ]
-        assert store.get_messages_as_conversation(session_id, topic_id=git["id"]) == []
+        assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=git["id"])] == [
+            "How do I recover a rebase?", "Rebase, resolve, then continue.\nTOPIC: git",
+        ]
         records = store._store.get_message_records(session_id)
         rows_by_content = {row["content"]: row for row in records}
-        assert rows_by_content["How do I brew tea?"]["topic_id"] == initial["id"]
-        assert rows_by_content["Steep the leaves."]["topic_id"] == initial["id"]
-        assert rows_by_content["How do I recover a rebase?"]["topic_id"] == cooking["id"]
-        assert rows_by_content["Rebase, resolve, then continue."]["topic_id"] == cooking["id"]
+        assert rows_by_content["How do I brew tea?"]["topic_id"] == cooking["id"]
+        assert rows_by_content["Steep the leaves.\nTOPIC: cooking"]["topic_id"] == cooking["id"]
+        assert rows_by_content["How do I recover a rebase?"]["topic_id"] == git["id"]
+        assert rows_by_content["Rebase, resolve, then continue.\nTOPIC: git"]["topic_id"] == git["id"]
 
         store.close()
         reopened = open_cli_session_store(load_config())
@@ -1343,19 +1336,17 @@ def test_public_topic_enabled_agent_turn_uses_selected_postgresql_end_to_end(pg_
             api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
             quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=reopened,
         )
-        # _active_topic_id is lazy in the always-on runtime: a fresh agent adopts
-        # the durable active topic on its first turn, so assert the durable state.
-        active = reopened.get_active_topic(session_id)
-        assert active is not None and active["id"] == git["id"]
-        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=cooking["id"])] == [
-            "How do I recover a rebase?", "Rebase, resolve, then continue.",
+        assert restored._topic_segmentation_enabled is True
+        assert restored._active_topic_id == git["id"]
+        assert [row["content"] for row in reopened.get_messages_as_conversation(session_id, topic_id=git["id"])] == [
+            "How do I recover a rebase?", "Rebase, resolve, then continue.\nTOPIC: git",
         ]
     assert opens == []
     assert not (home / "state.db").exists()
 
 
 def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(pg_cli_home):
-    """A selected-store topic-fault seam is isolated: the inline runtime stays fail-open."""
+    """A deterministic provider seam proves the selected-store failure boundary."""
     import agent.conversation_loop as conversation_loop
     from hermes_cli.config import load_config
     from run_agent import AIAgent
@@ -1384,22 +1375,81 @@ def test_public_topic_turn_fails_closed_on_selected_postgresql_transition_error(
         def traced_finalize(*args, **kwargs):
             finalize_calls.append((args, kwargs))
             return original_finalize(*args, **kwargs)
-        # The inline runtime's selected-store fault boundary: a broken topic
-        # facade must not corrupt the durable transcript contract (fail-open,
-        # answer durable) — the fail-closed boundary is the lease gate above.
         with (
             patch.object(conversation_loop, "finalize_turn", traced_finalize),
-            patch.object(store, "get_topics", side_effect=RuntimeError("selected store fault")),
+            patch.object(store, "activate_topic_for_messages", side_effect=RuntimeError("selected store fault")),
         ):
             result = agent.run_conversation("How do I brew tea?")
 
         assert len(finalize_calls) == 1
-        assert result["completed"] is True and result["failed"] is False
-        # Fail-open inline classification: the signal is stripped and the answer
-        # is durable despite the topic-facade fault (no quarantine in this lineage).
-        persisted = [row["content"] for row in store.get_messages_as_conversation(session_id)]
-        assert "This tail must not persist." in persisted
-        assert all("TOPIC:" not in row for row in persisted)
+        assert result["completed"] is False and result["failed"] is True
+        from agent.session_topics import TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+
+        assert result["failure_reason"] == "topic_segmentation_runtime_failed"
+        assert result["error"] == TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+        assert result["final_response"] is None
+        assert answer not in repr(result)
+        assert answer not in [row["content"] for row in store.get_messages_as_conversation(session_id)]
+        topics = store.get_topics(session_id)
+        assert len(topics) == 1 and topics[0]["state"] == "active"
+        assert topics[0]["title"] != "cooking"
+    assert opens == []
+    assert not (home / "state.db").exists()
+
+
+def test_selected_topic_transition_failure_cannot_replay_after_postgresql_reopen(pg_cli_home):
+    """A failed buffered turn leaves only accepted history after a real PG close/reopen."""
+    from hermes_cli.config import load_config
+    from run_agent import AIAgent
+
+    home, stores = pg_cli_home
+    _write_topic_enabled_postgresql_config(home)
+    session_id = "pg-topic-reopen-quarantine"
+    accepted = "Steep the leaves.\nTOPIC: cooking"
+    rejected = "This candidate must not survive restart.\nTOPIC: secrets"
+    with (
+        trap_state_db_opens(home) as opens,
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        store = open_cli_session_store(load_config())
+        stores.append(store)
+        first = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        first.client = MagicMock()
+        first.client.chat.completions.create.return_value = _offline_text_response(accepted)
+        assert first.run_conversation("How do I brew tea?")["completed"] is True
+
+        failing = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=store,
+        )
+        failing.client = MagicMock()
+        failing.client.chat.completions.create.return_value = _offline_text_response(rejected)
+        with patch.object(store, "activate_topic_for_messages", side_effect=RuntimeError("transition fault")):
+            failed = failing.run_conversation("Tell me a secret")
+        assert failed["failure_reason"] == "topic_segmentation_runtime_failed"
+        assert rejected not in repr(failed)
+
+        store.close()
+        reopened = open_cli_session_store(load_config())
+        stores.append(reopened)
+        restored = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1/offline", model="oracle/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, session_id=session_id, session_db=reopened,
+        )
+        restored.client = MagicMock()
+        restored.client.chat.completions.create.return_value = _offline_text_response("Fresh answer.\nTOPIC: cooking")
+        before = reopened.get_messages_as_conversation(session_id)
+        assert [row["content"] for row in before] == ["How do I brew tea?", accepted]
+        assert rejected not in repr(before)
+
+        assert restored.run_conversation("What water temperature?")["completed"] is True
+        request = restored.client.chat.completions.create.call_args.kwargs["messages"]
+        assert rejected not in repr(request)
     assert opens == []
     assert not (home / "state.db").exists()
 
