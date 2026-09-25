@@ -57,7 +57,7 @@ The PostgreSQL session/message slice has one schema-evolution authority: a progr
 
 Migration is offline and single-authority: quiesce the selected SQLite profile/root writer, capture a consistent SQLite backup including WAL, import canonical rows in FK order, restore sequence high-water marks, rebuild derived indexes, verify counts/invariants/search, and only then select PostgreSQL. No dual write is permitted.
 
-Pre-write rollback switches back only after preserving the PostgreSQL candidate. After PostgreSQL has accepted writes, rollback requires a verified reverse export or restore of a PostgreSQL backup to a separately selected SQLite candidate; changing config alone is prohibited because it would lose post-cutover writes. Existing live databases are out of scope for this branch run.
+Pre-write rollback switches back only after preserving the PostgreSQL candidate. After PostgreSQL has accepted writes, there is no verified PostgreSQL→SQLite candidate or supported data-preserving reverse rollback today; configuration-only fallback is prohibited because it loses PostgreSQL-era writes. Native PostgreSQL backup/restore is retention and recovery, not a reverse SQLite migration. Existing live databases are out of scope for this branch run.
 
 ## DeliveryLedger PostgreSQL adapter (task 3b9561)
 
