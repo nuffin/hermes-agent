@@ -82,10 +82,12 @@ def _rewind_user_turn_impl(
     from agent.context_compressor import (
         _DB_PERSISTED_MARKER, history_before_user_originated_turn, retryable_user_text,
         split_user_originated_turn, user_originated_turn_view)
+    from agent.agent_runtime_helpers import repair_message_sequence
     from agent.message_content import flatten_message_text
     from agent.session_persistence import _is_ephemeral_scaffolding
 
     expected_active_ids = self.get_active_message_ids(session_id)
+    # Keep raw durable identities/content for the destructive mutation fence.
     stored = self.get_messages_as_conversation(session_id, include_row_ids=True)
     # Live replay (the pre-request repair, a resume) merges a stored ``user;user`` pair — an ask whose turn
     # ended with no reply, then the next ask — into ONE turn while both rows stay stored. Address turns on
@@ -106,7 +108,8 @@ def _rewind_user_turn_impl(
 
     prefix = durable_prefix
     if warm_history is not None:
-        warm = [m for m in warm_history if not _is_ephemeral_scaffolding(m)]
+        warm = [dict(m) for m in warm_history if not _is_ephemeral_scaffolding(m)]
+        repair_message_sequence(None, warm)
         warm_user = _user_indices(warm)
         if len(warm_user) != len(durable_user):
             raise RuntimeError(_HISTORY_CHANGED)
@@ -129,6 +132,12 @@ def _rewind_user_turn_impl(
     request_id = request_id or uuid4().hex
     try:
         receipt_capable = callable(getattr(self, "get_rewind_receipt", None))
+        raw_target = next((message for message in durable if message.get("_row_id") == target_row_id), None)
+        if raw_target is None:
+            raise RuntimeError("rewind target has no durable source row")
+        _, raw_live_view = split_user_originated_turn(raw_target)
+        if raw_live_view is None:
+            raise RuntimeError("rewind target is not a durable user turn")
         mutation_kwargs = {
             "preserve_compaction_handoff": scaffold is not None,
             "expected_active_ids": expected_active_ids,
