@@ -173,13 +173,15 @@ def test_warm_only_topics_fail_closed_in_runtime_semantic_validation_and_doctor(
 
 
 def _assert_topic_operation_blocks_on_session_lock(postgresql_test_target, store, session_id, operation):
-    """Hold the real parent lock until the public contender is visibly pending."""
+    """Prove the public contender is waiting on this exact row-lock query."""
     started, completed = Event(), Event()
+    application_name = f"topic-row-lock-{uuid.uuid4().hex}"
+    contender_dsn = f"{postgresql_test_target.dsn}?application_name={application_name}"
 
     def contend():
         contender = PostgreSQLStateStore(
             PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=1),
-            postgresql_test_target.dsn, schema=postgresql_test_target.schema,
+            contender_dsn, schema=postgresql_test_target.schema,
         )
         try:
             started.set()
@@ -194,10 +196,27 @@ def _assert_topic_operation_blocks_on_session_lock(postgresql_test_target, store
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(contend)
             assert started.wait(timeout=2)
-            # The contender has entered the public method but cannot pass its
-            # first SELECT ... FOR UPDATE while this independent transaction owns
-            # the parent session row.
-            assert not completed.wait(timeout=0.3)
+            deadline = time.monotonic() + 2
+            blocked = False
+            while time.monotonic() < deadline:
+                cursor.execute(
+                    "SELECT state, wait_event_type, query FROM pg_stat_activity "
+                    "WHERE application_name=%s AND datname=current_database()",
+                    (application_name,),
+                )
+                row = cursor.fetchone()
+                if (
+                    row is not None
+                    and row[0] == "active"
+                    and row[1] == "Lock"
+                    and "sessions" in row[2]
+                    and "FOR UPDATE" in row[2]
+                ):
+                    blocked = True
+                    break
+                assert not completed.wait(timeout=0.05)
+            assert blocked, "contender never reached the session SELECT ... FOR UPDATE lock"
+            assert not completed.is_set()
             holder.commit()
             return future.result(timeout=5)
 

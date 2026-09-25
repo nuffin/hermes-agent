@@ -1262,7 +1262,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             values = (child_session_id, source or parent["source"], now, model or parent["model"], self._psycopg.types.json.Jsonb(model_config) if model_config else parent["model_config"], prompt_hash, parent_session_id, cwd or parent["cwd"], parent["git_branch"], parent["git_repo_root"], profile_name or parent["profile_name"], parent["user_id"], parent["session_key"], parent["chat_id"], parent["chat_type"], parent["thread_id"], parent["display_name"], parent["origin_json"], parent["title"], parent["title_source"], parent["hidden"], parent["archived"], parent["pinned"], now)
             cursor.execute(f"INSERT INTO {self._schema}.sessions ({', '.join(columns)}) VALUES ({', '.join('%s' for _ in columns)})", values)
             for message in messages:
-                record = MessageRecord(**{name: message[name] for name in record_fields if name in message})
+                record_values = {
+                    name: message[name] for name in record_fields if name in message
+                }
+                # Child sessions cannot reference a parent-scoped topic through
+                # the composite FK; lineage publication deliberately clears it.
+                record_values["topic_id"] = None
+                record = MessageRecord(**record_values)
                 cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(22))})", self._record_params(child_session_id, record))
             if watermark is not None:
                 upper = int(watermark_ceiling) if watermark_ceiling is not None else 9223372036854775807
@@ -1585,7 +1591,7 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
             "finish_reason, reasoning, reasoning_content, reasoning_details, "
             "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
-            "_compressed_summary, created_at AS timestamp, api_content, display_kind, display_metadata"
+            "_compressed_summary, created_at AS timestamp, api_content, display_kind, display_metadata, topic_id"
         )
         active_clause = "" if include_inactive else " AND active"
         with self._connection() as connection, connection.cursor(row_factory=self._psycopg.rows.dict_row) as cursor:
@@ -1607,7 +1613,10 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
                 if metadata is not None:
                     msg["display_metadata"] = metadata
             msg.update(
-                (column, row[column]) for column in ("timestamp", "tool_call_id", "tool_name", "effect_disposition") if row[column])
+                (column, row[column])
+                for column in ("timestamp", "tool_call_id", "tool_name", "effect_disposition", "topic_id")
+                if row[column] is not None
+            )
             if row["tool_calls"]:
                 tool_calls = self._record_json(row["tool_calls"])
                 msg["tool_calls"] = tool_calls if isinstance(tool_calls, list) else []
@@ -1829,7 +1838,13 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
             if preserve_compaction_handoff:
                 if handoff is None:  # guarded above; keeps the transactional path type-safe.
                     raise ValueError("preserve_compaction_handoff requires an active composite carrier")
-                record = MessageRecord(**{name: handoff[name] for name in MessageRecord.__dataclass_fields__ if name in handoff})
+                record_values = {
+                    name: handoff[name]
+                    for name in MessageRecord.__dataclass_fields__
+                    if name in handoff
+                }
+                record_values["topic_id"] = target["topic_id"]
+                record = MessageRecord(**record_values)
                 cursor.execute(f"INSERT INTO {self._schema}.messages (session_id, role, content, created_at, {', '.join(_MESSAGE_RECORD_WRITE_COLUMNS)}) VALUES ({', '.join('%s' for _ in range(22))}) RETURNING id", self._record_params(session_id, record))
                 inserted = cursor.fetchone()
                 replacement_id = int(inserted["id"] if isinstance(inserted, Mapping) else inserted[0])
