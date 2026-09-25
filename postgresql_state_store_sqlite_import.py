@@ -1053,10 +1053,17 @@ class SQLitePostgreSQLSandboxImporter:
             "id", "session_id", "title", "summary", "state", "message_count", "created_at", "last_active_at",
         )
         for row in self._rows(source, "session_topics"):
+            active_count = int(source.execute(
+                'SELECT count(*) FROM "messages" WHERE topic_id=? AND active=1', (row["id"],)
+            ).fetchone()[0])
             cursor.execute(
-                f"INSERT INTO {qschema}.session_topics ({', '.join(topic_columns)}) OVERRIDING SYSTEM VALUE VALUES ({', '.join(['%s'] * len(topic_columns))})",
-                [row[column] for column in topic_columns],
+                f"INSERT INTO {qschema}.session_topics ({', '.join(topic_columns)}) "
+                f"OVERRIDING SYSTEM VALUE VALUES ({', '.join(['%s'] * len(topic_columns))})",
+                [row["id"], row["session_id"], row["title"], row["summary"], row["state"], active_count,
+                 row["created_at"], row["last_active_at"]],
             )
+        if fail_after == "session_topics":
+            raise RuntimeError("injected interruption")
         message_columns = (
             "id",
             "session_id",
@@ -1166,7 +1173,8 @@ class SQLitePostgreSQLSandboxImporter:
         )
         topic_sequence = cursor.fetchone()[0]
         cursor.execute(
-            f"SELECT setval(%s::regclass, COALESCE((SELECT max(id) FROM {qschema}.session_topics), 1), (SELECT count(*) > 0 FROM {qschema}.session_topics))",
+            f"SELECT setval(%s::regclass, COALESCE((SELECT max(id) FROM {qschema}.session_topics), 1), "
+            f"(SELECT count(*) > 0 FROM {qschema}.session_topics))",
             (topic_sequence,),
         )
 
