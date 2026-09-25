@@ -12,6 +12,7 @@ import pytest
 
 from state_store import MessageRecord, PostgreSQLStateStoreConfig
 from postgresql_state_store_operations import PostgreSQLSandboxOperations, PostgreSQLSandboxOperationsError
+from tests.integration.postgresql_test_target import OwnedPostgreSQLTestTarget
 from state_store_postgresql import PostgreSQLStateStore
 
 
@@ -108,6 +109,32 @@ def test_get_topic_messages_filters_by_topic_and_decodes_content(store):
     assert store.get_topic_messages(session_id, topic_b) == []
 
 
+
+def test_ensure_and_activate_topics_adopt_filter_and_retag_durable_rows(store):
+    session_id = f"topics-runtime-{uuid.uuid4()}"
+    store.ensure_session(session_id, source="integration")
+    legacy_user = store.append_message_record(session_id, MessageRecord(role="user", content="legacy user"))
+    legacy_assistant = store.append_message_record(session_id, MessageRecord(role="assistant", content="legacy answer"))
+
+    first = store.ensure_session_topic(session_id, "git")
+    assert first["state"] == "active" and first["message_count"] == 2
+    initial = store.get_messages_as_conversation(session_id, include_ancestors=True, include_row_ids=True, topic_id=first["id"])
+    assert [row["content"] for row in initial] == ["legacy user", "legacy answer"]
+    assert [row["_row_id"] for row in initial] == [legacy_user, legacy_assistant]
+    assert {row["_topic_id"] for row in initial} == {first["id"]}
+
+    current = store.append_message_record(session_id, MessageRecord(role="user", content="cook tonight", topic_id=first["id"]))
+    second = store.activate_topic_for_messages(session_id, title="cooking", message_ids=[current])
+    assert second["state"] == "active" and second["message_count"] == 1
+    assert store.get_active_topic(session_id)["id"] == second["id"]
+    assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=first["id"])] == [
+        "legacy user", "legacy answer"
+    ]
+    assert [row["content"] for row in store.get_messages_as_conversation(session_id, topic_id=second["id"])] == [
+        "cook tonight"
+    ]
+
+
 def test_cross_session_topic_append_is_rejected_before_message_mutation(store, postgresql_test_target):
     first_session, second_session = f"topics-first-{uuid.uuid4()}", f"topics-second-{uuid.uuid4()}"
     store.ensure_session(first_session, source="integration")
@@ -119,13 +146,12 @@ def test_cross_session_topic_append_is_rejected_before_message_mutation(store, p
             second_session, [MessageRecord(role="user", content="must not write", topic_id=foreign_topic)]
         )
     # The v27 composite FK independently rejects a direct PostgreSQL append.
-    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
-        with pytest.raises(_psycopg().errors.ForeignKeyViolation):
-            cursor.execute(
-                f"INSERT INTO {store._schema}.messages (session_id, role, content, created_at, topic_id) "
-                "VALUES (%s, 'user', 'must not write directly', 0, %s)",
-                (second_session, foreign_topic),
-            )
+    with pytest.raises(_psycopg().errors.ForeignKeyViolation):
+        postgresql_test_target.execute(
+            f"INSERT INTO {store._schema}.messages (session_id, role, content, created_at, topic_id) "
+            "VALUES (%s, 'user', 'must not write directly', 0, %s)",
+            (second_session, foreign_topic),
+        )
     assert store.get_messages_as_conversation(second_session) == []
 
 
@@ -138,8 +164,10 @@ def test_topic_delete_nulls_its_messages_topic_id_without_deleting_messages(stor
     )
     assert message_id == 1
 
-    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DELETE FROM {store._schema}.session_topics WHERE id=%s", (topic_id,))
+    postgresql_test_target.execute(
+        f"DELETE FROM {store._schema}.session_topics WHERE id=%s", (topic_id,)
+    )
+    with _psycopg().connect(postgresql_test_target.dsn) as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT topic_id, content FROM {store._schema}.messages WHERE session_id=%s", (session_id,))
         assert cursor.fetchall() == [(None, "retained")]
 
@@ -159,8 +187,9 @@ def test_warm_only_topics_fail_closed_in_runtime_semantic_validation_and_doctor(
     session_id = f"topics-warm-only-{uuid.uuid4()}"
     store.ensure_session(session_id, source="integration")
     store.create_topic(session_id, "only")
-    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"UPDATE {store._schema}.session_topics SET state='warm' WHERE session_id=%s", (session_id,))
+    postgresql_test_target.execute(
+        f"UPDATE {store._schema}.session_topics SET state='warm' WHERE session_id=%s", (session_id,)
+    )
 
     with pytest.raises(ValueError, match="exactly one active topic"):
         store.get_topics(session_id)
@@ -255,8 +284,9 @@ def test_session_topics_cascade_when_session_is_deleted(store, postgresql_test_t
     store.create_topic(session_id, "cascade")
     assert store.get_topics(session_id) != []
 
-    with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
-        cursor.execute(f"DELETE FROM {store._schema}.sessions WHERE id = %s", (session_id,))
+    postgresql_test_target.execute(
+        f"DELETE FROM {store._schema}.sessions WHERE id=%s", (session_id,)
+    )
 
     assert store.get_topics(session_id) == []
 
@@ -301,17 +331,23 @@ def test_topic_catalog_has_fks_checks_indexes_and_doctor_rejects_topic_drift(sto
 
 
 def test_topic_catalog_rejects_same_name_fk_target_outside_tenant_schema(store, postgresql_test_target):
-    foreign_schema = f"topic_fk_foreign_{uuid.uuid4().hex}"
+    foreign_target = OwnedPostgreSQLTestTarget(postgresql_test_target.dsn).allocate()
     schema = store._schema
+    foreign_schema = foreign_target.schema
     try:
-        with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f'CREATE SCHEMA "{foreign_schema}"')
-            cursor.execute(f'CREATE TABLE "{foreign_schema}".session_topics (session_id text NOT NULL, id bigint NOT NULL, UNIQUE (session_id, id))')
-            cursor.execute(f'ALTER TABLE "{schema}".messages DROP CONSTRAINT messages_topic_id_fkey')
-            cursor.execute(
-                f'ALTER TABLE "{schema}".messages ADD CONSTRAINT messages_topic_id_fkey '
-                f'FOREIGN KEY (session_id, topic_id) REFERENCES "{foreign_schema}".session_topics (session_id, id) ON DELETE SET NULL (topic_id)'
-            )
+        foreign_target.execute(
+            f"CREATE TABLE {foreign_schema}.session_topics "
+            "(session_id text NOT NULL, id bigint NOT NULL, UNIQUE (session_id, id))"
+        )
+        postgresql_test_target.execute(
+            f"ALTER TABLE {schema}.messages DROP CONSTRAINT messages_topic_id_fkey"
+        )
+        postgresql_test_target.execute_referencing_owned_target(
+            f"ALTER TABLE {schema}.messages ADD CONSTRAINT messages_topic_id_fkey "
+            f"FOREIGN KEY (session_id, topic_id) REFERENCES {foreign_schema}.session_topics "
+            "(session_id, id) ON DELETE SET NULL (topic_id)",
+            foreign_target,
+        )
         operations = PostgreSQLSandboxOperations(
             PostgreSQLStateStoreConfig(dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=2),
             postgresql_test_target.dsn, schema=postgresql_test_target.schema,
@@ -319,5 +355,4 @@ def test_topic_catalog_rejects_same_name_fk_target_outside_tenant_schema(store, 
         with pytest.raises(PostgreSQLSandboxOperationsError, match="Alembic/core catalog is unhealthy"):
             operations.doctor()
     finally:
-        with _psycopg().connect(postgresql_test_target.dsn, autocommit=True) as connection, connection.cursor() as cursor:
-            cursor.execute(f'DROP SCHEMA IF EXISTS "{foreign_schema}" CASCADE')
+        foreign_target.drop()

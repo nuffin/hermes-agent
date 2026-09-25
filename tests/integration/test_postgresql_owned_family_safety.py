@@ -15,6 +15,7 @@ _FAMILY = (
     "test_postgresql_session_runtime_ownership.py",
     "test_postgresql_delivery_ledger.py",
     "test_postgresql_cli_session_store.py",
+    "test_postgresql_session_topics.py",
     "test_postgresql_compression_rotation_acceptance.py",
     "test_postgresql_compression_coordination.py",
     "test_postgresql_phase12_fault_harness.py",

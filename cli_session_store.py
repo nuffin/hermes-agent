@@ -143,6 +143,19 @@ class PostgreSQLCLISessionStore:
     def get_topic_messages(self, session_id: str, topic_id: int, include_inactive: bool = False) -> list[dict[str, Any]]:
         return self._topic_capability("get_topic_messages")(session_id, topic_id, include_inactive=include_inactive)
 
+    def ensure_session_topic(self, session_id: str, title: str) -> dict[str, Any]:
+        return self._topic_capability("ensure_session_topic")(session_id, title)
+
+    def activate_topic_for_messages(
+        self, session_id: str, *, topic_id: int | None = None, title: str | None = None,
+        summary: str | None = None, message_ids: list[int] | None = None,
+        turn_lease_holder: str | None = None,
+    ) -> dict[str, Any]:
+        return self._topic_capability("activate_topic_for_messages")(
+            session_id, topic_id=topic_id, title=title, summary=summary,
+            message_ids=message_ids, turn_lease_holder=turn_lease_holder,
+        )
+
     def update_session_meta(self, session_id: str, model_config_json: str, model: str | None = None) -> None:
         """Replace the session's model config (and fill a missing model) after queued usage is durable.
 
@@ -172,7 +185,7 @@ class PostgreSQLCLISessionStore:
 
     def get_messages_as_conversation(self, session_id: str, *, include_ancestors: bool = False,
                                      repair_alternation: bool = False, include_row_ids: bool = False,
-                                     **kwargs: Any) -> list[dict[str, Any]]:
+                                     topic_id: int | None = None, **kwargs: Any) -> list[dict[str, Any]]:
         """Resume projection in OpenAI format.
 
         ``repair_alternation`` is honored for live-replay callers (ACP resumes
@@ -184,7 +197,13 @@ class PostgreSQLCLISessionStore:
         """
         if kwargs:
             raise PostgreSQLCLISessionCapabilityError("PostgreSQL CLI resume does not support: " + ", ".join(sorted(kwargs)))
-        restored, _display = self._store.get_resume_conversations(session_id)
+        if topic_id is None:
+            restored, _display = self._store.get_resume_conversations(session_id)
+        else:
+            restored = self._topic_capability("get_messages_as_conversation")(
+                session_id, include_ancestors=include_ancestors,
+                repair_alternation=False, include_row_ids=True, topic_id=topic_id,
+            )
         if repair_alternation and restored:
             # Lazy import: keeps agent-side tooling out of store-only import paths.
             # The helper only mutates the list in place; its ``agent`` argument is unused.
