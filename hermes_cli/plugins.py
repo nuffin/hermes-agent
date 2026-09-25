@@ -239,7 +239,7 @@ VALID_HOOKS: Set[str] = {
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
-    "transform_api_error_classification",
+    "transform_api_error_classification", "pre_final_response",
     *SKILL_MUTATION_GUARD_HOOKS,
     *SKILL_MUTATION_PRE_HOOKS,
 }
