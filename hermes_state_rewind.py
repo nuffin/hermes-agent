@@ -101,6 +101,10 @@ def _rewind_user_turn_impl(
     target = durable[target_index]
     durable_prefix, live_view = history_before_user_originated_turn(durable, target_index)
     scaffold, _ = split_user_originated_turn(target)
+    if scaffold is not None and durable_prefix and isinstance(target.get("topic_id"), int):
+        # A PG composite carrier is replaced by its hidden handoff; preserve its
+        # same-session topic association in the durable and warm projections.
+        durable_prefix[-1]["topic_id"] = target["topic_id"]
     if require_composite and scaffold is None:
         raise RewindTargetUnavailableError("target user message is not a compaction carrier")
 

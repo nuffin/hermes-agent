@@ -140,14 +140,15 @@ def test_pg18_import_target_marker_is_private_and_cleanup_is_exact() -> None:
         assert cursor.fetchall() == public_before
 
 
-def test_pg18_failed_allocated_import_reconciles_target_without_exposing_dsn(
+def test_pg18_invalid_source_preflight_never_allocates_target_or_mutates_catalog(
     monkeypatch, sqlite_source, tmp_path,
 ) -> None:
-    """Failure returns a machine-readable cleanup result and no stranded target."""
+    """Public allocation helper rejects source-only faults before any PG mutation."""
     with sqlite3.connect(sqlite_source) as connection:
         connection.execute(
             "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES ('', 'x', '{}', 1)"
         )
+        source_before = connection.execute("SELECT * FROM gateway_routing").fetchall()
     settings = PostgreSQLStateStoreConfig(
         dsn_env="TEST_DSN", connect_timeout_seconds=5, pool_max_size=1
     )
@@ -162,19 +163,15 @@ def test_pg18_failed_allocated_import_reconciles_target_without_exposing_dsn(
         return target
 
     monkeypatch.setattr(sqlite_import, "allocate_owned_sqlite_import_target", capture_target)
-    with pytest.raises(SQLitePostgreSQLImportError, match="reconciliation result") as raised:
+    with pytest.raises(SQLitePostgreSQLImportError, match="read-only preflight") as raised:
         import_into_allocated_target(settings, _DSN, sqlite_source, snapshot_root=tmp_path)
-    assert len(allocated) == 1
-    cleanup = raised.value.cleanup
-    assert cleanup is not None and cleanup.status == "dropped"
-    assert _DSN not in json.dumps(cleanup.as_dict())
-    target = allocated[0]
-    with _psycopg().connect(_DSN) as connection, connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname IN (%s, %s)",
-            (target.schema.name, target.ownership_schema),
-        )
-        assert cursor.fetchall() == []
+    assert raised.value.stage == "source-preflight"
+    assert allocated == []
+    assert raised.value.cleanup is None
+    assert _DSN not in str(raised.value)
+    assert not list(tmp_path.glob("sqlite-import-*/source.snapshot.db"))
+    with sqlite3.connect(sqlite_source) as connection:
+        assert connection.execute("SELECT * FROM gateway_routing").fetchall() == source_before
 
 
 @pytest.fixture
@@ -206,8 +203,14 @@ def sqlite_source(tmp_path: Path) -> Path:
             ),
         )
         connection.execute(
-            """INSERT INTO messages (id, session_id, role, content, tool_calls, timestamp, observed, active, compacted, display_metadata)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO session_topics
+                   (id, session_id, title, normalized_title, summary, state, created_at, last_active_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (1, "session-a", "import", "import", "fixture topic", "active", 100.0, 101.0),
+        )
+        connection.execute(
+            """INSERT INTO messages (id, session_id, role, content, tool_calls, timestamp, observed, active, compacted, display_metadata, topic_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 41,
                 "session-a",
@@ -219,6 +222,7 @@ def sqlite_source(tmp_path: Path) -> Path:
                 1,
                 0,
                 '{"kind":"fixture"}',
+                1,
             ),
         )
         connection.execute(
@@ -280,6 +284,7 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
     assert result.object_counts == {
         "system_prompts": 1,
         "sessions": 1,
+        "session_topics": 1,
         "messages": 1,
         "session_model_usage": 1,
         "conversation_generations": 1,
@@ -293,14 +298,23 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
     )
     assert json.loads(evidence.read_text())["status"] == "complete"
     with target.connect() as connection, connection.cursor() as cursor:
-        cursor.execute(f"SELECT id, search_document IS NOT NULL FROM {schema}.messages")
-        assert cursor.fetchone() == (41, True)
+        cursor.execute(f"SELECT id, topic_id, search_document IS NOT NULL FROM {schema}.messages")
+        assert cursor.fetchone() == (41, 1, True)
+        cursor.execute(f"SELECT id, session_id, message_count FROM {schema}.session_topics")
+        assert cursor.fetchone() == (1, "session-a", 1)
     target.execute(
         f"INSERT INTO \"{schema}\".messages (session_id, role, content, created_at) VALUES ('session-a', 'user', 'next', 102)"
     )
     with target.connect() as connection, connection.cursor() as cursor:
         cursor.execute(f"SELECT max(id) FROM {schema}.messages")
         assert cursor.fetchone()[0] > 41
+    target.execute(
+        f"INSERT INTO \"{schema}\".session_topics (session_id, title, state, created_at, last_active_at) "
+        "VALUES ('session-a', 'next', 'warm', 103, 103)"
+    )
+    with target.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(f"SELECT max(id) FROM {schema}.session_topics")
+        assert cursor.fetchone()[0] > 1
     operations = PostgreSQLSandboxOperations(
         settings, _DSN, schema=schema, command_runner=_runner
     )
@@ -319,6 +333,10 @@ def test_pg18_import_happy_manifest_invariants_sequence_search_and_logical_rollb
 def test_pg18_import_rejects_cross_session_topic_before_target_mutation(sandbox, sqlite_source, tmp_path):
     importer, target, _settings = sandbox
     with sqlite3.connect(sqlite_source) as connection:
+        connection.execute(
+            "INSERT INTO sessions (id, source, started_at, model_config, archived, pinned, hidden, git_metadata_generation) "
+            "VALUES ('other-session', 'fixture', 100, '{}', 0, 0, 0, 0)"
+        )
         connection.execute("UPDATE messages SET session_id='other-session' WHERE id=41")
 
     with pytest.raises(SQLitePostgreSQLImportError, match="topic_id outside its session"):
@@ -328,9 +346,16 @@ def test_pg18_import_rejects_cross_session_topic_before_target_mutation(sandbox,
         assert cursor.fetchone() == (None,)
 
 
-@pytest.mark.parametrize("topic_states", (("warm",), ("active", "active")))
+@pytest.mark.parametrize(
+    ("topic_states", "error"),
+    (
+        (("warm",), "exactly one active topic"),
+        (("active", "active"), "exactly one active topic"),
+        (("active", "invalid"), "states outside active|warm"),
+    ),
+)
 def test_pg18_import_rejects_non_singleton_active_topics_before_target_mutation(
-    sandbox, sqlite_source, tmp_path, topic_states,
+    sandbox, sqlite_source, tmp_path, topic_states, error,
 ):
     """Legacy SQLite topic divergence is read-only rejected, never normalized."""
     importer, target, _settings = sandbox
@@ -338,14 +363,15 @@ def test_pg18_import_rejects_non_singleton_active_topics_before_target_mutation(
         connection.execute("UPDATE session_topics SET state=? WHERE id=1", (topic_states[0],))
         if len(topic_states) == 2:
             connection.execute(
-                "INSERT INTO session_topics (id, session_id, title, state, message_count, created_at, last_active_at) "
-                "VALUES (2, 'session-a', 'second', 'active', 0, 102, 102)"
+                "INSERT INTO session_topics (id, session_id, title, state, created_at, last_active_at) "
+                "VALUES (?, 'session-a', 'second', ?, 102, 102)",
+                (2, topic_states[1]),
             )
         before = connection.execute(
             "SELECT id, session_id, state FROM session_topics ORDER BY id"
         ).fetchall()
 
-    with pytest.raises(SQLitePostgreSQLImportError, match="exactly one active topic"):
+    with pytest.raises(SQLitePostgreSQLImportError, match=error):
         importer.import_source(sqlite_source, snapshot_root=tmp_path)
 
     with sqlite3.connect(sqlite_source) as connection:
@@ -577,8 +603,11 @@ def test_direct_module_cli_allocation_failure_is_structured_and_sanitized(
         ),
     )
 
+    source = tmp_path / "source.db"
+    with sqlite3.connect(source) as connection:
+        connection.executescript(SCHEMA_SQL)
     assert sqlite_import.main([
-        "--source", str(tmp_path / "source.db"), "--snapshot-root", str(tmp_path),
+        "--source", str(source), "--snapshot-root", str(tmp_path),
         "--dsn", secret_dsn,
     ]) == 2
     rendered = json.loads(capsys.readouterr().out)
