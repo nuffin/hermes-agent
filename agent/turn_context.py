@@ -568,9 +568,12 @@ def _assemble_selected_topic_dynamic_capabilities(agent: Any) -> tuple[str, str]
                     TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,
                 )
                 return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
-        from tools.bot_mode_dm import message_agent_authorized
+        # Selected-topic admission must not re-run Bot Mode discovery: that probe
+        # enumerates profiles and parses profile.yaml.  Consume only the normal
+        # turn's in-memory authorization snapshot; an unknown snapshot is false.
+        from tools.bot_mode_dm import message_agent_authorized_snapshot
 
-        if message_agent_authorized(agent):
+        if message_agent_authorized_snapshot(agent):
             from agent.session_topics import (
                 TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
                 TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,
@@ -1091,10 +1094,16 @@ def build_turn_context(
     # state reset, and every status/callback path: a refused turn must be observationally
     # inert, including across a later `/session-topic off` command in the same process.
     if getattr(agent, "_topic_segmentation_enabled", False):
-        from agent.session_topics import TopicPrepublicationCapabilityError
+        from agent.session_topics import (
+            TopicPrepublicationCapabilityError,
+            TopicSegmentationRuntimeError,
+            selected_topic_store_preflight_failure,
+        )
 
         if (failure := _assemble_selected_topic_dynamic_capabilities(agent)) is not None:
             raise TopicPrepublicationCapabilityError(failure)
+        if (failure := selected_topic_store_preflight_failure(agent)) is not None:
+            raise TopicSegmentationRuntimeError()
     else:
         _refresh_mcp_tools_between_turns(agent)
         try:

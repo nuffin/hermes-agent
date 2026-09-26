@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import types
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,6 +61,7 @@ class _FakeAgent:
         self.enabled_toolsets = None
         self.disabled_toolsets = None
         self._skip_mcp_refresh = False
+        self._message_agent_authorization_snapshot: Any = None
         self._topic_segmentation_enabled = False
         self.compression_enabled = False
         self.context_compressor = types.SimpleNamespace(
@@ -240,6 +242,29 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+def test_selected_topic_store_preflight_fails_without_turn_setup():
+    """An unavailable selected store is rejected by the read-only preflight."""
+    from agent.session_topics import (
+        TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+        TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+        selected_topic_store_preflight_failure,
+    )
+
+    agent = _FakeAgent()
+    agent._topic_segmentation_enabled = True
+    agent._session_db.get_topics.side_effect = RuntimeError("store unavailable")
+
+    assert selected_topic_store_preflight_failure(agent) == (
+        TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE,
+        TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE,
+    )
+    assert agent._session_db.method_calls == [
+        __import__("unittest.mock", fromlist=["call"]).call.get_topics(agent.session_id)
+    ]
+    assert agent._ensure_db_prompt_at_call == "<unset>"
+    assert agent._persist_calls == 0
+
+
 def test_selected_topic_dynamic_tool_stops_before_session_or_candidate_publication(monkeypatch):
     """The real prologue rejects existing and Bot dynamic tools before setup or hooks."""
     from agent.session_topics import TopicPrepublicationCapabilityError
@@ -249,7 +274,15 @@ def test_selected_topic_dynamic_tool_stops_before_session_or_candidate_publicati
         agent._topic_segmentation_enabled = True
         agent._session_db = MagicMock()
         if is_bot:
-            monkeypatch.setattr("tools.bot_mode_dm.message_agent_authorized", lambda _agent: True)
+            # Selected admission consumes only a previously-loaded snapshot; it must not
+            # invoke Bot Mode discovery (which may enumerate profiles/config files).
+            agent._message_agent_authorization_snapshot = (
+                (agent.session_id, str(agent._session_db.db_path or "")), True
+            )
+            monkeypatch.setattr(
+                "tools.bot_mode_dm.message_agent_authorized",
+                lambda _agent: (_ for _ in ()).throw(AssertionError("selected gate rediscovered Bot Mode")),
+            )
         else:
             agent.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
             agent.valid_tool_names = {"mcp_late_tool"}

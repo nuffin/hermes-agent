@@ -117,10 +117,36 @@ def message_agent_tool_schema() -> dict:
     }
 
 
+def _message_agent_snapshot_key(agent: Any) -> tuple[str, str]:
+    """Pure identity key for a cached Bot-Mode decision.
+
+    This deliberately uses only already-loaded agent/session attributes.  A selected-topic
+    admission check must never turn a dynamic tool question into a profile scan or config read.
+    """
+    db = getattr(agent, "_session_db", None)
+    return str(getattr(agent, "session_id", "") or ""), str(getattr(db, "db_path", "") or "")
+
+
+def message_agent_authorized_snapshot(agent: Any) -> bool:
+    """Return the already-discovered Bot authorization for this exact session/profile.
+
+    Unknown snapshots fail closed.  Unlike ``message_agent_authorized``, this is observationally
+    pure: it does not consult the DB title, filesystem, configuration, or Bot-Mode probe.
+    """
+    snapshot = getattr(agent, "_message_agent_authorization_snapshot", None)
+    if not (isinstance(snapshot, tuple) and len(snapshot) == 2):
+        return False
+    key, authorized = snapshot
+    return key == _message_agent_snapshot_key(agent) and authorized is True
+
+
 def message_agent_authorized(agent: Any) -> bool:
-    """The ``message_agent`` gate: a protocol-enabled agent whose session is a managed
-    Bot-Mode canonical Bot Chat. Session-stable, so it is prompt-cache safe to re-evaluate
-    on every tool-snapshot rebuild. Never raises."""
+    """Discover and snapshot the normal ``message_agent`` authorization gate.
+
+    Normal turns retain the ordinary Bot-Mode discovery behavior.  Selected-topic turns consume
+    only ``message_agent_authorized_snapshot`` so a rejected admission remains config-read pure.
+    """
+    authorized = False
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
@@ -128,10 +154,15 @@ def message_agent_authorized(agent: Any) -> bool:
 
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        authorized = _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        return authorized
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("message_agent_authorized failed", exc_info=True)
         return False
+    finally:
+        # A failed normal discovery must not leave a previous profile/session decision usable.
+        with contextlib.suppress(Exception):
+            agent._message_agent_authorization_snapshot = (_message_agent_snapshot_key(agent), authorized)
 
 
 def ensure_message_agent_tool(agent: Any) -> bool:

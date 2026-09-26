@@ -89,6 +89,26 @@ def selected_topic_prepublication_capability_failure(agent: Any) -> tuple[str, s
     return None
 
 
+def selected_topic_store_preflight_failure(agent: Any) -> tuple[str, str] | None:
+    """Probe the selected topic store before any turn-publication side effect.
+
+    Building a topic prompt only reads the already-selected store and its topic rows.  It is
+    therefore the strongest pure preflight available: an unavailable/malformed store is rejected
+    before runtime publication, identity binding, user-content logging, hooks, or persistence.
+    Topic creation/transition remains deliberately later because it is a durable mutation.
+    """
+    if not getattr(agent, "_topic_segmentation_enabled", False):
+        return None
+    try:
+        topic_prompt_context(agent)
+    except TopicSegmentationRuntimeError:
+        return TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE, TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+    except Exception as exc:
+        _topic_runtime_failure("preflight", exc)
+        return TOPIC_SEGMENTATION_RUNTIME_FAILURE_CODE, TOPIC_SEGMENTATION_RUNTIME_FAILURE_MESSAGE
+    return None
+
+
 def retry_pending_topic_retraction(agent: Any) -> tuple[str, str] | None:
     """Retry only an exact prior failed-turn retraction before admitting another turn."""
     pending = getattr(agent, "_pending_topic_retraction", None)
