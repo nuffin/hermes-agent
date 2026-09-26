@@ -182,11 +182,18 @@ def test_selected_topic_late_dynamic_tool_refusal_preserves_durable_prompt_and_p
     assert restored["tool_names"] == before_pin
 
 
-@pytest.mark.parametrize("late_tool", ("mcp_late_tool", "message_agent"))
-def test_selected_topic_actual_prologue_refuses_late_tool_before_provider_callback_or_persistence(
-    agent, monkeypatch, late_tool,
+@pytest.mark.parametrize("late_capability", ("mcp", "message_agent"))
+def test_selected_topic_actual_prologue_refuses_late_capability_before_provider_callback_or_persistence(
+    agent, monkeypatch, late_capability,
 ):
-    """The live prologue gate sits before every selected-topic publication sink."""
+    """The pure live prologue detects late MCP/Bot surfaces before every publication sink.
+
+    Selected-topic admission must not invoke the ordinary MCP refresh or Bot-Mode
+    injector: both can mutate process or agent state.  Model the actual pure
+    discovery surfaces instead — a registered MCP tool and the session-bound Bot
+    authorization snapshot — and verify their rejection still precedes callbacks,
+    provider calls, or durable writes.
+    """
     import agent.conversation_loop as conversation_loop
 
     agent._topic_segmentation_enabled = True
@@ -197,22 +204,21 @@ def test_selected_topic_actual_prologue_refuses_late_tool_before_provider_callba
     callback = MagicMock()
     agent._session_db = sink
 
-    def inject(*_args, **_kwargs):
-        agent.tools = _make_tool_defs(late_tool)
-        agent.valid_tool_names = {late_tool}
+    if late_capability == "mcp":
+        import tools.mcp_tool  # Ensure the guarded pure registered-tool probe is active.
 
-    if late_tool == "mcp_late_tool":
-        monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", inject)
-        monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+        monkeypatch.setattr("tools.mcp_tool_discovery.has_registered_mcp_tools", lambda: True)
     else:
-        monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", lambda _agent: None)
-        monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", inject)
+        from tools.bot_mode_dm import _message_agent_snapshot_key
+
+        agent._message_agent_authorization_snapshot = (_message_agent_snapshot_key(agent), True)
 
     result = conversation_loop._run_conversation_turn(
         agent, "q", conversation_history=[], stream_callback=callback,
     )
 
     assert result["pre_admission_failure"] is True
+    assert result["failure_reason"] == "topic_prepublication_capability_unsupported"
     assert result["api_calls"] == 0
     agent.client.chat.completions.create.assert_not_called()
     callback.assert_not_called()
