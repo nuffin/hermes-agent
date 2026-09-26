@@ -18,6 +18,35 @@ logger = logging.getLogger("tools.mcp_tool")
 _mcp_stderr_log_fh: Dict[str, Any] = {}  # profile home key -> handle
 _mcp_stderr_log_lock = threading.Lock()
 
+# Published only by the normal, committing configuration load below.  Admission
+# probes must never load configuration: that path hydrates dotenv values and
+# discovers portable plugin servers.  The snapshot is deliberately advisory;
+# callers must fail closed when it has no answer (including an absent server,
+# because config may have changed since the snapshot was published).
+_mcp_config_snapshot_lock = threading.Lock()
+_mcp_config_server_snapshots: Dict[str, frozenset[str]] = {}
+
+
+def _publish_mcp_config_snapshot(server_names: Set[str]) -> None:
+    """Publish names seen by a normal config load for a later read-only probe."""
+    from hermes_constants import hermes_home_key
+
+    with _mcp_config_snapshot_lock:
+        _mcp_config_server_snapshots[hermes_home_key()] = frozenset(server_names)
+
+
+def read_only_mcp_config_snapshot() -> Optional[frozenset[str]]:
+    """Return the current profile's last normal-load snapshot without loading config.
+
+    This function intentionally performs no config, dotenv, plugin, filesystem,
+    warning, or environment work.  Its caller must treat both ``None`` and a
+    missing name as unknown rather than as evidence that a server is absent.
+    """
+    from hermes_constants import hermes_home_key
+
+    with _mcp_config_snapshot_lock:
+        return _mcp_config_server_snapshots.get(hermes_home_key())
+
 
 def _get_mcp_stderr_log() -> Any:
     """Shared append-mode handle for MCP subprocess stderr, cached until shutdown PER PROFILE HOME (a
@@ -379,6 +408,7 @@ def _load_mcp_config() -> Dict[str, dict]:
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
         _portable_mcp_servers(safe_servers)
+        _publish_mcp_config_snapshot(set(safe_servers))
         return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)

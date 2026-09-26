@@ -501,3 +501,34 @@ def test_e2e_carded_oauth_park_and_adopt_stay_inside_their_profile(tmp_path):
             assert mcp.adopt_late_connections(agent_a) == ["linear"]
         assert registered == ["linear"] and agent_a.enabled_toolsets == ["linear"]
         assert mcp._LATE_ATTEMPTS == {}
+
+
+def test_read_only_mcp_snapshot_is_profile_isolated_under_concurrent_probes(tmp_path):
+    """A read-only selected-topic probe cannot publish another profile's config state."""
+    import tools.mcp_tool_config as mcp_config
+
+    home_a = _profile_home(tmp_path, "home-a")
+    home_b = _profile_home(tmp_path, "home-b")
+    with _as_home(home_a):
+        mcp_config._publish_mcp_config_snapshot({"alpha"})
+    with _as_home(home_b):
+        mcp_config._publish_mcp_config_snapshot({"bravo"})
+
+    barrier = threading.Barrier(2)
+    observed = {}
+
+    def probe(label, home):
+        with _as_home(home):
+            barrier.wait()
+            observed[label] = mcp_config.read_only_mcp_config_snapshot()
+
+    threads = [
+        threading.Thread(target=probe, args=("a", home_a)),
+        threading.Thread(target=probe, args=("b", home_b)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert observed == {"a": frozenset({"alpha"}), "b": frozenset({"bravo"})}

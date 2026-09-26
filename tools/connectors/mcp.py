@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -344,23 +345,38 @@ def late_connection_names_ready_for_adoption(agent: Any) -> List[str]:
     Selected-topic admission must decide whether a turn is publishable before it
     changes its tool surface.  In particular, it must not pop ``_LATE_ATTEMPTS``
     or register a server merely to discover that the resulting capability would
-    be refused.  ``OAuthAttempt.poll`` is a snapshot read; configuration is also
-    read-only here.  The committing ``adopt_late_connections`` path remains the
-    sole owner of attempt consumption and server registration.
+    be refused.  ``OAuthAttempt.poll`` is a snapshot read.  Configuration is
+    inspected only through a previously-published in-memory snapshot, without
+    importing the config module: normal config loading can hydrate dotenv values
+    and discover portable plugins.  An absent/stale snapshot cannot prove a
+    server is unavailable, so it fails closed and refuses the selected turn.
+    The committing ``adopt_late_connections`` path remains the sole owner of
+    config loading, attempt consumption, and server registration.
     """
     session_key = operation_session_key(getattr(agent, "session_id", None))
     attempts = _LATE_ATTEMPTS.get((hermes_home_key(), session_key))
     if not attempts:
         return []
-    from tools.mcp_tool_config import _load_mcp_config
-
-    configs = _load_mcp_config()
+    # Do not import the config module here.  Even an import is unnecessary for
+    # an observational gate, and a cold process must fail closed rather than
+    # cause the normal loader's dotenv/plugin side effects.  A loaded module's
+    # snapshot accessor is pure and lock-protected across multiplexed profiles.
+    config_module = sys.modules.get("tools.mcp_tool_config")
+    snapshot_reader = getattr(config_module, "read_only_mcp_config_snapshot", None)
+    config_snapshot = snapshot_reader() if callable(snapshot_reader) else None
     ready: List[str] = []
     for name, attempt in attempts.items():
-        snapshot = attempt.poll()
-        if (snapshot.get("status") == "approved" and not snapshot.get("discovery_error")
-                and isinstance(configs.get(name), dict)):
+        attempt_snapshot = attempt.poll()
+        if attempt_snapshot.get("status") != "approved" or attempt_snapshot.get("discovery_error"):
+            continue
+        if isinstance(config_snapshot, frozenset) and name in config_snapshot:
+            # The normal loader already observed this configured capability.
             ready.append(name)
+            continue
+        # No snapshot, or an absent name in one, cannot prove unavailability:
+        # config may not have been normally loaded yet or may have changed since
+        # publication.  Refuse rather than loading or discovering anything here.
+        ready.append(name)
     return ready
 
 

@@ -8,6 +8,8 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -265,7 +267,7 @@ def test_selected_topic_dynamic_tool_stops_before_session_or_candidate_publicati
         assert agent.valid_tool_names == expected_names
 
 
-def test_selected_topic_late_mcp_admission_probe_does_not_consume_real_adoption(monkeypatch):
+def test_selected_topic_late_mcp_admission_probe_is_pure_then_normal_adoption_runs(monkeypatch, tmp_path):
     """A rejected selected turn leaves the real parked-MCP adoption path untouched.
 
     The following ordinary turn must still consume that exact attempt once.  This
@@ -286,7 +288,30 @@ def test_selected_topic_late_mcp_admission_probe_does_not_consume_real_adoption(
     key = (hermes_home_key(), "sess-1")
     attempts = {key: {"late-server": _ApprovedAttempt()}}
     monkeypatch.setattr(mcp, "_LATE_ATTEMPTS", attempts)
-    monkeypatch.setattr("tools.mcp_tool_config._load_mcp_config", lambda: {"late-server": {"url": "https://example.invalid/mcp"}})
+    import tools.mcp_tool_config as mcp_config
+
+    sentinel_dotenv = tmp_path / ".env"
+    sentinel_dotenv.write_text("MCP_PROBE_SENTINEL=unchanged\n")
+    original_dotenv = sentinel_dotenv.read_bytes()
+    original_env = dict(os.environ)
+    dotenv_calls = MagicMock()
+    plugin_discovery_calls = MagicMock()
+    warnings = MagicMock()
+
+    # These are the exact side-effecting pieces of the normal config loader.
+    # The selected-topic admission probe must not invoke either, even though an
+    # approved parked attempt makes it reject the candidate turn.
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", dotenv_calls)
+    monkeypatch.setattr(mcp_config.logger, "warning", warnings)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+        "mcp_servers": {"late-server": {"url": "https://example.invalid/mcp"}},
+    })
+    plugin_manager = MagicMock()
+    plugin_manager.get_portable_mcp_servers.return_value = {}
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", types.SimpleNamespace(
+        discover_plugins=plugin_discovery_calls,
+        get_plugin_manager=lambda: plugin_manager,
+    ))
     registered = []
     monkeypatch.setattr(
         "tools.mcp_tool_discovery.register_mcp_servers",
@@ -298,6 +323,11 @@ def test_selected_topic_late_mcp_admission_probe_does_not_consume_real_adoption(
     assert registered == []
     assert agent.enabled_toolsets == []
     assert agent.tools == [] and agent.valid_tool_names == set()
+    dotenv_calls.assert_not_called()
+    plugin_discovery_calls.assert_not_called()
+    warnings.assert_not_called()
+    assert sentinel_dotenv.read_bytes() == original_dotenv
+    assert dict(os.environ) == original_env
 
     agent._topic_segmentation_enabled = False
     _refresh_mcp_tools_between_turns(agent)
@@ -305,6 +335,8 @@ def test_selected_topic_late_mcp_admission_probe_does_not_consume_real_adoption(
     assert registered == ["late-server"]
     assert mcp._LATE_ATTEMPTS == {}
     assert agent.enabled_toolsets == ["late-server"]
+    dotenv_calls.assert_called_once_with()
+    plugin_discovery_calls.assert_called_once_with()
 
 
 def test_selected_topic_refusal_runs_no_recovery_runtime_or_status_path(monkeypatch, tmp_path):
