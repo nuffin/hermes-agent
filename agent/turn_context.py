@@ -560,9 +560,9 @@ def _assemble_selected_topic_dynamic_capabilities(agent: Any) -> tuple[str, str]
                 )
                 return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
         if "tools.mcp_tool" in sys.modules:
-            from tools.mcp_tool_discovery import has_registered_mcp_tools
+            from tools.mcp_tool_discovery import get_registered_mcp_server_names
 
-            if has_registered_mcp_tools():
+            if get_registered_mcp_server_names():
                 from agent.session_topics import (
                     TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
                     TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,

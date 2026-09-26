@@ -33,7 +33,12 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent.turn_context import PreflightCompressionTimedOut, _emit_reaction, build_turn_context
+from agent.turn_context import (
+    PreflightCompressionTimedOut,
+    _assemble_selected_topic_dynamic_capabilities,
+    _emit_reaction,
+    build_turn_context,
+)
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
@@ -1610,10 +1615,20 @@ def _run_conversation_turn(
         retry_pending_topic_retraction,
         selected_topic_prepublication_capability_failure,
     )
-    _topic_pre_admission_failure = (
-        retry_pending_topic_retraction(agent)
-        or selected_topic_prepublication_capability_failure(agent)
-    )
+    # A selected-topic refusal must be fully observational: retrying a prior
+    # turn's retraction is itself a durable write.  Normal turns retain the
+    # historical retry-before-setup order, while selected turns defer it until
+    # both capability admissions have accepted the current turn.
+    _selected_topic_turn = bool(getattr(agent, "_topic_segmentation_enabled", False))
+    if _selected_topic_turn:
+        _topic_pre_admission_failure = selected_topic_prepublication_capability_failure(agent)
+    else:
+        # Preserve the normal-turn recovery order: a prior failed selected
+        # turn is repaired before the regular capability predicate is read.
+        _topic_pre_admission_failure = (
+            retry_pending_topic_retraction(agent)
+            or selected_topic_prepublication_capability_failure(agent)
+        )
     if _topic_pre_admission_failure is not None:
         return _topic_pre_admission_result(agent, conversation_history, _topic_pre_admission_failure)
 
@@ -1623,12 +1638,16 @@ def _run_conversation_turn(
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
 
-    # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
-    # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
-    try:
-        agent._try_refresh_env_client_credentials()
-    except Exception:
-        logger.debug("per-turn env credential refresh failed", exc_info=True)
+    # Selected-topic turns defer this mutating client refresh until the final
+    # post-context capability admission below.  A late MCP/Bot refusal must not
+    # replace the provider client or adopt credentials/base-url.
+    if not _selected_topic_turn:
+        # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
+        # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
+        try:
+            agent._try_refresh_env_client_credentials()
+        except Exception:
+            logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
@@ -1694,9 +1713,22 @@ def _run_conversation_turn(
     # Turn context may dynamically refresh MCP/Bot Mode capabilities after the
     # initial check. Validate that final surface before request assembly,
     # provider hooks, tool execution, or continuation handling can observe it.
-    _post_admission_failure = selected_topic_prepublication_capability_failure(agent)
+    _post_admission_failure = (
+        _assemble_selected_topic_dynamic_capabilities(agent)
+        if _selected_topic_turn else selected_topic_prepublication_capability_failure(agent)
+    )
     if _post_admission_failure is not None:
         return _topic_pre_admission_result(agent, conversation_history, _post_admission_failure)
+    if _selected_topic_turn:
+        _topic_retry_failure = retry_pending_topic_retraction(agent)
+        if _topic_retry_failure is not None:
+            return _topic_pre_admission_result(agent, conversation_history, _topic_retry_failure)
+        # The final selected-topic capability gate has admitted this turn, so
+        # credential adoption can now safely replace the live provider client.
+        try:
+            agent._try_refresh_env_client_credentials()
+        except Exception:
+            logger.debug("per-turn env credential refresh failed", exc_info=True)
     _emit_reaction(agent, _ctx.original_user_message)
     _admit_selected_topic_prompt_persistence(agent)
 

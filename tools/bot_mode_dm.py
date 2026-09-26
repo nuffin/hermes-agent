@@ -140,6 +140,17 @@ def message_agent_authorized_snapshot(agent: Any) -> bool:
     return key == _message_agent_snapshot_key(agent) and authorized is True
 
 
+def publish_message_agent_authorization_snapshot(agent: Any, authorized: bool) -> None:
+    """Publish the current normal-turn Bot authorization for pure later readers.
+
+    This is the sole writer for the session-bound snapshot consumed by selected-
+    topic admission.  Callers that already performed ordinary authorization can
+    publish their result without making the pure reader re-run configuration or
+    profile discovery.
+    """
+    agent._message_agent_authorization_snapshot = (_message_agent_snapshot_key(agent), bool(authorized))
+
+
 def message_agent_authorized(agent: Any) -> bool:
     """Discover and snapshot the normal ``message_agent`` authorization gate.
 
@@ -162,7 +173,7 @@ def message_agent_authorized(agent: Any) -> bool:
     finally:
         # A failed normal discovery must not leave a previous profile/session decision usable.
         with contextlib.suppress(Exception):
-            agent._message_agent_authorization_snapshot = (_message_agent_snapshot_key(agent), authorized)
+            publish_message_agent_authorization_snapshot(agent, authorized)
 
 
 def ensure_message_agent_tool(agent: Any) -> bool:

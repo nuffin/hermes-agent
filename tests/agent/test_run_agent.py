@@ -14,7 +14,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
@@ -207,11 +207,17 @@ def test_selected_topic_actual_prologue_refuses_late_capability_before_provider_
     if late_capability == "mcp":
         import tools.mcp_tool  # Ensure the guarded pure registered-tool probe is active.
 
-        monkeypatch.setattr("tools.mcp_tool_discovery.has_registered_mcp_tools", lambda: True)
+        # The selected-topic gate consumes the public, pure registry snapshot;
+        # it must not invoke the mutating refresh path.
+        monkeypatch.setattr(
+            "tools.mcp_tool_discovery.get_registered_mcp_server_names", lambda: {"published-late-mcp"},
+        )
     else:
-        from tools.bot_mode_dm import _message_agent_snapshot_key
+        from tools.bot_mode_dm import publish_message_agent_authorization_snapshot
 
-        agent._message_agent_authorization_snapshot = (_message_agent_snapshot_key(agent), True)
+        # Publish through the normal public snapshot writer, not direct private
+        # attribute injection.
+        publish_message_agent_authorization_snapshot(agent, True)
 
     result = conversation_loop._run_conversation_turn(
         agent, "q", conversation_history=[], stream_callback=callback,
@@ -227,6 +233,117 @@ def test_selected_topic_actual_prologue_refuses_late_capability_before_provider_
     assert not [
         call for call in sink.method_calls
         if call[0] in {"create_session", "update_system_prompt", "update_session_tool_names", "append_message"}
+    ]
+
+
+def _minimal_turn_context():
+    return SimpleNamespace(
+        user_message="q", original_user_message="q", conversation_history=[], effective_task_id="task",
+        turn_id="turn", should_review_memory=False, plugin_user_context="", ext_prefetch_cache="",
+        messages=[{"role": "user", "content": "q"}], active_system_prompt="", current_turn_user_idx=0,
+        preflight_compression_blocked=False,
+    )
+
+
+@pytest.mark.parametrize("late_capability", ("mcp", "message_agent"))
+def test_selected_topic_late_rejection_does_not_retry_prior_retraction_or_refresh_credentials(
+    agent, monkeypatch, late_capability,
+):
+    """A late capability refusal cannot mutate a prior failed turn or client state."""
+    import agent.conversation_loop as conversation_loop
+
+    agent._topic_segmentation_enabled = True
+    agent._pending_topic_retraction = {
+        "session_id": "prior-session", "message_ids": [41, 42], "turn_lease_holder": "prior-lease",
+    }
+    sink = MagicMock()
+    sink.retract_topic_turn_messages.return_value = 2
+    agent._session_db = sink
+    sentinel_client = object()
+    agent.client = sentinel_client
+    before = (agent.api_key, agent.base_url, dict(agent._client_kwargs), agent.client)
+    replacement = object()
+    resolve = MagicMock(return_value=("new-key", "https://new.example/v1", "https://old.example/v1"))
+    replace = MagicMock(side_effect=lambda **_kwargs: setattr(agent, "client", replacement) or True)
+    monkeypatch.setattr(agent, "_resolve_env_credentials", resolve)
+    monkeypatch.setattr(agent, "_should_adopt_env_credentials", lambda *_args: True)
+    monkeypatch.setattr(agent, "_replace_primary_openai_client", replace)
+    callback = MagicMock()
+    published_mcp = False
+    if late_capability == "mcp":
+        import tools.mcp_tool  # Activate the guarded registered-server snapshot path.
+
+        monkeypatch.setattr(
+            "tools.mcp_tool_discovery.get_registered_mcp_server_names",
+            lambda: {"late-mcp"} if published_mcp else set(),
+        )
+
+    def inject_late_capability(*_args, **_kwargs):
+        nonlocal published_mcp
+        if late_capability == "mcp":
+            published_mcp = True
+        else:
+            from tools.bot_mode_dm import publish_message_agent_authorization_snapshot
+
+            publish_message_agent_authorization_snapshot(agent, True)
+        return _minimal_turn_context()
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", inject_late_capability)
+    result = conversation_loop._run_conversation_turn(agent, "q", conversation_history=[], stream_callback=callback)
+
+    assert result["pre_admission_failure"] is True
+    assert sink.retract_topic_turn_messages.call_count == 0
+    assert agent._pending_topic_retraction["message_ids"] == [41, 42]
+    assert (agent.api_key, agent.base_url, dict(agent._client_kwargs), agent.client) == before
+    assert agent.client is sentinel_client
+    resolve.assert_not_called()
+    replace.assert_not_called()
+    callback.assert_not_called()
+    assert sink.method_calls == []
+
+
+def test_selected_topic_admitted_turn_retries_exact_prior_ids_then_refreshes_credentials(agent, monkeypatch):
+    """Accepted selected turns preserve exact retry recovery and deferred refresh."""
+    import agent.conversation_loop as conversation_loop
+
+    agent._topic_segmentation_enabled = True
+    agent.tools = []
+    agent.valid_tool_names = set()
+    # Other tests may have imported the MCP module; pin the public snapshot to
+    # the admitted empty surface for this recovery-order assertion.
+    monkeypatch.setattr("tools.mcp_tool_discovery.get_registered_mcp_server_names", lambda: set())
+    agent._pending_topic_retraction = {
+        "session_id": "prior-session", "message_ids": [9, 9, 12], "turn_lease_holder": "prior-lease",
+    }
+    sink = MagicMock()
+    sink.retract_topic_turn_messages.return_value = 2
+    agent._session_db = sink
+    refreshed = MagicMock(return_value=False)
+    call_order = MagicMock()
+    call_order.attach_mock(sink.retract_topic_turn_messages, "retract")
+    call_order.attach_mock(refreshed, "refresh")
+    monkeypatch.setattr(agent, "_try_refresh_env_client_credentials", refreshed)
+    monkeypatch.setattr(conversation_loop, "build_turn_context", lambda *_args, **_kwargs: _minimal_turn_context())
+
+    class _StopAfterAdmission(Exception):
+        pass
+
+    monkeypatch.setattr(
+        conversation_loop, "_emit_reaction", lambda *_args: (_ for _ in ()).throw(_StopAfterAdmission()),
+    )
+    monkeypatch.setattr(conversation_loop, "_admit_selected_topic_prompt_persistence", lambda *_args: None)
+
+    with pytest.raises(_StopAfterAdmission):
+        conversation_loop._run_conversation_turn(agent, "q", conversation_history=[])
+
+    sink.retract_topic_turn_messages.assert_called_once_with(
+        "prior-session", [9, 9, 12], turn_lease_holder="prior-lease",
+    )
+    assert not hasattr(agent, "_pending_topic_retraction")
+    refreshed.assert_called_once_with()
+    assert call_order.mock_calls == [
+        call.retract("prior-session", [9, 9, 12], turn_lease_holder="prior-lease"),
+        call.refresh(),
     ]
 
 
