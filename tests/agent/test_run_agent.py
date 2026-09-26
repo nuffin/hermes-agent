@@ -216,7 +216,8 @@ def test_selected_topic_actual_prologue_refuses_late_tool_before_provider_callba
     assert result["api_calls"] == 0
     agent.client.chat.completions.create.assert_not_called()
     callback.assert_not_called()
-    assert agent._inflight_turn_id is None
+    assert not hasattr(agent, "_inflight_turn_id")
+    assert not hasattr(agent, "_inflight_turn_session_id")
     assert not [
         call for call in sink.method_calls
         if call[0] in {"create_session", "update_system_prompt", "update_session_tool_names", "append_message"}

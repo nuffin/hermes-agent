@@ -56,6 +56,7 @@ class _FakeAgent:
         self.enabled_toolsets = None
         self.disabled_toolsets = None
         self._skip_mcp_refresh = False
+        self._topic_segmentation_enabled = False
         self.compression_enabled = False
         self.context_compressor = types.SimpleNamespace(
             protect_first_n=2, protect_last_n=2
@@ -71,15 +72,16 @@ class _FakeAgent:
 
         self.context_compressor.should_compress = _fake_should_compress
         self.context_compressor.should_compress_info = _fake_should_compress_info
-        self._cached_system_prompt = "SYSTEM"
+        self._cached_system_prompt: str | None = "SYSTEM"
         self._memory_store = None
         self._memory_manager = None
+        self._session_db = MagicMock()
         self._memory_nudge_interval = 0
         self._turns_since_memory = 0
         self._user_turn_count = 0
         self._todo_store = _FakeTodoStore()
         self._tool_guardrails = _FakeGuardrails()
-        self._compression_warning = None
+        self._compression_warning: str | None = None
         self._emit_warning = MagicMock()
         self._last_ctx_overflow_warn = None
         self._interrupt_requested = False
@@ -122,6 +124,9 @@ class _FakeAgent:
         return False
 
     def _emit_status(self, _msg):
+        pass
+
+    def _emit_diagnostic_status(self, _msg):
         pass
 
     def _replay_compression_warning(self):
@@ -263,9 +268,92 @@ def test_selected_topic_late_dynamic_tool_stops_before_session_or_candidate_publ
             call for call in agent._session_db.method_calls
             if call[0] in {"create_session", "update_system_prompt", "update_session_tool_names", "append_message"}
         ]
+        assert agent.tools == []
+        assert agent.valid_tool_names == set()
 
 
-# ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
+def test_selected_topic_refusal_runs_no_recovery_runtime_or_status_path(monkeypatch, tmp_path):
+    """The dynamic gate is before every recovery and prompt-rebuild side effect."""
+    from agent.session_topics import TopicPrepublicationCapabilityError
+
+    agent = _FakeAgent()
+    agent._topic_segmentation_enabled = True
+    agent._cached_system_prompt = None
+    agent._session_db = MagicMock()
+    agent._restore_primary_runtime = MagicMock()
+    agent._cleanup_dead_connections = MagicMock(return_value=True)
+    agent._emit_diagnostic_status = MagicMock()
+    agent._replay_compression_warning = MagicMock()
+    agent._compression_warning = "stale warning"
+    recovered = MagicMock(return_value=[{"role": "user", "content": "rotated"}])
+    prompt_snapshot = tmp_path / "skills-system-prompt.snapshot"
+    prompt_snapshot.write_bytes(b"stale Bot Chat prompt snapshot")
+    restore = MagicMock(side_effect=lambda *_a: prompt_snapshot.write_bytes(b"cleared"))
+    session_context = MagicMock()
+    write_origin = MagicMock()
+
+    def inject_mcp(target):
+        target.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
+        target.valid_tool_names = {"mcp_late_tool"}
+
+    monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", inject_mcp)
+    monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+    monkeypatch.setattr("agent.turn_context.recover_rotated_compression_session", recovered)
+
+    with pytest.raises(TopicPrepublicationCapabilityError):
+        _build(
+            agent,
+            restore_or_build_system_prompt=restore,
+            set_session_context=session_context,
+            set_current_write_origin=write_origin,
+        )
+
+    assert prompt_snapshot.read_bytes() == b"stale Bot Chat prompt snapshot"
+    restore.assert_not_called()
+    recovered.assert_not_called()
+    agent._restore_primary_runtime.assert_not_called()
+    agent._cleanup_dead_connections.assert_not_called()
+    agent._emit_diagnostic_status.assert_not_called()
+    agent._replay_compression_warning.assert_not_called()
+    session_context.assert_not_called()
+    write_origin.assert_not_called()
+    assert agent._tool_guardrails.reset_called is False
+    assert not hasattr(agent, "_current_turn_id")
+    assert agent.tools == [] and agent.valid_tool_names == set()
+
+
+def test_selected_topic_admission_runs_deferred_recovery_and_runtime(monkeypatch):
+    """Accepted text-only selected-topic turns retain ordinary recovery behavior."""
+    agent = _FakeAgent()
+    agent._topic_segmentation_enabled = True
+    events = []
+
+    def refresh(_agent):
+        events.append("dynamic")
+
+    def recover(target):
+        events.append("recovery")
+        target.session_id = "compression-child"
+        return [{"role": "user", "content": "rotated"}]
+
+    monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", refresh)
+    monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+    monkeypatch.setattr("agent.turn_context.recover_rotated_compression_session", recover)
+    monkeypatch.setattr(
+        "agent.session_topics.prepare_topic_turn",
+        lambda _agent, messages, current_turn_user_idx, _original: (
+            messages, current_turn_user_idx, messages[:-1],
+        ),
+    )
+    agent._restore_primary_runtime = lambda: events.append("runtime")
+
+    ctx = _build(agent)
+
+    assert events == ["dynamic", "recovery", "runtime"]
+    assert ctx.conversation_history == [{"role": "user", "content": "rotated"}]
+    assert ctx.messages[:-1] == ctx.conversation_history
+    assert agent.session_id == "compression-child"
+
 #
 # The prologue is the ONLY place the per-turn synchronous
 # memory_manager.prefetch_all() fires; a bare greeting must not block the

@@ -1655,11 +1655,9 @@ def _run_conversation_turn(
     except Exception as _topic_setup_exc:
         from agent.session_topics import TopicPrepublicationCapabilityError, TopicSegmentationRuntimeError
         if isinstance(_topic_setup_exc, TopicPrepublicationCapabilityError):
-            # _bind_turn_identity registered the in-flight marker before dynamic
-            # capabilities were assembled; this refused turn never reaches a
-            # persistence funnel to clear it.
-            from agent.agent_runtime_helpers import note_turn_persisted
-            note_turn_persisted(agent)
+            # Dynamic selected-topic refusal occurs before turn identity binding.
+            # Do not invoke a persistence/session hook merely to clear a marker
+            # that was never registered.
             return _topic_pre_admission_result(agent, conversation_history, _topic_setup_exc.failure)
         if not isinstance(_topic_setup_exc, TopicSegmentationRuntimeError):
             raise

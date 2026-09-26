@@ -534,6 +534,36 @@ def _refresh_mcp_tools_between_turns(agent: Any) -> None:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
 
+def _assemble_selected_topic_dynamic_capabilities(agent: Any) -> tuple[str, str] | None:
+    """Build and validate the late MCP/Bot surface before a selected-topic turn mutates
+    any recoverable session state.
+
+    MCP refresh and Bot Mode injection are deliberately in-memory probes here.  A refusal
+    restores their tool snapshot so a following recovery command (notably
+    ``/session-topic off``) cannot later persist an unadmitted capability surface.
+    """
+    tools_before = getattr(agent, "tools", None)
+    tools_snapshot = list(tools_before) if isinstance(tools_before, list) else tools_before
+    valid_before = getattr(agent, "valid_tool_names", None)
+    valid_snapshot = set(valid_before) if isinstance(valid_before, set) else valid_before
+
+    _refresh_mcp_tools_between_turns(agent)
+    try:
+        from tools.bot_mode_dm import ensure_message_agent_tool
+
+        ensure_message_agent_tool(agent)
+    except Exception:
+        logger.debug("message_agent injection skipped", exc_info=True)
+
+    from agent.session_topics import selected_topic_prepublication_capability_failure
+
+    failure = selected_topic_prepublication_capability_failure(agent)
+    if failure is not None:
+        agent.tools = tools_snapshot
+        agent.valid_tool_names = valid_snapshot
+    return failure
+
+
 def _bind_turn_identity(
     agent: Any, task_id: Optional[str], stream_callback, persist_user_message: Any,
     persist_user_timestamp: Optional[float], persist_user_platform_id: Optional[str],
@@ -1033,18 +1063,38 @@ def build_turn_context(
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
+    # Dynamic MCP/Bot capability discovery is the selected-topic admission boundary.  It
+    # intentionally precedes rotation recovery, runtime publication, prompt recovery, turn
+    # state reset, and every status/callback path: a refused turn must be observationally
+    # inert, including across a later `/session-topic off` command in the same process.
+    if getattr(agent, "_topic_segmentation_enabled", False):
+        from agent.session_topics import TopicPrepublicationCapabilityError
+
+        if (failure := _assemble_selected_topic_dynamic_capabilities(agent)) is not None:
+            raise TopicPrepublicationCapabilityError(failure)
+    else:
+        _refresh_mcp_tools_between_turns(agent)
+        try:
+            from tools.bot_mode_dm import ensure_message_agent_tool
+
+            ensure_message_agent_tool(agent)
+        except Exception:
+            logger.debug("message_agent injection skipped", exc_info=True)
+
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
 
-    # Recover a rotated session before binding log/turn ids or copying client history so
-    # everything in this turn belongs to the canonical child.
+    # Recover a rotated session only after selected-topic admission.  Recovery can reopen
+    # the parent and rewrite compression/session locks, so it is not a safe probe.
     recovered_history = recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
 
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the
-    # skill write-origin ContextVar; restore the primary runtime after a fallback turn.
+    # skill write-origin ContextVar; restore and publish the primary runtime only after
+    # admission.  `_reset_per_turn_agent_state` below can emit a status while cleaning dead
+    # connections, so it remains on this side of the boundary as well.
     # NOTE: the DB session row is created later, AFTER the system prompt is restored/built (see
     # _ensure_db_session() below the system-prompt block). Creating it here — before _cached_system_prompt
     # is populated — inserts a row with system_prompt=NULL on a fresh API/gateway agent that carries
@@ -1056,7 +1106,6 @@ def build_turn_context(
     set_review_attended(getattr(agent, "_review_attended", False))
     agent._restore_primary_runtime()
     _publish_runtime_main(agent)
-    _refresh_mcp_tools_between_turns(agent)
 
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
@@ -1120,25 +1169,10 @@ def build_turn_context(
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = agent._cached_system_prompt
 
-    # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat" session (same
-    # gate as the protocol section); gate is session-stable, so cache-safe.
-    try:
-        from tools.bot_mode_dm import ensure_message_agent_tool
-
-        ensure_message_agent_tool(agent)
-    except Exception:
-        logger.debug("message_agent injection skipped", exc_info=True)
-
-    # MCP refresh and Bot Mode injection have now assembled the complete dynamic
-    # tool surface.  Refuse before row creation, topic projection, compaction,
-    # callbacks, or crash persistence can publish a selected-topic candidate.
-    from agent.session_topics import (
-        TopicPrepublicationCapabilityError,
-        selected_topic_prepublication_capability_failure,
-    )
-    if (_topic_capability_failure := selected_topic_prepublication_capability_failure(agent)) is not None:
-        raise TopicPrepublicationCapabilityError(_topic_capability_failure)
-
+    # The dynamic MCP/Bot capability surface was assembled and admitted before recovery,
+    # runtime publication, prompt restore, and any session mutation above.  Do not re-inject
+    # here: doing so after stale Bot Chat prompt recovery could clear its disk snapshot on a
+    # refusal path.
     _ensure_session_row(agent, pending_cli_message)
 
     # A turn interrupted before admission could not write its accepted input because
