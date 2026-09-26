@@ -205,6 +205,8 @@ class PostgreSQLStateStore(SessionRuntimeOwnershipMixin):
         from state_store_alembic.semantic_catalog import validate_current_catalog_cursor
 
         validate_current_catalog_cursor(cursor, self._schema)
+
+    @staticmethod
     def _route_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
         return dict(value) if isinstance(value, Mapping) else {}
 
