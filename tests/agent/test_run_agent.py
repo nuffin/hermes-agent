@@ -269,6 +269,8 @@ def test_selected_topic_late_rejection_does_not_retry_prior_retraction_or_refres
     monkeypatch.setattr(agent, "_should_adopt_env_credentials", lambda *_args: True)
     monkeypatch.setattr(agent, "_replace_primary_openai_client", replace)
     callback = MagicMock()
+    raw_log = MagicMock()
+    monkeypatch.setattr(conversation_loop, "_summarize_user_message_for_log", raw_log)
     published_mcp = False
     if late_capability == "mcp":
         import tools.mcp_tool  # Activate the guarded registered-server snapshot path.
@@ -299,6 +301,7 @@ def test_selected_topic_late_rejection_does_not_retry_prior_retraction_or_refres
     resolve.assert_not_called()
     replace.assert_not_called()
     callback.assert_not_called()
+    raw_log.assert_not_called()
     assert sink.method_calls == []
 
 
