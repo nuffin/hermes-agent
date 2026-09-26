@@ -535,33 +535,56 @@ def _refresh_mcp_tools_between_turns(agent: Any) -> None:
 
 
 def _assemble_selected_topic_dynamic_capabilities(agent: Any) -> tuple[str, str] | None:
-    """Build and validate the late MCP/Bot surface before a selected-topic turn mutates
-    any recoverable session state.
+    """Validate dynamic MCP/Bot capability admission without changing any state.
 
-    MCP refresh and Bot Mode injection are deliberately in-memory probes here.  A refusal
-    restores their tool snapshot so a following recovery command (notably
-    ``/session-topic off``) cannot later persist an unadmitted capability surface.
+    A selected-topic refusal must leave both its agent and process-wide MCP
+    state untouched.  Do not use the ordinary refresh here: adoption consumes
+    OAuth attempts, registers servers, advances the registry generation and can
+    change the agent's toolset selection.  The normal (non-selected) path below
+    remains the one committing refresh and Bot injection after admission.
     """
-    tools_before = getattr(agent, "tools", None)
-    tools_snapshot = list(tools_before) if isinstance(tools_before, list) else tools_before
-    valid_before = getattr(agent, "valid_tool_names", None)
-    valid_snapshot = set(valid_before) if isinstance(valid_before, set) else valid_before
-
-    _refresh_mcp_tools_between_turns(agent)
-    try:
-        from tools.bot_mode_dm import ensure_message_agent_tool
-
-        ensure_message_agent_tool(agent)
-    except Exception:
-        logger.debug("message_agent injection skipped", exc_info=True)
-
     from agent.session_topics import selected_topic_prepublication_capability_failure
 
     failure = selected_topic_prepublication_capability_failure(agent)
     if failure is not None:
-        agent.tools = tools_snapshot
-        agent.valid_tool_names = valid_snapshot
-    return failure
+        return failure
+
+    try:
+        if "tools.connectors.mcp" in sys.modules:
+            from tools.connectors.mcp import late_connection_names_ready_for_adoption
+
+            if late_connection_names_ready_for_adoption(agent):
+                from agent.session_topics import (
+                    TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
+                    TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,
+                )
+                return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+        if "tools.mcp_tool" in sys.modules:
+            from tools.mcp_tool_discovery import has_registered_mcp_tools
+
+            if has_registered_mcp_tools():
+                from agent.session_topics import (
+                    TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
+                    TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,
+                )
+                return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+        from tools.bot_mode_dm import message_agent_authorized
+
+        if message_agent_authorized(agent):
+            from agent.session_topics import (
+                TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
+                TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,
+            )
+            return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+    except Exception:
+        # Dynamic detection is fail-closed: an uncertain late surface is not
+        # safe to publish under selected-topic semantics.
+        from agent.session_topics import (
+            TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE,
+            TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE,
+        )
+        return TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_CODE, TOPIC_PREPUBLICATION_CAPABILITY_FAILURE_MESSAGE
+    return None
 
 
 def _bind_turn_identity(

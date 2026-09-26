@@ -338,6 +338,32 @@ def _late_key(operation: ConnectionOperation) -> Tuple[str, str]:
 _LATE_ATTEMPTS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
+def late_connection_names_ready_for_adoption(agent: Any) -> List[str]:
+    """Return late MCP names this turn would adopt, without consuming an attempt.
+
+    Selected-topic admission must decide whether a turn is publishable before it
+    changes its tool surface.  In particular, it must not pop ``_LATE_ATTEMPTS``
+    or register a server merely to discover that the resulting capability would
+    be refused.  ``OAuthAttempt.poll`` is a snapshot read; configuration is also
+    read-only here.  The committing ``adopt_late_connections`` path remains the
+    sole owner of attempt consumption and server registration.
+    """
+    session_key = operation_session_key(getattr(agent, "session_id", None))
+    attempts = _LATE_ATTEMPTS.get((hermes_home_key(), session_key))
+    if not attempts:
+        return []
+    from tools.mcp_tool_config import _load_mcp_config
+
+    configs = _load_mcp_config()
+    ready: List[str] = []
+    for name, attempt in attempts.items():
+        snapshot = attempt.poll()
+        if (snapshot.get("status") == "approved" and not snapshot.get("discovery_error")
+                and isinstance(configs.get(name), dict)):
+            ready.append(name)
+    return ready
+
+
 def adopt_late_connections(agent: Any) -> List[str]:
     """Register the servers whose authorization committed after their card had closed, and add
     them to the agent's toolset selection. Runs between turns, so the result that said "not

@@ -17,6 +17,8 @@ import pytest
 from agent.turn_context import (
     PreflightCompressionTimedOut,
     TurnContext,
+    _assemble_selected_topic_dynamic_capabilities,
+    _refresh_mcp_tools_between_turns,
     build_turn_context,
 )
 
@@ -236,28 +238,19 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
-def test_selected_topic_late_dynamic_tool_stops_before_session_or_candidate_publication(monkeypatch):
-    """The real prologue rejects MCP/Bot injection before durable setup or hooks."""
+def test_selected_topic_dynamic_tool_stops_before_session_or_candidate_publication(monkeypatch):
+    """The real prologue rejects existing and Bot dynamic tools before setup or hooks."""
     from agent.session_topics import TopicPrepublicationCapabilityError
 
-    def inject_mcp(agent):
-        agent.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
-        agent.valid_tool_names = {"mcp_late_tool"}
-
-    def inject_bot(agent):
-        agent.tools = [{"type": "function", "function": {"name": "message_agent"}}]
-        agent.valid_tool_names = {"message_agent"}
-
-    for injection in (inject_mcp, inject_bot):
+    for is_bot in (False, True):
         agent = _FakeAgent()
         agent._topic_segmentation_enabled = True
         agent._session_db = MagicMock()
-        if injection is inject_mcp:
-            monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", injection)
-            monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+        if is_bot:
+            monkeypatch.setattr("tools.bot_mode_dm.message_agent_authorized", lambda _agent: True)
         else:
-            monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", lambda _agent: None)
-            monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", inject_bot)
+            agent.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
+            agent.valid_tool_names = {"mcp_late_tool"}
 
         with pytest.raises(TopicPrepublicationCapabilityError):
             _build(agent)
@@ -268,8 +261,50 @@ def test_selected_topic_late_dynamic_tool_stops_before_session_or_candidate_publ
             call for call in agent._session_db.method_calls
             if call[0] in {"create_session", "update_system_prompt", "update_session_tool_names", "append_message"}
         ]
-        assert agent.tools == []
-        assert agent.valid_tool_names == set()
+        expected_names = {"mcp_late_tool"} if not is_bot else set()
+        assert agent.valid_tool_names == expected_names
+
+
+def test_selected_topic_late_mcp_admission_probe_does_not_consume_real_adoption(monkeypatch):
+    """A rejected selected turn leaves the real parked-MCP adoption path untouched.
+
+    The following ordinary turn must still consume that exact attempt once.  This
+    covers the connector's real late-attempt bookkeeping, rather than injecting
+    an already-built tool list into the agent.
+    """
+    import tools.connectors.mcp as mcp
+
+    class _ApprovedAttempt:
+        def poll(self):
+            return {"status": "approved", "discovery_error": ""}
+
+    agent = _FakeAgent()
+    agent._topic_segmentation_enabled = True
+    agent.enabled_toolsets = []
+    from hermes_constants import hermes_home_key
+
+    key = (hermes_home_key(), "sess-1")
+    attempts = {key: {"late-server": _ApprovedAttempt()}}
+    monkeypatch.setattr(mcp, "_LATE_ATTEMPTS", attempts)
+    monkeypatch.setattr("tools.mcp_tool_config._load_mcp_config", lambda: {"late-server": {"url": "https://example.invalid/mcp"}})
+    registered = []
+    monkeypatch.setattr(
+        "tools.mcp_tool_discovery.register_mcp_servers",
+        lambda servers: registered.extend(servers) or [],
+    )
+
+    assert _assemble_selected_topic_dynamic_capabilities(agent) is not None
+    assert mcp._LATE_ATTEMPTS == attempts
+    assert registered == []
+    assert agent.enabled_toolsets == []
+    assert agent.tools == [] and agent.valid_tool_names == set()
+
+    agent._topic_segmentation_enabled = False
+    _refresh_mcp_tools_between_turns(agent)
+
+    assert registered == ["late-server"]
+    assert mcp._LATE_ATTEMPTS == {}
+    assert agent.enabled_toolsets == ["late-server"]
 
 
 def test_selected_topic_refusal_runs_no_recovery_runtime_or_status_path(monkeypatch, tmp_path):
@@ -292,12 +327,8 @@ def test_selected_topic_refusal_runs_no_recovery_runtime_or_status_path(monkeypa
     session_context = MagicMock()
     write_origin = MagicMock()
 
-    def inject_mcp(target):
-        target.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
-        target.valid_tool_names = {"mcp_late_tool"}
-
-    monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", inject_mcp)
-    monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
+    agent.tools = [{"type": "function", "function": {"name": "mcp_late_tool"}}]
+    agent.valid_tool_names = {"mcp_late_tool"}
     monkeypatch.setattr("agent.turn_context.recover_rotated_compression_session", recovered)
 
     with pytest.raises(TopicPrepublicationCapabilityError):
@@ -319,7 +350,8 @@ def test_selected_topic_refusal_runs_no_recovery_runtime_or_status_path(monkeypa
     write_origin.assert_not_called()
     assert agent._tool_guardrails.reset_called is False
     assert not hasattr(agent, "_current_turn_id")
-    assert agent.tools == [] and agent.valid_tool_names == set()
+    assert agent.tools == [{"type": "function", "function": {"name": "mcp_late_tool"}}]
+    assert agent.valid_tool_names == {"mcp_late_tool"}
 
 
 def test_selected_topic_admission_runs_deferred_recovery_and_runtime(monkeypatch):
@@ -328,16 +360,11 @@ def test_selected_topic_admission_runs_deferred_recovery_and_runtime(monkeypatch
     agent._topic_segmentation_enabled = True
     events = []
 
-    def refresh(_agent):
-        events.append("dynamic")
-
     def recover(target):
         events.append("recovery")
         target.session_id = "compression-child"
         return [{"role": "user", "content": "rotated"}]
 
-    monkeypatch.setattr("agent.turn_context._refresh_mcp_tools_between_turns", refresh)
-    monkeypatch.setattr("tools.bot_mode_dm.ensure_message_agent_tool", lambda _agent: False)
     monkeypatch.setattr("agent.turn_context.recover_rotated_compression_session", recover)
     monkeypatch.setattr(
         "agent.session_topics.prepare_topic_turn",
@@ -349,7 +376,7 @@ def test_selected_topic_admission_runs_deferred_recovery_and_runtime(monkeypatch
 
     ctx = _build(agent)
 
-    assert events == ["dynamic", "recovery", "runtime"]
+    assert events == ["recovery", "runtime"]
     assert ctx.conversation_history == [{"role": "user", "content": "rotated"}]
     assert ctx.messages[:-1] == ctx.conversation_history
     assert agent.session_id == "compression-child"
