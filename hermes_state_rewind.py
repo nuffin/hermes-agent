@@ -79,6 +79,7 @@ def _rewind_user_turn_impl(
     carrier. ``adopt_row_ids`` (TUI): copy durable ``_row_id`` identities onto the installed warm prefix so
     clients can address follow-ups by row; the CLI leaves its history shape alone. Out-of-range /
     wrong-shape targets raise :class:`RewindTargetUnavailableError`."""
+    from agent.agent_runtime_helpers import repair_message_sequence
     from agent.context_compressor import (
         _DB_PERSISTED_MARKER, history_before_user_originated_turn, retryable_user_text,
         split_user_originated_turn, user_originated_turn_view)
@@ -145,7 +146,8 @@ def _rewind_user_turn_impl(
             "expected_active_ids": expected_active_ids,
             # Pin against the STORED row (upstream #115493 semantics); receipt-bearing stores
             # compare on the same projection the durable row stores.
-            "expected_target_content": _comparison_content(stored_view) if receipt_capable else stored_view.get("content"),        }
+            "expected_target_content": _comparison_content(stored_view) if receipt_capable else stored_view.get("content"),
+        }
         # SQLite retains its historical primitive signature. Receipt-bearing
         # stores opt in explicitly; this is not a duck-typed SQLite extension.
         if receipt_capable:
