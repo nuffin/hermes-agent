@@ -44,6 +44,41 @@ class CLIChatTurnMixin:
             return
         GatewayRunner._apply_fallback_chain_to_agent(agent, self._fallback_model)
 
+    def _sync_compression_config_with_config(self, agent) -> None:
+        """Apply only compression and context-window edits to the live agent before a turn.
+
+        The config read is fail-closed: a torn file must retain the last-known-good
+        compressor rather than being interpreted as an empty configuration.  This
+        intentionally updates the existing compressor in place and never rebuilds
+        the agent/client or cache-sensitive conversation state.
+        """
+        from cli import logger
+
+        try:
+            from agent.compression_live_config import (
+                apply_live_compression_config,
+                compression_config_signature,
+            )
+            from hermes_cli.config_effective import load_user_config_effective
+
+            cfg = load_user_config_effective(fail_closed=True)
+            signature = compression_config_signature(cfg)
+        except Exception as e:
+            logger.debug("compression config sync skipped (keeping active settings): %s", e)
+            return
+        if (
+            signature == getattr(self, "_compression_config_seen", None)
+            and getattr(self, "_compression_config_seen_agent", None) is agent
+        ):
+            return
+        try:
+            apply_live_compression_config(agent, cfg)
+        except Exception as e:
+            logger.warning("compression config sync skipped (keeping active settings): %s", e)
+            return
+        self._compression_config_seen = signature
+        self._compression_config_seen_agent = agent
+
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """Run one user turn; returns the agent's response, or None on error.
 
@@ -77,6 +112,7 @@ class CLIChatTurnMixin:
         agent = self.agent
         if agent is None:
             return None
+        self._sync_compression_config_with_config(agent)
         self._sync_fallback_chain_with_config(agent)  # chain added after this chat opened reaches this turn
         message = self._chat_route_images(message, images)
 
