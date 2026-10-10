@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import math
+from types import TracebackType
 from typing import Any, Optional
 
 logger = logging.getLogger("topic_detection")
@@ -55,6 +56,14 @@ S6_THRESHOLD: float = 0.47
 # Long messages dilute the core intent with context, quotes, and numbered
 # lists; the first ~100 chars capture what the user actually wants.
 INTENT_PREFIX_LEN: int = 100
+
+
+def _redacted_s6_exc_info() -> tuple[type[RuntimeError], RuntimeError, TracebackType | None]:
+    """A traceback safe to log when an arbitrary embed callback fails."""
+    try:
+        raise RuntimeError("S6 embedding unavailable") from None
+    except RuntimeError as redacted:
+        return type(redacted), redacted, redacted.__traceback__
 
 
 def compute_s6_cosine(
@@ -93,8 +102,10 @@ def compute_s6_cosine(
             return None
 
         return _cosine(emb_a, emb_b)
-    except Exception as exc:
-        logger.debug("S6 cosine computation failed: %s", exc)
+    except Exception:
+        # The injected embedder is arbitrary code; its exception may contain
+        # message text, credentials or endpoint URLs. Log a synthetic traceback.
+        logger.debug("S6 cosine computation failed", exc_info=_redacted_s6_exc_info())
         return None
 
 

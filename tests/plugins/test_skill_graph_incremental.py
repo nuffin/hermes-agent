@@ -36,6 +36,16 @@ def sg():
 
 
 @pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    """Keep candidate tests away from the real profile even if graph lookup runs."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    yield home
+
+
+@pytest.fixture(autouse=True)
 def reset_cache(sg):
     """Clear the injection cache between tests."""
     sg._injected_names_cache.clear()
@@ -214,3 +224,71 @@ class TestInjectionBlockFormat:
             )
             lines = [l for l in block.split('\n') if l.startswith('- ')]
             assert len(lines) <= 10
+
+
+def _assert_redacted_failure(caplog, location):
+    records = [r for r in caplog.records if f"location=candidate.{location}" in r.message]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1].__context__ is None
+    assert "candidate lookup unavailable" in caplog.text
+    for private in ("https://private.invalid", "token-private", "session-private", "private request"):
+        assert private not in caplog.text
+
+
+class TestCandidateFailureBoundaries:
+    """Boundary failures retain fallback injection without logging private data."""
+
+    def test_embedding_client_failure_keeps_llm_delta(self, sg, caplog):
+        hit = {"name": "skill-a", "description": "A", "score": 0.9}
+        sg._injected_names_cache["_injected:session-private"] = {"skill-a"}
+        with patch.object(sg, "_skill_graph_config", return_value={}), \
+             patch.object(sg, "_split_intents", return_value=(["test intent"], None, True)), \
+             patch.object(sg, "_embedding_client", side_effect=RuntimeError(
+                 "token-private https://private.invalid private request")), \
+             patch.object(sg, "_embedding_search", return_value=[hit]):
+            block, intents = sg._build_skill_candidates_context(
+                "Continue implementing this function", session_id="session-private",
+                prev_msg="Implement this function", prev_intents=["test intent"],
+            )
+        assert block is None  # llm_only continuation filters the already-injected hit
+        assert intents == []
+        _assert_redacted_failure(caplog, "client")
+
+    def test_topic_detector_failure_forces_full_injection(self, sg, caplog):
+        hit = {"name": "skill-a", "description": "A", "score": 0.9}
+        sg._injected_names_cache["_injected:session-private"] = {"skill-a"}
+        with patch.object(sg, "_skill_graph_config", return_value={}), \
+             patch.object(sg, "_split_intents", return_value=(["test intent"], None, True)), \
+             patch.object(sg, "_embedding_client", return_value=None), \
+             patch("importlib.util.spec_from_file_location", side_effect=RuntimeError(
+                 "token-private https://private.invalid private request")), \
+             patch.object(sg, "_embedding_search", return_value=[hit]):
+            block, intents = sg._build_skill_candidates_context(
+                "Continue implementing this function", session_id="session-private",
+                prev_msg="Implement this function", prev_intents=["test intent"],
+            )
+        assert "skill-a" in block  # unknown topic => full, not delta
+        assert intents == ["test intent"]
+        assert sg._injected_names_cache["_injected:session-private"] == {"skill-a"}
+        _assert_redacted_failure(caplog, "topic")
+
+    def test_lexical_failure_keeps_other_intent_candidates(self, sg, caplog):
+        with patch.object(sg, "_skill_graph_config", return_value={}), \
+             patch.object(sg, "_split_intents", return_value=(
+                 ["first intent", "second intent"], None, None)), \
+             patch.object(sg, "_embedding_client", return_value=None), \
+             patch.object(sg, "_embedding_search", return_value=[]), \
+             patch.object(sg, "_ensure_graph", return_value=MagicMock()), \
+             patch.object(sg, "_search_graph", side_effect=[
+                 RuntimeError("token-private https://private.invalid private request"),
+                 [{"name": "skill-b", "description": "B"}],
+             ]) as lexical:
+            block, intents = sg._build_skill_candidates_context(
+                "Find skills for both intents", session_id="session-private", is_first_turn=True,
+            )
+        assert lexical.call_count == 2
+        assert "skill-b" in block
+        assert intents == ["first intent", "second intent"]
+        assert sg._injected_names_cache["_injected:session-private"] == {"skill-b"}
+        _assert_redacted_failure(caplog, "lexical")
