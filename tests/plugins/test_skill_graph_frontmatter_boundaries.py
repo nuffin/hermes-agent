@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,13 +15,19 @@ PLUGIN_PATH = Path(__file__).parents[2] / "plugins" / "skill-graph" / "__init__.
 SECRET = "SECRET-skill-path-tags-scenes-suggestions"
 
 
-@pytest.fixture
-def env(tmp_path, monkeypatch):
+@pytest.fixture(params=["bare", "package"])
+def env(tmp_path, monkeypatch, request):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    spec = importlib.util.spec_from_file_location("test_skill_graph_frontmatter_plugin", PLUGIN_PATH)
+    name = "test_skill_graph_frontmatter_plugin"
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_PATH,
+        submodule_search_locations=[str(PLUGIN_PATH.parent)] if request.param == "package" else None,
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    if request.param == "package":
+        monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -124,4 +131,72 @@ def test_enrich_persists_db_and_observes_write_policy(env, monkeypatch, caplog, 
     assert ("tags:" in path.read_text()) == (policy == "writable")
     assert ("DB only" in caplog.text) == (policy in ("bundled", "read-only"))
     assert "enrichment suggestions" in caplog.text
+    _private(caplog)
+
+
+def test_single_skill_uses_late_bound_seams_and_commits_fts_terms(env, monkeypatch, caplog):
+    module, conn, root = env
+    path = root / "bundled" / "SKILL.md"
+    path.parent.mkdir()
+    path.write_text("---\nname: test-skill\n---\nBody\n")
+    _skill(conn, path, SECRET)
+    conn.execute("INSERT INTO skill_fts (name, tags) VALUES (?, ?)", (SECRET, "old"))
+    conn.execute("INSERT INTO skill_terms (term, skill_name) VALUES (?, ?)", ("old", SECRET))
+    conn.commit()
+
+    prompts = []
+    monkeypatch.setattr(module, "_build_enrichment_prompt", lambda n, c: prompts.append((n, c)) or "prompt")
+    monkeypatch.setattr(module, "_call_llm_for_enrichment", lambda p: {
+        "tags": [SECRET], "scenes": ["coding", "not-a-scene"], "suggestions": [SECRET],
+    } if p == "prompt" else None)
+    monkeypatch.setattr(module, "_extract_skill_terms", lambda n, t, d: [("new", 0.7, "tag")])
+    monkeypatch.setattr(module, "get_bundled_skills_dir", lambda fallback: path.parent)
+    monkeypatch.setattr(module, "_patch_skill_frontmatter", lambda *args: pytest.fail("bundled write"))
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        assert module._enrich_skill(conn, SECRET)
+    assert prompts == [(SECRET, path.read_text())]
+    assert conn.in_transaction is False
+    row = conn.execute("SELECT enriched, enriched_at, tags, scenes FROM skill_nodes WHERE name = ?", (SECRET,)).fetchone()
+    assert row["enriched"] == 1 and row["enriched_at"]
+    assert json.loads(row["tags"]) == [SECRET]
+    assert json.loads(row["scenes"]) == ["coding"]
+    assert [tuple(r) for r in conn.execute("SELECT tags, scenes FROM skill_fts WHERE name = ?", (SECRET,))] == [(SECRET, "coding")]
+    assert [tuple(r) for r in conn.execute("SELECT term, strength, source FROM skill_terms WHERE skill_name = ?", (SECRET,))] == [("new", 0.7, "tag")]
+    assert "tags:" not in path.read_text()
+    _private(caplog)
+
+
+def test_db_error_before_frontmatter_write_can_be_rolled_back(env, monkeypatch):
+    module, conn, root = env
+    path = root / "skills" / "SKILL.md"
+    path.parent.mkdir()
+    original = "---\nname: test-skill\n---\nBody\n"
+    path.write_text(original)
+    _skill(conn, path)
+    conn.execute("CREATE TRIGGER abort_term_update BEFORE DELETE ON skill_terms BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+    conn.execute("INSERT INTO skill_terms (term, skill_name) VALUES ('old', 'test-skill')")
+    conn.commit()
+    monkeypatch.setattr(module, "_call_llm_for_enrichment", lambda prompt: {"tags": ["new"], "scenes": ["coding"]})
+    monkeypatch.setattr(module, "_patch_skill_frontmatter", lambda *args: pytest.fail("write before DB update"))
+    with pytest.raises(sqlite3.IntegrityError, match="blocked"):
+        module._enrich_skill(conn, "test-skill")
+    conn.rollback()
+    assert tuple(conn.execute("SELECT enriched, tags FROM skill_nodes WHERE name = 'test-skill'").fetchone()) == (0, "[]")
+    assert [r[0] for r in conn.execute("SELECT term FROM skill_terms")] == ["old"]
+    assert path.read_text() == original
+
+
+def test_pending_cooldown_force_and_private_names(env, monkeypatch, caplog):
+    module, conn, root = env
+    # The existing pending query targets databases with the legacy soft-delete column.
+    conn.execute("ALTER TABLE skill_nodes ADD COLUMN is_deleted INTEGER DEFAULT 0")
+    _skill(conn, root / "unused", SECRET)
+    conn.execute("UPDATE skill_nodes SET enriched_at = datetime('now') WHERE name = ?", (SECRET,))
+    calls = []
+    monkeypatch.setattr(module, "_enrich_skill", lambda db, name: calls.append((db, name)) or False)
+    assert module._enrich_pending_skills(conn) == 0
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        assert module._enrich_pending_skills(conn, force=True) == 0
+    assert calls == [(conn, SECRET)]
+    assert "FAILED" in caplog.text
     _private(caplog)

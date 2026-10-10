@@ -238,3 +238,62 @@ def test_real_client_cpu_fallback_stores_embedding(graph, monkeypatch, caplog):
     row = conn.execute("SELECT model, dim, vector FROM skill_embeddings").fetchone()
     assert (row["model"], row["dim"]) == ("bge-m3", 2)
     assert row["vector"] == backend.to_blob([1.0, 0.0])
+
+
+@pytest.mark.parametrize("register_package", [True, False], ids=["package-spec", "bare-spec"])
+def test_loader_modes_resolve_siblings_and_keep_late_patch_seams(
+    tmp_path, monkeypatch, register_package,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    name = f"skill_graph_embedding_mode_{'package' if register_package else 'bare'}"
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_PATH,
+        submodule_search_locations=[str(PLUGIN_PATH.parent)] if register_package else None,
+    )
+    assert spec and spec.loader
+    sg = importlib.util.module_from_spec(spec)
+    if register_package:
+        monkeypatch.setitem(sys.modules, name, sg)
+    spec.loader.exec_module(sg)
+    assert sg._embedding_text("first", {"description": "one"}) == "first\none"
+    real_backend = sg._load_embedding_backend()
+    assert real_backend is sg._load_embedding_backend()
+    assert real_backend.EmbeddingClient(lambda: {})
+
+    backend = ModuleType(f"{name}.embedding_client")
+    setattr(backend, "EmbeddingClient", lambda reader: (reader(), client)[1])
+    setattr(backend, "to_blob", lambda vec: struct.pack(f"{len(vec)}f", *vec))
+    setattr(backend, "cosine_batch", lambda _query, blobs: [0.9 for _ in blobs])
+    monkeypatch.setattr(sg, "_load_embedding_backend", lambda: backend)
+    monkeypatch.setattr(sg, "_skill_graph_config", lambda: {"embedding_backend": "test"})
+    client = Mock()
+    client.is_available.return_value = True
+    client.model_name.return_value = "test-model"
+    client.embed.return_value = [[1.0, 0.0]]
+    assert sg._embedding_client() is client
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        sg._init_db(conn)
+        sg._migrate_db(conn)
+        conn.execute("INSERT INTO skill_nodes (name, description) VALUES (?, ?)", ("first", "original"))
+        # Both seams are read when invoked, not captured by the sibling loader.
+        monkeypatch.setattr(sg, "_embedding_text", lambda _name, _info: "patched text")
+        assert sg._compute_embedding_for_skill(conn, "first", {})
+        client.embed.assert_called_with(["patched text"])
+        monkeypatch.setattr(sg, "_ensure_graph", lambda: conn)
+        monkeypatch.setattr(sg, "_get_node_info", lambda _conn, _name: {
+            "description": "patched node", "scenes": ["coding"],
+        })
+        assert sg._embedding_search("search", scenes=["coding"]) == [{
+            "name": "first", "description": "patched node", "scenes": ["coding"], "score": 1.0,
+        }]
+        # Replacing the client after one search must affect the next call.
+        monkeypatch.setattr(sg, "_embedding_client", lambda: None)
+        assert sg._embedding_search("search") == []
+    finally:
+        conn.close()
