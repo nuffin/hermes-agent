@@ -188,6 +188,46 @@ class TestDeltaInjectionCache:
             assert "skill-z" in cache2
 
 
+class TestCandidateFacadeSeams:
+    """Injection reads plugin-level callbacks and cache on each call."""
+
+    def test_rebound_cache_and_callbacks_used_on_each_turn(self, sg, monkeypatch):
+        cache = {}
+        monkeypatch.setattr(sg, "_injected_names_cache", cache)
+        monkeypatch.setattr(sg, "_skill_graph_config", lambda: {})
+        split = MagicMock(return_value=(["work"], None, True))
+        monkeypatch.setattr(sg, "_split_intents", split)
+        monkeypatch.setattr(sg, "_detect_candidate_topic", lambda *args: {
+            "method": "llm", "topic_continuation": True,
+        })
+        rank = MagicMock(return_value=[{"name": "first", "score": 0.9}])
+        monkeypatch.setattr(sg, "_rank_skill_candidates", rank)
+
+        first, intents = sg._build_skill_candidates_context(
+            "Implement a working feature", session_id="rebound", is_first_turn=True,
+        )
+        assert "first" in first
+        assert cache["_injected:rebound"] == {"first"}
+
+        rank.return_value = [{"name": "first", "score": 0.9}, {"name": "second", "score": 0.8}]
+        delta, _ = sg._build_skill_candidates_context(
+            "Continue implementing the feature", session_id="rebound",
+            prev_msg="Implement a working feature", prev_intents=intents,
+        )
+        assert "second" in delta and "first" not in delta
+        assert cache["_injected:rebound"] == {"first", "second"}
+        assert split.call_count == 2 and rank.call_count == 2
+
+    def test_bare_spec_loads_adjacent_candidates(self, isolated_home):
+        # The plugin loader also supports a bare spec without a registered package.
+        spec = importlib.util.spec_from_file_location("candidate_bare_spec", _PLUGIN_PATH)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod._build_skill_candidates_context("hi", is_first_turn=True) == (None, [])
+        assert mod._injected_names_cache == {}
+
+
 class TestInjectionBlockFormat:
     """Verify the injected block format is correct."""
 

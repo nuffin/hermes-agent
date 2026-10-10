@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +33,8 @@ class Response:
         return {"choices": [{"message": {"content": self.content}}]}
 
 
-@pytest.fixture
-def request_env(monkeypatch, tmp_path):
+@pytest.fixture(params=["bare", "package"])
+def request_env(monkeypatch, tmp_path, request):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     monkeypatch.setenv("TEST_ENRICH_KEY", SECRET)
     monkeypatch.setenv("TEST_ENRICH_URL", f"https://{SECRET}.invalid/v1/")
@@ -48,9 +49,15 @@ def request_env(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
     monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", registry)
     monkeypatch.setattr("hermes_cli.auth.has_usable_secret", bool)
-    spec = importlib.util.spec_from_file_location("test_skill_graph_enrichment_plugin", PLUGIN_PATH)
+    name = "test_skill_graph_enrichment_plugin"
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_PATH,
+        submodule_search_locations=[str(PLUGIN_PATH.parent)] if request.param == "package" else None,
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    if request.param == "package":
+        monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     sleeps = []
     monkeypatch.setattr(module.time, "sleep", sleeps.append)
@@ -202,3 +209,60 @@ def test_setup_and_model_fallback_redact_config_errors(request_env, monkeypatch,
     assert len(calls) == 1
     assert "location=enrichment.setup" in caplog.text
     _assert_private(caplog)
+
+
+def test_intent_split_continuation_and_model_override(request_env, monkeypatch, caplog):
+    module, config, _, sleeps = request_env
+    config["skills"]["config"]["skill-graph"]["intent_split_model"] = "split-model"
+    calls = _responses(monkeypatch, [Response(""), Response(
+        '```json\n{"intents": ["  Review the change.  ", "Run its tests."], '
+        '"scene": "coding", "topic_continuation": "YES"}\n```'
+    )])
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        result = module._split_intents(SECRET, ["Earlier task"])
+    assert result == (["Review the change.", "Run its tests."], "coding", True)
+    assert len(calls) == 2 and sleeps == [1.5]
+    assert calls[0][2]["model"] == "split-model"
+    assert calls[0][2]["temperature"] == 0.1
+    assert calls[0][2]["max_tokens"] == 1024
+    assert "Earlier task" in calls[0][2]["messages"][0]["content"]
+    assert calls[0][0] == f"https://{SECRET}.invalid/v1/chat/completions"
+    _assert_private(caplog)
+
+
+def test_intent_split_no_provider_and_exhausted_transport(request_env, monkeypatch, caplog):
+    module, _, _, sleeps = request_env
+    monkeypatch.delenv("TEST_ENRICH_KEY")
+    calls = _responses(monkeypatch, [])
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        assert module._split_intents(SECRET) == ([], None, None)
+    assert calls == [] and sleeps == []
+    _assert_private(caplog)
+
+    monkeypatch.setenv("TEST_ENRICH_KEY", SECRET)
+    caplog.clear()
+    calls = _responses(monkeypatch, [requests.ConnectionError(SECRET)] * 3)
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        assert module._split_intents(SECRET) == ([], None, None)
+    assert len(calls) == 3 and sleeps == [1.5, 3.0]
+    _assert_private(caplog)
+
+
+def test_facade_seams_remain_late_bound(request_env, monkeypatch):
+    module, _, _, _ = request_env
+    monkeypatch.setattr(module, "_request_enrichment_with_retries", lambda *a: {"injected": True})
+    assert module._call_llm_for_enrichment(SECRET) == {"injected": True}
+    monkeypatch.setattr(module, "_resolve_llm_provider", lambda: None)
+    assert module._split_intents(SECRET) == ([], None, None)
+    monkeypatch.setattr(module, "_split_intents", lambda *a: (["patched"], "coding", None))
+    assert module._split_intents(SECRET) == (["patched"], "coding", None)
+
+
+def test_prompt_scene_vocabulary_and_response_contract(request_env):
+    module, _, _, _ = request_env
+    assert module._needs_enrichment({"tags": ["t"], "scenes": []})
+    prompt = module._build_enrichment_prompt("sample", "x" * 4100)
+    assert "sample" in prompt and "coding:" in prompt and "x" * 4000 in prompt
+    assert "x" * 4001 not in prompt
+    assert module._parse_enrichment_response({"choices": [{"message": {"content": ""}}]}) == (True, None)
+    assert module._parse_enrichment_response({"choices": [{"message": {"content": "[]"}}]}) == (False, None)

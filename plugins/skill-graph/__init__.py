@@ -562,338 +562,121 @@ def _upsert_skill(conn: sqlite3.Connection, name: str, path: Path, now: float) -
 
 # ── Embedding ──────────────────────────────────────────────────────────────
 
+# Load adjacent siblings even when a caller uses spec_from_file_location
+# without inserting the plugin package in sys.modules.
+try:
+    from . import skill_graph_embeddings as _embedding_impl
+except ImportError:
+    import importlib.util as _embedding_importlib
+
+    _embedding_spec = _embedding_importlib.spec_from_file_location(
+        f"{__name__}.skill_graph_embeddings", Path(__file__).with_name("skill_graph_embeddings.py")
+    )
+    assert _embedding_spec is not None and _embedding_spec.loader is not None
+    _embedding_impl = _embedding_importlib.module_from_spec(_embedding_spec)
+    _embedding_spec.loader.exec_module(_embedding_impl)
+
+
+_bare_embedding_backend: Any = None
+
+
+def _load_embedding_backend() -> Any:
+    # Resolve the adjacent backend in both package and bare-spec loader modes.
+    try:
+        from . import embedding_client
+        return embedding_client
+    except ImportError:
+        global _bare_embedding_backend
+        if _bare_embedding_backend is None:
+            import importlib.util as importlib_util
+
+            spec = importlib_util.spec_from_file_location(
+                f"{__name__}.embedding_client", Path(__file__).with_name("embedding_client.py")
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError("embedding_client.py not importable")
+            module = importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _bare_embedding_backend = module
+        return _bare_embedding_backend
+
 
 def _embedding_client() -> Any:
-    """Build the EmbeddingClient from skills.config.skill-graph config."""
-    try:
-        from .embedding_client import EmbeddingClient
-    except ImportError:
-        try:
-            from embedding_client import EmbeddingClient
-        except ImportError:
-            logger.warning("skill-graph: embedding_client.py not importable")
-            return None
-
-    def _reader() -> dict:
-        return _skill_graph_config()
-
-    return EmbeddingClient(_reader)
+    return _embedding_impl.embedding_client(
+        config_reader=_skill_graph_config, load_backend=_load_embedding_backend, logger=logger,
+    )
 
 
 def _embedding_text(name: str, info: dict[str, Any]) -> str:
-    """Build the text to embed for a skill (name + category + description + tags)."""
-    parts = [name]
-    if info.get("category"):
-        parts.append(info["category"])
-    if info.get("description"):
-        parts.append(str(info["description"]))
-    tags = info.get("tags") or []
-    if tags:
-        parts.append(" ".join(str(t) for t in tags))
-    return "\n".join(parts)
+    return _embedding_impl.embedding_text(name, info)
 
 
 def _compute_embedding_for_skill(
     conn: sqlite3.Connection, name: str, info: dict[str, Any]
 ) -> bool:
-    """Compute + store embedding for one skill. Returns True on success.
-
-    Uses the configured backend (auto → TEI, CPU fallback). Failure is
-    non-fatal — logs a warning and leaves the row absent (retried next rebuild).
-    """
-    client = _embedding_client()
-    if client is None:
-        return False
-    try:
-        from .embedding_client import to_blob
-    except ImportError:
-        try:
-            from embedding_client import to_blob  # noqa: F401
-        except ImportError:
-            logger.warning("skill-graph: embedding_client.py not importable")
-            return False
-    try:
-        if not client.is_available():
-            logger.info("skill-graph: embedding backend unavailable; embedding deferred")
-            return False
-        text = _embedding_text(name, info)
-        vec = client.embed([text])[0]
-        if not vec:
-            logger.warning("skill-graph: empty embedding [location=embedding.single]")
-            return False
-        model = client.model_name()
-        blob = to_blob(vec)
-        dim = len(vec)
-        conn.execute(
-            """INSERT OR REPLACE INTO skill_embeddings
-               (skill_name, vector, model, dim, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (name, blob, model, dim, time.time()),
-        )
-        return True
-    except Exception:
-        # Pluggable backends can put skill text, URLs or credentials in exceptions.
-        logger.warning("skill-graph: embedding failed [location=embedding.single]",
-                       exc_info=_redacted_candidate_exc_info())
-        return False
+    return _embedding_impl.compute_embedding_for_skill(
+        conn, name, info, client_factory=_embedding_client,
+        load_backend=_load_embedding_backend, text_builder=_embedding_text,
+        logger=logger, redacted_exc_info=_redacted_candidate_exc_info,
+    )
 
 
 def _rebuild_embeddings(conn: sqlite3.Connection) -> int:
-    """Compute embeddings for all skills that lack one (batch, best-effort).
-
-    Called after full rebuild / incremental sync. Skips skills that already
-    have an embedding for the current model. Returns count computed.
-    """
-    try:
-        from .embedding_client import to_blob
-    except ImportError:
-        try:
-            from embedding_client import to_blob  # noqa: F401
-        except ImportError:
-            logger.warning("skill-graph: embedding_client.py not importable")
-            return 0
-
-    client = _embedding_client()
-    if client is None:
-        return 0
-    try:
-        if not client.is_available():
-            logger.info("skill-graph: embedding backend unavailable — embeddings deferred")
-            return 0
-    except Exception:
-        logger.warning("skill-graph: embedding availability failed [location=embedding.availability]",
-                       exc_info=_redacted_candidate_exc_info())
-        return 0
-
-    try:
-        model = client.model_name()
-    except Exception:
-        logger.warning("skill-graph: embedding model unavailable [location=embedding.model]",
-                       exc_info=_redacted_candidate_exc_info())
-        return 0
-    # Skills missing an embedding for the current model
-    rows = conn.execute(
-        """SELECT n.name, n.category, n.description, n.tags
-           FROM skill_nodes n
-           LEFT JOIN skill_embeddings e ON e.skill_name = n.name
-           WHERE e.skill_name IS NULL OR e.model != ?
-             AND (n.is_deleted IS NULL OR n.is_deleted = 0)""",
-        (model,),
-    ).fetchall()
-
-    if not rows:
-        return 0
-
-    texts = []
-    for row in rows:
-        name = row["name"]
-        info = {
-            "category": row["category"],
-            "description": row["description"],
-            "tags": json.loads(row["tags"]) if row["tags"] else [],
-        }
-        texts.append(_embedding_text(name, info))
-
-    logger.info("skill-graph: computing embeddings for %d skills", len(texts))
-    # TEI max_client_batch_size is 32 — chunk to avoid oversized POSTs
-    BATCH = 32
-    vecs: list[list[float]] = []
-    for i in range(0, len(texts), BATCH):
-        chunk = texts[i : i + BATCH]
-        try:
-            chunk_vecs = client.embed(chunk)
-            if len(chunk_vecs) != len(chunk) or any(not vec for vec in chunk_vecs):
-                raise ValueError("incomplete embedding batch")
-            vecs.extend(chunk_vecs)
-        except Exception:
-            # Preserve complete earlier chunks but never count a partial batch.
-            logger.warning("skill-graph: batch embedding failed [location=embedding.batch]",
-                           exc_info=_redacted_candidate_exc_info())
-            break
-
-    now = time.time()
-    count = 0
-    expected_dim = len(vecs[0]) if vecs else 0
-    for row, vec in zip(rows, vecs):
-        if len(vec) != expected_dim:
-            logger.warning("skill-graph: inconsistent embedding dimension [location=embedding.row]")
-            continue
-        try:
-            blob = to_blob(vec)
-            conn.execute(
-                """INSERT OR REPLACE INTO skill_embeddings
-                   (skill_name, vector, model, dim, updated_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (row["name"], blob, model, len(vec), now),
-            )
-            count += 1
-        except Exception:
-            logger.warning("skill-graph: embedding row failed [location=embedding.row]",
-                           exc_info=_redacted_candidate_exc_info())
-    try:
-        conn.commit()
-    except sqlite3.Error as exc:
-        _log_fallback_exception("skill-graph: embedding commit failed [location=embedding.commit]", exc)
-        conn.rollback()
-        return 0
-    logger.info("skill-graph: stored %d embeddings", count)
-    return count
+    return _embedding_impl.rebuild_embeddings(
+        conn, client_factory=_embedding_client, load_backend=_load_embedding_backend,
+        text_builder=_embedding_text, logger=logger,
+        redacted_exc_info=_redacted_candidate_exc_info, log_error=_log_fallback_exception,
+    )
 
 
 def _drop_embeddings(conn: sqlite3.Connection, name: str) -> None:
-    """Remove embedding rows for a skill (on delete)."""
-    try:
-        conn.execute("DELETE FROM skill_embeddings WHERE skill_name = ?", (name,))
-    except sqlite3.Error as exc:
-        _log_fallback_exception("skill-graph: embedding removal failed [location=embedding.drop]", exc)
+    return _embedding_impl.drop_embeddings(conn, name, log_error=_log_fallback_exception)
 
 
 def _embedding_search(
     query: str, topk: int = 5, scenes: list[str] | None = None
 ) -> list[dict[str, Any]]:
-    """Semantic search over skill embeddings.
-
-    Returns top-k skills ranked by cosine similarity, each with name,
-    description, and score. Falls back to the lexical graph search when
-    embeddings are unavailable.
-    """
-    try:
-        from .embedding_client import EmbeddingClient, to_blob, cosine_batch
-    except ImportError:
-        try:
-            from embedding_client import EmbeddingClient, to_blob, cosine_batch  # noqa: F401
-        except ImportError:
-            return []
-
-    client = _embedding_client()
-    if client is None:
-        return []
-    try:
-        if not client.is_available():
-            return []
-    except Exception:
-        logger.warning("skill-graph: search backend unavailable [location=embedding.search.availability]",
-                       exc_info=_redacted_candidate_exc_info())
-        return []
-
-    try:
-        conn = _ensure_graph()
-        conn.row_factory = sqlite3.Row
-        qvec = client.embed([query])[0]
-        if not qvec:
-            return []
-        qblob = to_blob(qvec)
-        rows = conn.execute(
-            "SELECT skill_name, vector FROM skill_embeddings"
-        ).fetchall()
-        if not rows:
-            return []
-        names = [r["skill_name"] for r in rows]
-        blobs = [r["vector"] for r in rows]
-        scores = cosine_batch(qblob, blobs)
-        ranked = sorted(zip(names, scores), key=lambda x: -x[1])
-
-        # Scene soft-boost (×1.3) for skills whose scenes overlap the intent's
-        scenes_set = set(scenes or [])
-        out: list[dict[str, Any]] = []
-        for name, score in ranked[: topk * 3]:
-            info = _get_node_info(conn, name) or {}
-            skill_scenes = info.get("scenes") or []
-            effective = score
-            if scenes_set and any(s in scenes_set for s in skill_scenes):
-                effective = min(1.0, score * 1.3)
-            out.append(
-                {
-                    "name": name,
-                    "description": info.get("description", ""),
-                    "score": round(effective, 4),
-                    "scenes": skill_scenes,
-                }
-            )
-        out.sort(key=lambda x: -x["score"])
-        return out[:topk]
-    except Exception:
-        logger.warning("skill-graph: embedding search failed [location=embedding.search]",
-                       exc_info=_redacted_candidate_exc_info())
-        return []
-
+    return _embedding_impl.embedding_search(
+        query, topk, scenes, client_factory=_embedding_client,
+        load_backend=_load_embedding_backend, ensure_graph=_ensure_graph,
+        get_node_info=_get_node_info, logger=logger,
+        redacted_exc_info=_redacted_candidate_exc_info,
+    )
 
 # ── pre_llm_call: candidate injection (Plan A) ─────────────────────────────
 
-# Per-session state for delta injection: session_id → set of injected skill names
+try:
+    from . import skill_graph_candidates as _candidate_impl
+except ImportError:
+    import importlib.util as _candidate_importlib
+
+    _candidate_spec = _candidate_importlib.spec_from_file_location(
+        f"{__name__}.skill_graph_candidates", Path(__file__).with_name("skill_graph_candidates.py")
+    )
+    assert _candidate_spec is not None and _candidate_spec.loader is not None
+    _candidate_impl = _candidate_importlib.module_from_spec(_candidate_spec)
+    _candidate_spec.loader.exec_module(_candidate_impl)
+
+# Preserve the plugin-level cache object for session tracking and external hooks.
 _injected_names_cache: dict[str, set[str]] = {}
 
-
-def _redacted_candidate_exc_info() -> tuple[type[RuntimeError], RuntimeError, Any]:
-    """Synthetic traceback for failures that may carry private request data."""
-    try:
-        raise RuntimeError("candidate lookup unavailable") from None
-    except RuntimeError as redacted:
-        redacted.__context__ = None
-        return type(redacted), redacted, redacted.__traceback__
-
+_redacted_candidate_exc_info = _candidate_impl.redacted_candidate_exc_info
 
 def _detect_candidate_topic(
     msg: str, prev_msg: str | None, llm_tc: bool | None,
 ) -> dict[str, Any] | None:
-    """Detect continuity; an unavailable detector means full injection."""
-    embed_fn: Any = None
-    try:
-        client = _embedding_client()
-        if client:
-            embed_fn = lambda text: (client.embed([text]) or [None])[0]
-    except Exception:
-        # Client construction is a pluggable boundary; errors may contain URLs or secrets.
-        logger.warning("skill-graph: candidate embedding client unavailable [location=candidate.client]",
-                       exc_info=_redacted_candidate_exc_info())
-
-    try:
-        import importlib.util as importlib_util
-        detector_path = Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py"
-        if detector_path.exists():
-            spec = importlib_util.spec_from_file_location("topic_detection", str(detector_path))
-            detector = importlib_util.module_from_spec(spec)
-            spec.loader.exec_module(detector)
-            return detector.detect_topic_shift(
-                msg, prev_msg=prev_msg,
-                llm_topic_continuation=llm_tc,
-                embed_fn=embed_fn,
-            )
-    except Exception:
-        # Dynamic loader and detector invoke arbitrary callbacks; never expose their errors.
-        logger.warning("skill-graph: candidate topic detection unavailable [location=candidate.topic]",
-                       exc_info=_redacted_candidate_exc_info())
-    return None
-
+    return _candidate_impl.detect_candidate_topic(
+        msg, prev_msg, llm_tc, client_factory=_embedding_client,
+        detector_path=Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py",
+        logger=logger, redacted_exc_info=_redacted_candidate_exc_info,
+    )
 
 def _rank_skill_candidates(intents: list[str]) -> list[dict[str, Any]]:
-    """Merge semantic results, falling back to lexical search per intent."""
-    merged: dict[str, dict[str, Any]] = {}
-    for intent in intents[:6]:
-        hits = _embedding_search(intent, topk=5)
-        if not hits:
-            try:
-                conn = _ensure_graph()
-                lex = _search_graph(intent, conn, limit=5)
-                for result in lex:
-                    hits.append({
-                        "name": result.get("name", ""),
-                        "description": result.get("description", ""),
-                        "score": 0.5,
-                        "scenes": [],
-                    })
-            except Exception:
-                # Retrieval is best-effort; SQL and graph callbacks can carry request text.
-                logger.warning("skill-graph: candidate lexical fallback unavailable [location=candidate.lexical]",
-                               exc_info=_redacted_candidate_exc_info())
-        for hit in hits:
-            name = hit.get("name", "")
-            if not name:
-                continue
-            if name not in merged or hit.get("score", 0) > merged[name].get("score", 0):
-                merged[name] = hit
-    return sorted(merged.values(), key=lambda result: -result.get("score", 0))
-
+    return _candidate_impl.rank_skill_candidates(
+        intents, embedding_search=_embedding_search, ensure_graph=_ensure_graph,
+        search_graph=_search_graph, logger=logger,
+        redacted_exc_info=_redacted_candidate_exc_info,
+    )
 
 def _build_skill_candidates_context(
     user_message: str,
@@ -902,690 +685,113 @@ def _build_skill_candidates_context(
     prev_msg: str | None = None,
     prev_intents: list[str] | None = None,
 ) -> tuple[str | None, list[str]]:
-    """Return candidate block and intents, or ``(None, [])`` when skipped.
-
-    Continuations inject only unseen candidates; topic shifts and failures
-    inject the full list. Empty intent splits use the raw message; unavailable
-    embeddings use lexical lookup. Short conversational messages are skipped.
-    """
-    if not user_message or not isinstance(user_message, str):
-        return None, []
-    msg = user_message.strip()
-    if not msg:
-        return None, []
-
-    # Cost guard: skip conversational filler and very short messages.
-    if len(msg) < 12:
-        return None, []
-    lowered = msg.lower()
-    _trivial_prefixes = (
-        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
-        "好的", "谢谢", "你好", "嗯", "okay", "知道了", "收到",
-    )
-    if lowered in _trivial_prefixes or any(
-        lowered.startswith(p) for p in _trivial_prefixes
-    ):
-        return None, []
-    # Pure confirmation / single-word replies
-    if msg in ("好", "可以", "行", "ok", "yes", "no", "y", "n", "done", "完成", "继续"):
-        return None, []
-
-    # Config gate: injection can be disabled entirely
-    if _skill_graph_config().get("inject_candidates") is False:
-        return None, []
-
-    # Intent split (one lightweight LLM call). Pass prev_intents to get
-    # topic_continuation judgment (piggy-backed, zero extra cost).
-    intents, scene, llm_tc = _split_intents(msg, prev_intents=prev_intents)
-    if not intents:
-        intents = [msg]
-
-    # LLM judgment is usable only when the previous intents are available.
-    topic_result = _detect_candidate_topic(msg, prev_msg, llm_tc if prev_intents else None)
-
-    # Determine injection mode: full or delta
-    force_full = True  # missing detector or fallback always uses full injection
-    if not is_first_turn and topic_result and topic_result.get("method") != "fallback":
-        force_full = not topic_result.get("topic_continuation", False)
-
-    ranked = _rank_skill_candidates(intents)
-    if not ranked:
-        return None, []
-
-    # ── Delta filtering ──
-    injected_key = f"_injected:{session_id}"
-    if force_full:
-        # Reset: inject all, rebuild tracking set
-        candidates = ranked[:10]
-        _injected_names_cache[injected_key] = set(
-            c["name"] for c in candidates
-        )
-        mode_label = "full"
-    else:
-        # Delta: only inject candidates not yet seen this session
-        already = _injected_names_cache.get(injected_key, set())
-        delta = [c for c in ranked[:10] if c["name"] not in already]
-        if not delta:
-            logger.info("skill-graph: no new candidates (all %d already injected)", len(already))
-            return None, []
-        candidates = delta
-        _injected_names_cache[injected_key] = already | set(
-            c["name"] for c in candidates
-        )
-        mode_label = "delta"
-
-    # Cap the injection budget (~2K tokens ≈ keep candidates lean).
-    lines = []
-    for c in candidates:
-        desc = (c.get("description") or "")[:120]
-        lines.append(f"- {c['name']}: {desc}  (score={c.get('score', 0):.2f})")
-    block = (
-        "Relevant skills you may want to load (skill_load) for this request:\n"
-        + "\n".join(lines)
+    return _candidate_impl.build_skill_candidates_context(
+        user_message, session_id, is_first_turn, prev_msg, prev_intents,
+        config_reader=_skill_graph_config, split_intents=_split_intents,
+        detect_topic=_detect_candidate_topic, rank_candidates=_rank_skill_candidates,
+        injected_names_cache=_injected_names_cache, logger=logger,
     )
 
-    tc_str = ""
-    if topic_result:
-        tc_str = f" [topic={topic_result.get('method')}, cont={topic_result.get('topic_continuation')}]"
 
-    logger.info(
-        "skill-graph: injected %d skill candidates (%s mode, from %d intents): %s%s",
-        len(candidates), mode_label, len(intents),
-        ", ".join(c["name"] for c in candidates),
-        tc_str,
+# ── LLM enrichment and intent split ─────────────────────────────────────────
+# The bare-spec loader does not register the plugin as a package in sys.modules.
+try:
+    from . import skill_graph_enrichment as _enrichment_impl
+except ImportError:
+    import importlib.util as _enrichment_importlib
+
+    _enrichment_spec = _enrichment_importlib.spec_from_file_location(
+        f"{__name__}.skill_graph_enrichment", Path(__file__).with_name("skill_graph_enrichment.py")
     )
-    return block, intents
+    assert _enrichment_spec is not None and _enrichment_spec.loader is not None
+    _enrichment_impl = _enrichment_importlib.module_from_spec(_enrichment_spec)
+    _enrichment_spec.loader.exec_module(_enrichment_impl)
 
-
-# ── LLM Enrichment ────────────────────────────────────────────────────────────
-
-# Scene vocabulary — fixed set of valid scene values for LLM enrichment
-SCENE_VOCABULARY = [
-    "coding",       # Writing/fixing/reviewing code, PRs, git operations
-    "writing",      # Composing text — papers, articles, docs, fiction
-    "research",     # Investigating, exploring, searching, auditing
-    "design",       # Architecture, system design, planning, prototyping
-    "devops",       # Deploying, configuring, docker, infrastructure
-    "hermes",       # Hermes agent config, plugins, skills, meta-work
-    "media",        # Audio, video, image production
-    "common",       # Cross-scene, applicable in any context
-]
+SCENE_VOCABULARY = _enrichment_impl.SCENE_VOCABULARY
+SCENE_VOCABULARY_DESC = _enrichment_impl.SCENE_VOCABULARY_DESC
 
 
 def _needs_enrichment(info: dict[str, Any]) -> bool:
-    """Check if a skill needs LLM enrichment (missing tags or scenes)."""
-    return not info.get("tags") or not info.get("scenes")
+    return _enrichment_impl.needs_enrichment(info)
 
 
 def _build_enrichment_prompt(skill_name: str, content: str) -> str:
-    """Build the LLM prompt for enriching a skill."""
-    scene_desc = "\n".join(
-        f"  - {s}: {SCENE_VOCABULARY_DESC.get(s, '')}"
-        for s in SCENE_VOCABULARY
-    )
-    return f"""You are a skill metadata tagger. Analyze this SKILL.md and produce:
-1. tags: 3-8 lowercase descriptive tags (domain, tech stack, activity type)
-2. scenes: 1-3 scene values from the fixed scene vocabulary below
-3. suggestions: any scene candidates NOT in the vocabulary that might apply
-
-Scene vocabulary (ONLY use these for the "scenes" field):
-{scene_desc}
-
-Rules for scenes:
-- Pick 1-3 most applicable scenes from the vocabulary above
-- Include "common" only if the skill truly applies across many scenes
-- Be conservative — if unsure, prefer fewer scenes
-
-Rules for tags:
-- Lowercase, descriptive, 3-8 tags
-- Include: domain, primary tech/tool, activity type
-- Example: ["python", "fastapi", "backend", "code-review"]
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{{"tags": ["tag1", "tag2", ...], "scenes": ["scene1", ...], "suggestions": []}}
-
-Skill: {skill_name}
-Content:
-{content[:4000]}"""
-
-
-SCENE_VOCABULARY_DESC = {
-    "coding": "Writing/fixing/reviewing code, PRs, git operations",
-    "writing": "Composing text — papers, articles, docs, fiction",
-    "research": "Investigating, exploring, searching, auditing",
-    "design": "Architecture, system design, planning, prototyping",
-    "devops": "Deploying, configuring, docker, infrastructure",
-    "hermes": "Hermes agent config, plugins, skills, meta-work",
-    "media": "Audio, video, image production",
-    "common": "Cross-scene, applicable in any context",
-}
+    return _enrichment_impl.build_enrichment_prompt(skill_name, content)
 
 
 def _parse_enrichment_response(data: Any) -> tuple[bool, dict[str, Any] | None]:
-    """Distinguish empty content (retry) from non-object JSON (stop)."""
-    text = (data.get("choices", [{}])[0]
-            .get("message", {}).get("content", "")).strip()
-    if not text:
-        return True, None
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:]) if len(lines) > 1 else text
-        if text.endswith("```"):
-            text = text[:-3]
-    if text.startswith("json"):
-        text = text[4:].strip()
-    result = json.loads(text)
-    return False, result if isinstance(result, dict) else None
+    return _enrichment_impl.parse_enrichment_response(data)
 
 
 def _request_enrichment_with_retries(url: str, headers: dict, payload: dict) -> dict[str, Any] | None:
-    """Bound transport/parse retries and keep all failure logs credential-free."""
-    import requests
-
-    for attempt in range(3):
-        resp = None
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            empty, result = _parse_enrichment_response(resp.json())
-            if not empty:
-                return result
-            location = "enrichment.empty"
-        except (requests.RequestException, json.JSONDecodeError, IndexError,
-                AttributeError, TypeError, KeyError):
-            location = "enrichment.request"
-        # A response's status_code is untrusted; log only a real HTTP integer.
-        code = getattr(resp, "status_code", None)
-        status = code if type(code) is int and 100 <= code <= 599 else None
-        logger.warning("skill-graph: %s [attempt=%d/3 status=%s]",
-                       location, attempt + 1, status)
-        if attempt < 2:
-            time.sleep(2 * (attempt + 1))
-    return None
+    return _enrichment_impl.request_enrichment_with_retries(
+        url, headers, payload, parse_response=_parse_enrichment_response, logger=logger,
+    )
 
 
 def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
-    """Call the configured LLM provider for enrichment; return JSON or None."""
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
-        from hermes_cli.config import load_config_readonly
-
-        config = load_config_readonly() or {}
-        sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-        enrichment_cfg = sg_config.get("enrichment", {}) if isinstance(sg_config, dict) else {}
-        preferred_provider = enrichment_cfg.get("provider", "")
-
-        def _resolve_provider(pid: str) -> tuple[str, str] | None:
-            """Return (api_key, base_url) for a provider, or None."""
-            pconfig = PROVIDER_REGISTRY.get(pid)
-            if not pconfig:
-                return None
-            for env_var in pconfig.api_key_env_vars:
-                key_val = os.environ.get(env_var, "")
-                if has_usable_secret(key_val):
-                    url = os.environ.get(pconfig.base_url_env_var, "") if pconfig.base_url_env_var else ""
-                    if not url:
-                        url = pconfig.inference_base_url or ""
-                    return key_val, url
-            return None
-
-        provider_name = ""
-        api_key = ""
-        base_url = ""
-        if preferred_provider:
-            resolved = _resolve_provider(preferred_provider)
-            if resolved:
-                provider_name = preferred_provider
-                api_key, base_url = resolved
-            else:
-                logger.warning("skill-graph: enrichment unavailable [location=enrichment.provider]")
-                return None
-        else:
-            # Default: use the main agent's configured provider
-            main_model_cfg = config.get("model", {})
-            main_provider = main_model_cfg.get("provider", "")
-            if main_provider:
-                resolved = _resolve_provider(main_provider)
-                if resolved:
-                    provider_name = main_provider
-                    api_key, base_url = resolved
-            if not provider_name:
-                # Last resort: first provider with a usable API key
-                for pid in PROVIDER_REGISTRY:
-                    if pid in ("copilot", "lmstudio"):
-                        continue
-                    resolved = _resolve_provider(pid)
-                    if resolved:
-                        provider_name = pid
-                        api_key, base_url = resolved
-                        break
-
-        if not provider_name:
-            logger.warning("skill-graph: enrichment unavailable [location=enrichment.provider]")
-            return None
-
-        # Resolve model: enrichment config → main agent model → deepseek-v4-flash
-        try:
-            model_name = enrichment_cfg.get("model", "") or config.get("model", {}).get("default", "")
-        except (AttributeError, TypeError):
-            logger.warning("skill-graph: enrichment model fallback [location=enrichment.model]")
-            model_name = ""
-        model_name = model_name or "deepseek-v4-flash"
-
-        # Normalise base_url: strip /v1 suffix if present (we add it below)
-        base_url = base_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 2048,
-        }
-        return _request_enrichment_with_retries(f"{base_url}/v1/chat/completions", headers, payload)
-    except (ImportError, OSError, TypeError, ValueError, AttributeError,
-            RuntimeError, KeyError, yaml.YAMLError):
-        logger.warning("skill-graph: enrichment unavailable [location=enrichment.setup]")
-        return None
+    return _enrichment_impl.call_llm_for_enrichment(
+        prompt, request_enrichment=_request_enrichment_with_retries, logger=logger,
+    )
 
 
-# ── Intent Split ───────────────────────────────────────────────────────────
-
-
-def _resolve_llm_provider(
-    config: dict | None = None,
-) -> tuple[str, str, str] | None:
-    """Resolve (provider_name, api_key, base_url) for LLM calls.
-
-    Mirrors enrichment's provider resolution: preferred provider from
-    config → main agent provider → first provider with a usable API key.
-    """
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
-        from hermes_cli.config import load_config_readonly
-    except (ImportError, OSError, TypeError, ValueError, AttributeError,
-            RuntimeError, yaml.YAMLError) as exc:
-        _log_fallback_exception("skill-graph: could not import provider configuration", exc)
-        return None
-    if config is None:
-        try:
-            config = load_config_readonly() or {}
-        except (ImportError, OSError, TypeError, ValueError, AttributeError,
-                RuntimeError, yaml.YAMLError) as exc:
-            _log_fallback_exception("skill-graph: could not read provider configuration", exc)
-            return None
-    if not isinstance(config, dict):
-        return None
-
-    sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-    if not isinstance(sg_config, dict):
-        sg_config = {}
-
-    def _resolve_provider(pid: str) -> tuple[str, str] | None:
-        pconfig = PROVIDER_REGISTRY.get(pid)
-        if not pconfig:
-            return None
-        for env_var in pconfig.api_key_env_vars:
-            key_val = os.environ.get(env_var, "")
-            if has_usable_secret(key_val):
-                url = os.environ.get(pconfig.base_url_env_var, "") if pconfig.base_url_env_var else ""
-                if not url:
-                    url = pconfig.inference_base_url or ""
-                return key_val, url
-        return None
-
-    provider_name = ""
-    api_key = ""
-    base_url = ""
-    preferred = sg_config.get("enrichment", {}).get("provider", "") if isinstance(sg_config.get("enrichment"), dict) else ""
-    if preferred:
-        resolved = _resolve_provider(preferred)
-        if resolved:
-            provider_name = preferred
-            api_key, base_url = resolved
-    if not provider_name:
-        main_provider = config.get("model", {}).get("provider", "")
-        if main_provider:
-            resolved = _resolve_provider(main_provider)
-            if resolved:
-                provider_name = main_provider
-                api_key, base_url = resolved
-    if not provider_name:
-        for pid in PROVIDER_REGISTRY:
-            if pid in ("copilot", "lmstudio"):
-                continue
-            resolved = _resolve_provider(pid)
-            if resolved:
-                provider_name = pid
-                api_key, base_url = resolved
-                break
-    if not provider_name:
-        return None
-    return provider_name, api_key, base_url
+def _resolve_llm_provider(config: dict | None = None) -> tuple[str, str, str] | None:
+    return _enrichment_impl.resolve_llm_provider(
+        config, logger=logger, log_fallback_exception=_log_fallback_exception,
+    )
 
 
 def _split_intents(
-    user_message: str,
-    prev_intents: list[str] | None = None,
+    user_message: str, prev_intents: list[str] | None = None,
 ) -> tuple[list[str], str | None, bool | None]:
-    """Split a user message into intent sentences via one lightweight LLM call.
-
-    Returns ``(intents, scene, topic_continuation)``:
-
-    - ``intents``: list of intent sentences (``[]`` on failure — caller falls
-      back to treating the whole message as one intent).
-    - ``scene``: one of coding|writing|research|design|devops|hermes|media|common,
-      or ``None`` if the LLM didn't return it.
-    - ``topic_continuation``: ``True``/``False`` from the LLM when
-      ``prev_intents`` is provided, ``None`` if unavailable. Piggy-backed onto
-      the intent-split call (zero extra API cost).
-
-    Multi-intent: each intent is a *sentence* (embedding-friendly), not a
-    keyword list. When ``prev_intents`` is given, the prompt includes the
-    previous message's intents so the model can judge topic continuity.
-    """
-    if not user_message or not user_message.strip():
-        return [], None, None
-
-    try:
-        import requests
-    except ImportError:
-        logger.warning("skill-graph: intent split skipped — requests not installed")
-        return [], None, None
-
-    resolved = _resolve_llm_provider()
-    if resolved is None:
-        logger.warning("skill-graph: intent split skipped — no provider with API key")
-        return [], None, None
-    provider_name, api_key, base_url = resolved
-
-    # Model: intent_split_model config → enrichment model → main model → default
-    model_name = "deepseek-v4-flash"
-    try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly() or {}
-        sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-        if isinstance(sg, dict):
-            model_name = (
-                sg.get("intent_split_model")
-                or (sg.get("enrichment", {}) or {}).get("model")
-                or config.get("model", {}).get("default")
-                or "deepseek-v4-flash"
-            )
-    except (ImportError, OSError, TypeError, ValueError, AttributeError,
-            RuntimeError, yaml.YAMLError) as exc:
-        _log_fallback_exception("skill-graph: intent split model fallback", exc)
-
-    base_url = base_url.rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-
-    # Build topic-continuation prompt section (only when prev_intents given)
-    topic_section = ""
-    if prev_intents:
-        prev_text = " | ".join(prev_intents[:3])
-        topic_section = (
-            f"\n--- PREVIOUS MESSAGE INTENTS ---\n{prev_text}\n--- END ---\n\n"
-            'Also include this field:\n'
-            '"topic_continuation": true/false — is this new message continuing '
-            "the same topic/task as the previous message (whose intents are "
-            "shown above), or is it a new topic?\n"
-            "Judge by the core intent, not surface words. Follow-ups, "
-            'clarifications, and confirmations are "continuation". A brand-new '
-            'task or unrelated question is "new topic".\n\n'
-        )
-
-    prompt = (
-        "Split the user's message into separate intents. Each intent should be "
-        "ONE complete sentence describing a single topic the user wants done. "
-        "Output ONLY JSON:\n"
-        '{"intents": ["<intent 1 as a sentence>", "<intent 2 as a sentence>", ...], '
-        '"scene": "<one of: coding|writing|research|design|devops|hermes|media|common>"'
-        + (', "topic_continuation": true/false}' if prev_intents else "}")
-        + "\nRules:\n"
-        "- Keep the user's original meaning; do not add requirements.\n"
-        "- 1-6 intents. If the message is a single topic, return exactly 1 intent "
-        "with the full message rephrased as a sentence.\n"
-        "- Each intent must be self-contained (no 'it'/'that' references across intents).\n"
-        "- Scene: pick the single most applicable value.\n"
-        + topic_section
-        + "User message:\n"
-        f"{user_message}"
+    return _enrichment_impl.split_intents(
+        user_message, prev_intents, resolve_provider=_resolve_llm_provider,
+        logger=logger, log_fallback_exception=_log_fallback_exception,
     )
 
-    payload = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": 1024,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+try:
+    from . import skill_graph_enrichment_store as _enrichment_store
+except ImportError:
+    import importlib.util as _store_importlib
 
-    import time as _time
-    for _attempt in range(3):
-        try:
-            resp = requests.post(
-                f"{base_url}/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            text = (data.get("choices", [{}])[0]
-                    .get("message", {}).get("content", "")).strip()
-            if not text:
-                if _attempt < 2:
-                    _time.sleep(1.5 * (_attempt + 1))
-                    continue
-                logger.warning("skill-graph: intent split empty response [attempt=3/3]")
-                return [], None, None
-
-            # Strip markdown code fences if present
-            if text.startswith("```"):
-                lines = text.split("\n")
-                text = "\n".join(lines[1:]) if len(lines) > 1 else text
-                if text.endswith("```"):
-                    text = text[:-3]
-            if text.startswith("json"):
-                text = text[4:].strip()
-
-            result = json.loads(text)
-            intents = result.get("intents", []) if isinstance(result, dict) else []
-            intents = [str(i).strip() for i in intents if str(i).strip()]
-            scene = result.get("scene") if isinstance(result, dict) else None
-            tc = result.get("topic_continuation") if isinstance(result, dict) else None
-            # Coerce tc to bool/None
-            if isinstance(tc, str):
-                tc = tc.lower().strip() in ("true", "yes", "1")
-            elif not isinstance(tc, bool):
-                tc = None
-            if intents:
-                return intents, scene, tc
-            logger.warning("skill-graph: intent split returned no intents")
-            return [], None, None
-
-        except (requests.RequestException, json.JSONDecodeError):
-            logger.warning(
-                "skill-graph: intent split request failed [attempt=%d/3]",
-                _attempt + 1,
-            )
-            if _attempt < 2:
-                _time.sleep(1.5 * (_attempt + 1))
-
-    return [], None, None
+    _store_spec = _store_importlib.spec_from_file_location(
+        f"{__name__}.skill_graph_enrichment_store",
+        Path(__file__).with_name("skill_graph_enrichment_store.py"),
+    )
+    assert _store_spec is not None and _store_spec.loader is not None
+    _enrichment_store = _store_importlib.module_from_spec(_store_spec)
+    _store_spec.loader.exec_module(_enrichment_store)
 
 
 def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]) -> bool:
-    """Write tags and scenes back to the SKILL.md frontmatter.
-
-    Only called for editable source dirs (non-read-only).
-    Returns True on success.
-    """
-    try:
-        p = Path(skill_path)
-        content = p.read_text(encoding="utf-8-sig", errors="replace")
-
-        # Find frontmatter boundaries
-        content_str = content.lstrip("\ufeff")
-        if not content_str.startswith("---"):
-            return False
-        end = content_str.find("---", 3)
-        if end == -1:
-            return False
-
-        # Parse existing frontmatter
-        frontmatter = content_str[3:end].strip()
-        try:
-            meta = yaml.safe_load(frontmatter) or {}
-        except yaml.YAMLError as exc:
-            _log_fallback_exception("skill-graph: invalid frontmatter [location=frontmatter.parse]", exc)
-            return False
-
-        # Update metadata.hermes.tags and metadata.hermes.scenes
-        hermes_meta = meta.setdefault("metadata", {}).setdefault("hermes", {})
-        hermes_meta["tags"] = tags
-        hermes_meta["scenes"] = scenes
-
-        # Re-serialize frontmatter
-        new_fm = yaml.safe_dump(meta, default_flow_style=False, allow_unicode=True).strip()
-        new_content = f"---\n{new_fm}\n---{content_str[end + 3:]}"
-
-        p.write_text(new_content, encoding="utf-8")
-        return True
-
-    except (OSError, UnicodeError, TypeError, ValueError, AttributeError,
-            RuntimeError, yaml.YAMLError) as exc:
-        _log_fallback_exception("skill-graph: frontmatter patch failed [location=frontmatter.patch]", exc)
-        return False
+    return _enrichment_store.patch_skill_frontmatter(
+        skill_path, tags, scenes, log_fallback_exception=_log_fallback_exception,
+    )
 
 
 def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
-    """Run LLM enrichment for a single skill. Updates DB. Writes back to SKILL.md if editable.
-
-    Returns True on success.
-    """
-    # Fetch skill content
-    node = conn.execute(
-        "SELECT file_path, content_hash FROM skill_nodes WHERE name = ?",
-        (skill_name,),
-    ).fetchone()
-    if not node or not node["file_path"]:
-        return False
-
-    skill_path = node["file_path"]
-    try:
-        content = Path(skill_path).read_text(encoding="utf-8-sig", errors="replace")
-    except (OSError, UnicodeError, TypeError, ValueError) as exc:
-        _log_fallback_exception("skill-graph: enrichment read failed [location=enrichment.read]", exc)
-        return False
-
-    # Build prompt + call LLM
-    prompt = _build_enrichment_prompt(skill_name, content)
-    result = _call_llm_for_enrichment(prompt)
-    if result is None:
-        return False
-
-    tags = result.get("tags", [])
-    scenes = result.get("scenes", [])
-    suggestions = result.get("suggestions", [])
-
-    if not isinstance(tags, list) or not isinstance(scenes, list):
-        return False
-
-    # Filter scenes to vocabulary only
-    valid_scenes = [s for s in scenes if s in SCENE_VOCABULARY]
-    if suggestions:
-        logger.info(
-            "skill-graph: enrichment suggestions received [location=enrichment.suggestions]",
-        )
-
-    # Update DB
-    conn.execute(
-        "UPDATE skill_nodes SET tags = ?, scenes = ?, enriched = 1, enriched_at = datetime('now') WHERE name = ?",
-        (json.dumps(tags, ensure_ascii=False),
-         json.dumps(valid_scenes, ensure_ascii=False),
-         skill_name),
+    return _enrichment_store.enrich_skill(
+        conn, skill_name,
+        build_prompt=_build_enrichment_prompt,
+        call_llm=_call_llm_for_enrichment,
+        extract_terms=_extract_skill_terms,
+        is_under=_is_under,
+        is_read_only=_is_read_only_skill,
+        bundled_skills_dir=get_bundled_skills_dir,
+        patch_frontmatter=_patch_skill_frontmatter,
+        scene_vocabulary=SCENE_VOCABULARY,
+        plugin_file=__file__,
+        logger=logger,
+        log_fallback_exception=_log_fallback_exception,
     )
-    # Update FTS
-    tags_text = " ".join(tags)
-    scenes_text = " ".join(valid_scenes)
-    conn.execute("DELETE FROM skill_fts WHERE name = ?", (skill_name,))
-    conn.execute(
-        "INSERT INTO skill_fts (name, category, description, tags, scenes) VALUES (?, ?, ?, ?, ?)",
-        (skill_name, "", "", tags_text, scenes_text),
-    )
-    # Update terms
-    conn.execute("DELETE FROM skill_terms WHERE skill_name = ?", (skill_name,))
-    terms = _extract_skill_terms(skill_name, tags, "")
-    for term_text, strength, source in terms:
-        conn.execute(
-            "INSERT OR IGNORE INTO skill_terms (term, skill_name, strength, source) VALUES (?, ?, ?, ?)",
-            (term_text, skill_name, strength, source),
-        )
-
-    # Write back to SKILL.md if not read-only
-    bundled_skills = get_bundled_skills_dir(Path(__file__).resolve().parents[2] / "skills")
-    if _is_under(Path(skill_path), bundled_skills):
-        logger.info("skill-graph: enriched tags=%d scenes=%d (bundled dir, DB only)",
-                    len(tags), len(valid_scenes))
-    elif not _is_read_only_skill(skill_path):
-        wrote = _patch_skill_frontmatter(skill_path, tags, valid_scenes)
-        if wrote:
-            logger.info("skill-graph: enriched tags=%d scenes=%d (wrote SKILL.md)",
-                        len(tags), len(valid_scenes))
-        else:
-            logger.info("skill-graph: enriched tags=%d scenes=%d (SKILL.md write failed)",
-                        len(tags), len(valid_scenes))
-    else:
-        logger.info("skill-graph: enriched tags=%d scenes=%d (read-only, DB only)",
-                    len(tags), len(valid_scenes))
-
-    conn.commit()
-    return True
 
 
 
 def _enrich_pending_skills(conn: sqlite3.Connection, limit: int = 10,
                              force: bool = False) -> int:
-    """Process pending enrichment skills. Returns count of successfully tagged.
-
-    If ``force`` is False, skips skills enriched within the last 5 minutes
-    (cooldown to avoid rapid re-runs after rebuild).
-    """
-    if force:
-        where = "enriched = 0 AND (is_deleted IS NULL OR is_deleted = 0)"
-    else:
-        where = ("enriched = 0 AND (is_deleted IS NULL OR is_deleted = 0) "
-                 "AND (enriched_at IS NULL "
-                 "OR enriched_at < datetime('now', '-5 minutes'))")
-    rows = conn.execute(
-        f"SELECT name FROM skill_nodes WHERE {where} LIMIT ?",
-        (limit,),
-    ).fetchall()
-
-    total = len(rows)
-    if total > 10:
-        logger.info("skill-graph: %d skills need enrichment — this may take a while, please wait...", total)
-
-    logger.info("skill-graph: enriching %d pending skills", total)
-    count = 0
-    for i, row in enumerate(rows, 1):
-        logger.info("skill-graph: enrich [%d/%d] %s", i, total, row["name"])
-        if _enrich_skill(conn, row["name"]):
-            count += 1
-        else:
-            logger.warning("skill-graph: enrich FAILED [%d/%d] %s", i, total, row["name"])
-    logger.info("skill-graph: enrich done — %d/%d succeeded", count, total)
-    return count
+    return _enrichment_store.enrich_pending_skills(
+        conn, limit, force, enrich_one=_enrich_skill, logger=logger,
+    )
 
 
 
@@ -1738,325 +944,63 @@ def _reverse_type(rel_type: str) -> str | None:
 # ── Graph search ────────────────────────────────────────────────────────────
 
 
+# The plugin may be loaded by spec_from_file_location without registration in
+# sys.modules. In that case relative imports are unavailable, so load the
+# sibling by its adjacent path rather than a global sys.path import.
+try:
+    from . import skill_graph_search as _search_impl
+except ImportError:
+    import importlib.util as _importlib_util
+
+    _search_spec = _importlib_util.spec_from_file_location(
+        f"{__name__}.skill_graph_search", Path(__file__).with_name("skill_graph_search.py")
+    )
+    assert _search_spec is not None and _search_spec.loader is not None
+    _search_impl = _importlib_util.module_from_spec(_search_spec)
+    _search_spec.loader.exec_module(_search_impl)
+
+
 def _search_graph(query: str, conn: sqlite3.Connection, limit: int = 10,
                   scenes: list[str] | None = None) -> list[dict[str, Any]]:
-    """Search the skill graph by intent query.
-
-    If ``scenes`` is provided, skill results matching those scenes get a
-    ×1.3 score boost in Phase 5 (soft weighting, not hard filtering).
-    """
-    results: dict[str, dict[str, Any]] = {}
-    seen: set[str] = set()
-
-    # Phase 1: FTS5 direct search — include BM25 rank for normalized scoring
-    fts_query = _fts_query(query)
-    if fts_query:
-        cursor = conn.execute(
-            """SELECT n.name, n.category, n.description, n.tags, n.file_path, f.rank
-               FROM skill_fts f
-               JOIN skill_nodes n ON f.name = n.name
-               WHERE skill_fts MATCH ?
-                 AND (n.is_deleted IS NULL OR n.is_deleted = 0)
-               ORDER BY rank
-               LIMIT ?""",
-            (fts_query, limit * 2),
-        )
-        for row in cursor:
-            name = row["name"]
-            seen.add(name)
-            tags = json.loads(row["tags"]) if row["tags"] else []
-            # Normalize BM25: rank is negative (closer to 0 = better)
-            bm25_score = 1.0 / (1.0 + abs(row["rank"]))
-            results[name] = {
-                "name": name,
-                "category": row["category"],
-                "description": row["description"],
-                "tags": tags,
-                "file_path": row["file_path"],
-                "relevance": "direct",
-                "relationship_chain": [],
-                "score": bm25_score,
-            }
-
-    # Phase 2: Graph expansion — only fills gaps not found by FTS5
-    expansion_queue = list(seen)
-    while expansion_queue and len(results) < limit * 3:
-        current = expansion_queue.pop(0)
-        cursor = conn.execute(
-            """SELECT e.target, e.rel_type, e.properties, n.category, n.description
-               FROM skill_edges e
-               JOIN skill_nodes n ON e.target = n.name
-               WHERE e.source = ?
-               ORDER BY e.rel_type
-               LIMIT 5""",
-            (current,),
-        )
-        for row in cursor:
-            target = row["target"]
-            if target in seen:
-                continue
-            seen.add(target)
-            props = json.loads(row["properties"]) if row["properties"] else {}
-            rel_type = row["rel_type"]
-            reason = props.get("reason", f"via {rel_type}")
-            _score = 0.8 if rel_type == "supersedes" else 0.5
-            results[target] = {
-                "name": target,
-                "category": row["category"] or "",
-                "description": row["description"] or "",
-                "tags": [],
-                "file_path": "",
-                "relevance": "expansion",
-                "relationship_chain": [f"{current} --({rel_type})--> {target}: {reason}"],
-                "score": _score,
-            }
-            expansion_queue.append(target)
-
-    # Phase 3: Tag match (existing) — uses its own dedup set so it doesn't
-    # block Phase 4 from finding higher-scoring term matches.
-    _tag_seen: set[str] = set()
-    terms = _extract_terms(query)
-    for term in terms:
-        cursor = conn.execute(
-            """SELECT name FROM skill_nodes WHERE instr(tags, ?) > 0 AND (is_deleted IS NULL OR is_deleted = 0)""",
-            (json.dumps(term),),
-        )
-        for row in cursor:
-            if row["name"] not in _tag_seen:
-                _tag_seen.add(row["name"])
-                info = _get_node_info(conn, row["name"])
-                if info:
-                    info["relevance"] = "tag_match"
-                    info["score"] = 0.7
-                    results[info["name"]] = info
-
-    # Phase 4: Term table match — direct term→skill lookup from the
-    # skill_terms table (auto-extracted from name, tags, description).
-    # This catches Chinese terms and split-name parts that FTS5 misses.
-    for term in terms:
-        if seen:
-            cursor = conn.execute(
-                """SELECT t.skill_name, t.strength, t.source, n.category, n.description
-                   FROM skill_terms t
-                   JOIN skill_nodes n ON t.skill_name = n.name AND (n.is_deleted IS NULL OR n.is_deleted = 0)
-                   WHERE t.term = ? AND t.skill_name NOT IN ({})
-                   ORDER BY t.strength DESC
-                   LIMIT 5""".format(",".join("?" for _ in seen)),
-                (term.lower(),) + tuple(seen),
-            )
-        else:
-            cursor = conn.execute(
-                """SELECT t.skill_name, t.strength, t.source, n.category, n.description
-                   FROM skill_terms t
-                   JOIN skill_nodes n ON t.skill_name = n.name AND (n.is_deleted IS NULL OR n.is_deleted = 0)
-                   WHERE t.term = ?
-                   ORDER BY t.strength DESC
-                   LIMIT 5""",
-                (term.lower(),),
-            )
-        for row in cursor:
-            sname = row["skill_name"]
-            _term_score = 0.8 * row["strength"]
-            if sname in results:
-                # Don't overwrite — take the higher score
-                if results[sname]["score"] < _term_score:
-                    results[sname]["score"] = _term_score
-                    results[sname]["relevance"] = "term_match"
-                    results[sname]["relationship_chain"] = [
-                        f"term[{term}] → {sname} (strength={row['strength']}, source={row['source']})"
-                    ]
-                continue
-            seen.add(sname)
-            results[sname] = {
-                "name": sname,
-                "category": row["category"] or "",
-                "description": row["description"] or "",
-                "tags": [],
-                "file_path": "",
-                "relevance": "term_match",
-                "relationship_chain": [f"term[{term}] → {sname} (strength={row['strength']}, source={row['source']})"],
-                "score": 0.8 * row["strength"],
-            }
-
-    # Phase 5: Term-based scoring boost + search stats
-    _boost_search_results(conn, results, terms)
-    if scenes:
-        _boost_scene_results(conn, results, scenes)
-
-    sorted_results = sorted(results.values(), key=lambda r: -r["score"])
-    if not sorted_results:
-        return _fallback_search(query, conn, limit)
-    return sorted_results[:limit]
+    """Search via the sibling; retain plugin-level dependency patch seams."""
+    return _search_impl.search_graph(
+        query, conn, limit, scenes, fts_query=_fts_query,
+        extract_terms=_extract_terms, get_node_info=_get_node_info,
+        boost_search_results=_boost_search_results,
+        boost_scene_results=_boost_scene_results, fallback_search=_fallback_search,
+    )
 
 
 def _boost_search_results(
     conn: sqlite3.Connection, results: dict[str, dict[str, Any]], terms: list[str],
 ) -> None:
-    """Apply confidence-weighted term stats without losing search results on stats errors."""
-    _norm_terms = [t.lower() for t in terms]
-    for sname, r in results.items():
-        _placeholders = ",".join("?" for _ in _norm_terms)
-        _term_rows = conn.execute(
-            f"SELECT term FROM skill_terms WHERE skill_name = ? AND term IN ({_placeholders})",
-            (sname,) + tuple(_norm_terms),
-        ).fetchall()
-        matched_terms = [row["term"] for row in _term_rows]
-        if matched_terms:
-            for mt in matched_terms:
-                try:
-                    conn.execute(
-                        """INSERT INTO skill_term_stats (skill_name, term, search_count, load_count)
-                           VALUES (?, ?, 1, 0)
-                           ON CONFLICT(skill_name, term) DO UPDATE SET search_count = search_count + 1""",
-                        (sname, mt),
-                    )
-                except sqlite3.Error as exc:
-                    _log_fallback_exception("skill-graph: search stat update failed", exc)
-            try:
-                rows = conn.execute(
-                    """SELECT term, load_count, search_count, success_count FROM skill_term_stats
-                       WHERE skill_name = ? AND term IN ({})"""
-                    .format(",".join("?" for _ in matched_terms)),
-                    (sname,) + tuple(mt.lower() for mt in matched_terms),
-                ).fetchall()
-                if rows:
-                    import math as _m
-                    _avg_eff = sum(
-                        (r["success_count"] * 2 + r["load_count"]) / max(r["search_count"] * 3, 1)
-                        for r in rows
-                    ) / len(rows)
-                    _confidence = 1 - _m.pow(0.5, sum(r["search_count"] for r in rows) / max(len(rows), 1) / 5)
-                    _adj = (_avg_eff - 0.5) * 2
-                    _tanh = _adj / (1 + abs(_adj) * 0.5)  # tanh approximation
-                    r["score"] *= (1.0 + 0.1 * _tanh * _confidence)
-            except (sqlite3.Error, ArithmeticError, TypeError, ValueError) as exc:
-                _log_fallback_exception("skill-graph: search stat boost failed", exc)
-    conn.commit()
+    return _search_impl.boost_search_results(
+        conn, results, terms, log_error=_log_fallback_exception,
+    )
 
 
 def _boost_scene_results(
     conn: sqlite3.Connection, results: dict[str, dict[str, Any]], scenes: list[str],
 ) -> None:
-    """Soft-boost matching scenes while preserving the parent's isolated search stats."""
-    scene_set = {scene.lower() for scene in scenes}
-    for sname, result in results.items():
-        row = conn.execute("SELECT scenes FROM skill_nodes WHERE name = ?", (sname,)).fetchone()
-        if not row:
-            continue
-        try:
-            skill_scenes = json.loads(row[0])
-            if isinstance(skill_scenes, list) and skill_scenes:
-                skill_set = {scene.lower() for scene in skill_scenes}
-                if skill_set != {"common"} and scene_set & skill_set:
-                    result["score"] *= 1.3
-                    result["_scene_boost"] = True
-        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
-            _log_fallback_exception("skill-graph: invalid scene metadata", exc)
+    return _search_impl.boost_scene_results(
+        conn, results, scenes, log_error=_log_fallback_exception,
+    )
 
 
 def _fallback_search(query: str, conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]]:
-    """Broad fallback when the primary search returns nothing.
-
-    Returns skills whose name, tags, or description contain any of the
-    query terms, ordered by term strength. This catches skills that FTS5
-    and exact-term matching miss (e.g. stemming mismatches, partial words).
-    """
-    terms = _extract_terms(query)
-    if not terms:
-        # No parseable terms — return top skills by name
-        cursor = conn.execute(
-            "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE (is_deleted IS NULL OR is_deleted = 0) ORDER BY name LIMIT ?",
-            (limit,),
-        )
-        fallback = []
-        for row in cursor:
-            fallback.append({
-                "name": row["name"],
-                "category": row["category"] or "",
-                "description": row["description"] or "",
-                "tags": json.loads(row["tags"]) if row["tags"] else [],
-                "file_path": row["file_path"],
-                "relevance": "fallback",
-                "score": 0.1,
-            })
-        return fallback
-
-    results: dict[str, dict[str, Any]] = {}
-    for term in terms:
-        cursor = conn.execute(
-            """SELECT n.name, n.category, n.description, n.tags, n.file_path
-               FROM skill_nodes n
-               WHERE (n.is_deleted IS NULL OR n.is_deleted = 0)
-                 AND (instr(n.name, ?) > 0
-                  OR instr(n.description, ?) > 0
-                  OR instr(n.tags, ?) > 0)
-               LIMIT ?""",
-            (term, term, json.dumps(term), limit),
-        )
-        for row in cursor:
-            if row["name"] not in results:
-                results[row["name"]] = {
-                    "name": row["name"],
-                    "category": row["category"] or "",
-                    "description": row["description"] or "",
-                    "tags": json.loads(row["tags"]) if row["tags"] else [],
-                    "file_path": row["file_path"],
-                    "relevance": "fallback",
-                    "score": 0.2,
-                }
-    sorted_results = sorted(results.values(), key=lambda r: -r["score"])
-    return sorted_results[:limit]
+    return _search_impl.fallback_search(query, conn, limit, extract_terms=_extract_terms)
 
 
 def _fts_query(query: str) -> str:
-    """Convert a natural language query to an FTS5 query string.
-
-    For ASCII-heavy queries, builds an AND query from multi-char terms.
-    For Chinese-heavy queries (single-char tokens from unicode61), returns
-    empty so _search_graph falls through to term-table matching (Phase 4).
-    """
-    terms = re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff_-]+", query.lower())
-    # Split Chinese multi-char terms into individual characters for FTS5
-    # compatibility, since unicode61 tokenizes each CJK char separately.
-    flat: list[str] = []
-    for t in terms:
-        if re.match(r"^[\u4e00-\u9fff]+$", t) and len(t) > 1:
-            flat.extend(list(t))  # each CJK char is its own token
-        else:
-            flat.append(t)
-    has_ascii = any(t.isascii() for t in flat)
-    if has_ascii:
-        # Quote each term so FTS5 treats hyphens and other special chars
-        # as literal text, not column-filter operators.
-        return " AND ".join(f'"{t}"' for t in flat if len(t) > 1)
-    return " OR ".join(t for t in flat if len(t) > 1) if flat else ""
+    return _search_impl.fts_query(query)
 
 
 def _extract_terms(query: str) -> list[str]:
-    """Extract meaningful search terms from a query string."""
-    terms = re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff_-]+", query.lower())
-    return [t for t in terms if len(t) > 1]
+    return _search_impl.extract_terms(query)
 
 
 def _get_node_info(conn: sqlite3.Connection, name: str) -> dict[str, Any] | None:
-    """Fetch full node info from the database."""
-    cursor = conn.execute(
-        """SELECT name, category, description, tags, file_path, needs_organizing
-           FROM skill_nodes WHERE name = ? AND (is_deleted IS NULL OR is_deleted = 0)""",
-        (name,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    return {
-        "name": row["name"],
-        "category": row["category"],
-        "description": row["description"],
-        "tags": json.loads(row["tags"]) if row["tags"] else [],
-        "file_path": row["file_path"],
-        "needs_organizing": bool(dict(row).get("needs_organizing")) or False,
-    }
-
+    return _search_impl.get_node_info(conn, name)
 
 # ── Plugin state ────────────────────────────────────────────────────────────
 
@@ -2303,489 +1247,71 @@ def _handle_skill_graph_config(args: dict | None = None, **kw) -> str:
         _log_fallback_exception("skill-graph: configuration tool failed", exc)
         return json.dumps({"success": False, "error": "Could not update graph configuration"})
 
-# ── Slash command handler ───────────────────────────────────────────────────
+# Keep plugin-level entry points as patch seams for callers and tests. The sibling
+# is file-loaded once, independently of the plugin's synthetic package name.
+_slash_module = None
 
+
+def _slash_delegate(name: str, *args):
+    global _slash_module
+    if _slash_module is None:
+        import importlib.util
+
+        path = Path(__file__).with_name("skill_graph_slash.py")
+        spec = importlib.util.spec_from_file_location(f"{__name__}.skill_graph_slash", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load skill-graph slash handler: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _slash_module = module
+    return getattr(_slash_module, name)(globals(), *args)
 
 def _format_edges(skill_name: str) -> str:
-    """Query and format graph edges only."""
-    try:
-        conn = _ensure_graph()
-        rows = conn.execute(
-            """SELECT source, target, rel_type, properties FROM skill_edges
-               WHERE source = ? OR target = ?
-               ORDER BY rel_type, source""",
-            (skill_name, skill_name),
-        ).fetchall()
-        if not rows:
-            return f"No relations defined for: {skill_name}"
-        seen: set[tuple[str, str, str]] = set()
-        parts = []
-        for src, tgt, rel, props in rows:
-            key = (src, tgt, rel)
-            if key in seen:
-                continue
-            seen.add(key)
-            arrow = f"  {src} ──({rel})──> {tgt}"
-            reason = ""
-            if isinstance(props, str) and props:
-                import json as _j
-                try:
-                    reason = _j.loads(props).get("reason", "")
-                except (ValueError, TypeError, AttributeError) as exc:
-                    _log_fallback_exception("skill-graph: invalid edge properties", exc)
-                    reason = props[:40]
-            elif isinstance(props, dict):
-                reason = props.get("reason", "")
-            if reason:
-                parts.append(f"{arrow:55s} {reason[:50]}")
-            else:
-                parts.append(arrow)
-        return "Edges:\n" + "\n".join(parts) + "\n"
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-            AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: could not format edges", exc)
-        return ""
+    return _slash_delegate("_format_edges", skill_name)
 
 
 def _format_terms(skill_name: str) -> str:
-    """Query and format term associations with inline stats."""
-    try:
-        conn = _ensure_graph()
-        parts = []
-
-        # Skill's own terms
-        terms = conn.execute(
-            "SELECT t.term, t.strength, t.source, "
-            "COALESCE(s.search_count,0) AS sc, COALESCE(s.load_count,0) AS lc, "
-            "COALESCE(s.success_count,0) AS suc "
-            "FROM skill_terms t "
-            "LEFT JOIN skill_term_stats s ON t.skill_name = s.skill_name AND t.term = s.term "
-            "WHERE t.skill_name = ? ORDER BY t.strength DESC, t.source",
-            (skill_name,),
-        ).fetchall()
-        if terms:
-            term_lines = ["", "  Terms:"]
-            for t in terms:
-                _sc, _lc, _suc = t['sc'], t['lc'], t['suc']
-                _eff = (_suc * 2 + _lc) / max(_sc * 3, 1)
-                _conf = 1 - __import__("math").pow(0.5, _sc / 5)
-                _adj = (_eff - 0.5) * 2
-                _th = _adj / (1 + abs(_adj) * 0.5)
-                _boost = 0.1 * _th * _conf
-                _sign = "+" if _boost > 0 else ""
-                _stats = f"s={_sc}/l={_lc}/ok={_suc}/b={_sign}{_boost:.3f}".replace("+-", "")
-                term_lines.append(
-                    f"    {skill_name} ──({t['source']})──> {t['term']}  [{_stats}]"
-                )
-            parts.append("\n".join(term_lines))
-
-        # Reverse lookup
-        rev = conn.execute(
-            "SELECT t.skill_name, t.strength, t.source, "
-            "COALESCE(s.search_count,0) AS sc, COALESCE(s.load_count,0) AS lc, "
-            "COALESCE(s.success_count,0) AS suc "
-            "FROM skill_terms t "
-            "LEFT JOIN skill_term_stats s ON t.skill_name = s.skill_name AND t.term = s.term "
-            "WHERE t.term = ? ORDER BY t.strength DESC",
-            (skill_name,),
-        ).fetchall()
-        if rev:
-            rev_lines = ["", "  Skills with this term:"]
-            for sn, s, src, sc, lc, suc in rev:
-                _eff2 = (suc * 2 + lc) / max(sc * 3, 1)
-                _conf2 = 1 - __import__("math").pow(0.5, sc / 5)
-                _adj2 = (_eff2 - 0.5) * 2
-                _th2 = _adj2 / (1 + abs(_adj2) * 0.5)
-                _boost2 = 0.1 * _th2 * _conf2
-                _sign2 = "+" if _boost2 > 0 else ""
-                rev_lines.append(f"    {sn:40s} ──({src})──> {skill_name}  [s={sc}/l={lc}/ok={suc}/b={_sign2}{_boost2:.3f}]".replace("+-", ""))
-            parts.append("\n".join(rev_lines))
-
-        return "\n".join(parts) if parts else ""
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-            AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: could not format terms", exc)
-        return ""
+    return _slash_delegate("_format_terms", skill_name)
 
 
 def _slash_graph_status() -> str:
-    """Report graph counts and indexed source directories."""
-    try:
-        conn = _ensure_graph()
-        node_count = conn.execute("SELECT COUNT(*) FROM skill_nodes").fetchone()[0]
-        edge_count = conn.execute("SELECT COUNT(*) FROM skill_edges").fetchone()[0]
-        term_count = conn.execute("SELECT COUNT(DISTINCT term) FROM skill_terms").fetchone()[0]
-        db_path = _db_path()
-
-        if node_count == 0:
-            with _graph_lock:
-                count = _sync_graph(conn)
-            node_count = count
-            edge_count = conn.execute("SELECT COUNT(*) FROM skill_edges").fetchone()[0]
-
-        scanned = _find_all_skills_dirs()
-        dirs_info = []
-        for d in scanned:
-            if d.exists():
-                cnt = sum(
-                    1 for root, dirs, files in os.walk(str(d), followlinks=True)
-                    if "SKILL.md" in files
-                )
-            else:
-                cnt = 0
-            dirs_info.append(f"    {d}  ({cnt} SKILL.md)")
-        dirs_text = "\n".join(dirs_info) if dirs_info else "    (none)"
-
-        db_size = db_path.stat().st_size if db_path.exists() else 0
-        return (
-            f"Skill Graph status\n"
-            f"  Skills:  {node_count}\n"
-            f"  Edges:   {edge_count}\n"
-            f"  Terms:   {term_count}\n"
-            f"  DB size: {db_size / 1024:.1f} KB\n"
-            f"  DB path: {db_path}\n"
-            f"  Scanned dirs:\n{dirs_text}"
-        )
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-            KeyError, AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: status check failed", exc)
-        return "Status check failed: could not read graph status"
+    return _slash_delegate("_slash_graph_status")
 
 
 def _slash_graph_rebuild(rest: str) -> str:
-    """Rebuild and optionally launch the legacy enrichment worker."""
-    try:
-        force = rest.strip() == "--force"
-        conn = _ensure_graph()
-        with _graph_lock:
-            count = _full_rebuild(conn)
-        where = "enriched = 0 AND (is_deleted IS NULL OR is_deleted = 0)"
-        if not force:
-            where += (" AND (enriched_at IS NULL "
-                      "OR enriched_at < datetime('now', '-5 minutes'))")
-        pending = conn.execute(
-            f"SELECT COUNT(*) FROM skill_nodes WHERE {where}"
-        ).fetchone()[0]
-        if pending > 0:
-            import subprocess as _sp
-            _log_dir = get_hermes_home() / "personal" / "skill-graph"
-            _log_dir.mkdir(parents=True, exist_ok=True)
-            _log_file = str(_log_dir / "enrichment.log")
-            _lock_file = _log_dir / ".enrichment.lock"
-
-            # Prevent concurrent enrichment runs
-            if _lock_file.exists():
-                import psutil
-                try:
-                    _stale_pid = int(_lock_file.read_text(encoding="utf-8-sig").strip())
-                    if psutil.pid_exists(_stale_pid):
-                        _cmd = " ".join(psutil.Process(_stale_pid).cmdline()).lower()
-                        if "enrich" in _cmd or "skill_graph" in _cmd:
-                            return (
-                                f"Skill graph rebuilt: {count} skills indexed. "
-                                f"{pending} skills pending enrichment — "
-                                f"background enrichment already running (pid {_stale_pid})."
-                            )
-                        logger.warning("skill-graph: stale enrichment lock (pid %d alive but not enrich worker)", _stale_pid)
-                except (ValueError, OSError, psutil.Error) as exc:
-                    _log_fallback_exception("skill-graph: stale enrichment lock", exc)
-            _script = _log_dir / "_enrich_worker.py"
-            _script.write_text(f"""\
-import importlib.util, sys, os, atexit, logging
-from pathlib import Path
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
-
-_lock = "{_lock_file}"
-_lock_dir = "{_log_dir}"
-os.makedirs(_lock_dir, exist_ok=True)
-with open(_lock, 'w') as f:
-    f.write(str(os.getpid()))
-atexit.register(lambda: os.remove(_lock) if os.path.exists(_lock) else None)
-
-spec = importlib.util.spec_from_file_location(
-    'skill_graph', "{Path(__file__).resolve()}",
-    submodule_search_locations=["{Path(__file__).parent.resolve()}"],
-)
-mod = importlib.util.module_from_spec(spec)
-sys.modules['skill_graph'] = mod
-spec.loader.exec_module(mod)
-conn = mod._get_conn()
-mod._enrich_pending_skills(conn, limit={pending}, force={force})
-""")
-            with open(_log_file, "a", encoding="utf-8") as log:
-                _sp.Popen(
-                    [__import__("sys").executable, str(_script)],
-                    stdout=log, stderr=log,
-                    start_new_session=True,
-                )
-            msg = f"Skill graph rebuilt: {count} skills indexed. {pending} skills pending enrichment — running in background."
-            if force:
-                msg += " (forced — cooldown bypassed)"
-            return msg
-        return f"Skill graph rebuilt: {count} skills indexed."
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-            KeyError, AttributeError, IndexError, yaml.YAMLError) as exc:
-        _log_fallback_exception("skill-graph: rebuild failed", exc)
-        return "Rebuild failed: could not rebuild skill graph"
+    return _slash_delegate("_slash_graph_rebuild", rest)
 
 
 def _slash_help() -> str:
-    """Default slash help, also used when search has no query."""
-    return (
-        "/skill-graph — Skill knowledge graph\n\n"
-        "Subcommands:\n"
-        "  /skill-graph search <query>   Search skills by intent\n"
-        "  /skill-graph show <name>      Show full skill content (preview)\n"
-        "  /skill-graph info <name>      Show skill metadata\n"
-        "  /skill-graph terms <name>     Show term associations with stats\n"
-        "  /skill-graph score <query>    Show scoring breakdown with term stats\n"
-        "  /skill-graph list             List all skills in graph\n"
-        "  /skill-graph config           Show configuration (paths, DB)\n"
-        "  /skill-graph status           Show graph stats\n"
-        "  /skill-graph rebuild          Force full graph rebuild\n"
-        "  /skill-graph scene [list|show]  List scene distribution or show skills per scene\n"
-    )
+    return _slash_delegate("_slash_help")
 
 
 def _slash_graph_search(rest: str) -> str:
-    if not rest:
-        return _slash_help()
-    try:
-        conn = _ensure_graph()
-        with _graph_lock:
-            results = _search_graph(rest, conn, limit=15)
-        if not results:
-            return f"No skills found for: {rest}"
-        lines = [f"Search results for: {rest}", ""]
-        for r in results:
-            rel = r.get("relevance", "")
-            chain = r.get("relationship_chain", [])
-            extra = f" [{rel}]" if rel else ""
-            if chain:
-                extra += f"  chain: {' → '.join(chain[:2])}"
-            lines.append(f"  {r['name']:35s}  {r.get('description', '')[:55]}{extra}")
-        return "\n".join(lines)
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: search failed", exc)
-        return "Search failed: could not search skills"
-
-
-def _slash_scene_distribution(conn: sqlite3.Connection) -> str:
-    rows = conn.execute("SELECT scenes FROM skill_nodes WHERE (is_deleted IS NULL OR is_deleted = 0)").fetchall()
-    counts, untagged = {}, 0
-    for row in rows:
-        try:
-            slist = json.loads(row["scenes"]) if row["scenes"] else []
-        except (ValueError, TypeError) as exc:
-            _log_fallback_exception("skill-graph: invalid scene data", exc)
-            slist = []
-        if not slist:
-            untagged += 1
-        for s in slist:
-            counts[s] = counts.get(s, 0) + 1
-    lines = [f"Scene distribution ({len(rows)} skills):", ""]
-    for s in SCENE_VOCABULARY:
-        lines.append(f"  {s:12s} {counts.get(s, 0):4d}")
-    if untagged:
-        lines.append(f"  {'(untagged)':12s} {untagged:4d}")
-    other = sum(v for k, v in counts.items() if k not in SCENE_VOCABULARY)
-    if other:
-        lines.append(f"  {'(other)':12s} {other:4d}")
-    return "\n".join(lines)
-
-
-def _slash_scene_show(conn: sqlite3.Connection, scene_arg: str) -> str:
-    rows = conn.execute(
-        "SELECT name, description FROM skill_nodes WHERE (is_deleted IS NULL OR is_deleted = 0) "
-        "AND instr(scenes, ?) > 0 ORDER BY name", (json.dumps(scene_arg),)).fetchall()
-    if not rows:
-        return f"No skills with scene: {scene_arg}"
-    lines = [f"Skills with scene '{scene_arg}' ({len(rows)}):", ""]
-    for row in rows:
-        lines.append(f"  {row['name']:40s} {(row['description'] or '')[:80]}")
-    return "\n".join(lines)
+    return _slash_delegate("_slash_graph_search", rest)
 
 
 def _slash_graph_scene(rest: str) -> str:
-    parts = rest.strip().split(None, 1)
-    scene_sub = parts[0].lower() if parts else "list"
-    scene_arg = parts[1] if len(parts) > 1 else ""
-    try:
-        conn = _ensure_graph()
-        if scene_sub == "list":
-            return _slash_scene_distribution(conn)
-        if scene_sub == "show" and scene_arg:
-            return _slash_scene_show(conn, scene_arg)
-        return "Usage: /sg scene list | /sg scene show <scene-name>"
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: scene command failed", exc)
-        return "Scene command failed: could not read graph results"
+    return _slash_delegate("_slash_graph_scene", rest)
 
 
 def _slash_graph_list(_rest: str) -> str:
-    try:
-        conn = _ensure_graph()
-        rows = conn.execute("SELECT name, description, category FROM skill_nodes ORDER BY name").fetchall()
-        if not rows:
-            return "No skills in graph."
-        lines = [f"Skills in graph ({len(rows)}):", ""]
-        for r in rows:
-            lines.append(f"  {r['name']:35s}  [{r['category']}]  {(r['description'] or '')[:60]}")
-        return "\n".join(lines)
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: list failed", exc)
-        return "List failed: could not read graph results"
+    return _slash_delegate("_slash_graph_list", _rest)
 
 
 def _slash_graph_score(rest: str) -> str:
-    """Show detailed scoring breakdown for a search query."""
-    if not rest:
-        return "Usage: /skill-graph score <query>"
-    try:
-        conn = _ensure_graph()
-        with _graph_lock:
-            results = _search_graph(rest, conn, limit=8)
-            lines = [f"Score breakdown for: {rest}", ""]
-            for r in results:
-                name = r["name"]
-                stats_rows = conn.execute(
-                    "SELECT term, load_count, search_count FROM skill_term_stats WHERE skill_name = ?", (name,)
-                ).fetchall()
-                stats_line = (
-                    "; ".join(f"{s['term']}: load={s['load_count']}/{s['search_count']}"
-                              for s in stats_rows[:5]) if stats_rows else "(no stats)"
-                )
-                lines.append(f"  {name:40s} score={r['score']:.4f}  [{r.get('relevance', '?')}]")
-                lines.append(f"  {'':40s}  stats: {stats_line}")
-            lines.append(f"\n{len(results)} results shown")
-            return "\n".join(lines)
-    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
-        _log_fallback_exception("skill-graph: score breakdown failed", exc)
-        return "Score breakdown failed: could not read graph results"
+    return _slash_delegate("_slash_graph_score", rest)
 
 
 def _handle_slash_discovery(subcmd: str, rest: str) -> str:
-    """Dispatch graph-wide discovery commands and aliases."""
-    handlers = {
-        "status": _slash_graph_status, "stats": _slash_graph_status,
-        "search": _slash_graph_search,
-        "scene": _slash_graph_scene,
-        "list": _slash_graph_list,
-        "score": _slash_graph_score, "explain": _slash_graph_score,
-    }
-    if subcmd not in handlers:
-        raise ValueError("Unsupported graph discovery command")
-    if subcmd in ("status", "stats"):
-        return handlers[subcmd]()
-    return handlers[subcmd](rest)
+    return _slash_delegate("_handle_slash_discovery", subcmd, rest)
 
 
 def _slash_graph_config(rest: str) -> str:
-    """Dispatch configuration display or source-directory changes."""
-    rest_parts = rest.strip().split(None, 1) if rest.strip() else []
-    config_action = rest_parts[0].lower() if rest_parts else "show"
-    config_arg = rest_parts[1] if len(rest_parts) > 1 else ""
-    if config_action in ("add", "remove"):
-        return _handle_source_dir_config(config_action, config_arg)
-    return _show_graph_config()
+    return _slash_delegate("_slash_graph_config", rest)
 
 
 def _handle_slash_command(args: str) -> str | None:
-    parts = args.strip().split(None, 1) if args.strip() else []
-    subcmd = parts[0].lower() if parts else "help"
-    rest = parts[1] if len(parts) > 1 else ""
-
-    if subcmd in ("status", "stats", "search", "list", "score", "explain", "scene"):
-        return _handle_slash_discovery(subcmd, rest)
-    if subcmd == "config":
-        return _slash_graph_config(rest)
-    if subcmd == "rebuild":
-        return _slash_graph_rebuild(rest)
-
-    if subcmd == "show":
-        """Show full skill content (preview)."""
-        if not rest:
-            return "Usage: /skill-graph show <skill-name>"
-        try:
-            result = _handle_skill_load({"name": rest})
-            data = json.loads(result)
-            if not data.get("success"):
-                return f"Not found: {rest}"
-            content = data.get("content", "")
-            return (
-                f"Skill: {data['name']} ({len(content)} chars)\n"
-                f"  Description: {data.get('description', '')}\n"
-                f"  Category:    {data.get('category', '')}\n"
-                f"\n{content[:2000]}"
-            )
-        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                KeyError, AttributeError, IndexError) as exc:
-            _log_fallback_exception("skill-graph: show failed", exc)
-            return "Show failed: could not load skill"
-
-    elif subcmd == "info":
-        """Show skill metadata only."""
-        if not rest:
-            return "Usage: /skill-graph info <skill-name>"
-        try:
-            conn = _ensure_graph()
-            node = conn.execute(
-                "SELECT name, category, description, tags, file_path FROM skill_nodes WHERE name = ?",
-                (rest,),
-            ).fetchone()
-            if not node:
-                return f"Not found: {rest}  (try /sg list)"
-            return "\n".join([
-                f"Node: {node['name']}",
-                f"  Category:    {node['category'] or ''}",
-                f"  Description: {node['description'] or ''}",
-                f"  Tags:        {node['tags'] or ''}",
-                f"  Path:        {node['file_path'] or ''}",
-            ])
-        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                KeyError, AttributeError, IndexError) as exc:
-            _log_fallback_exception("skill-graph: info failed", exc)
-            return "Info failed: could not read skill metadata"
-
-    elif subcmd == "terms":
-        """Show term associations with stats."""
-        if not rest:
-            return "Usage: /skill-graph terms <skill-name>"
-        try:
-            return _format_terms(rest)
-        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                KeyError, AttributeError, IndexError) as exc:
-            _log_fallback_exception("skill-graph: terms failed", exc)
-            return "Terms failed: could not read skill terms"
-
-    else:
-        # Unknown command — try proxying to a skill in the graph
-        if subcmd:
-            try:
-                conn = _ensure_graph()
-                _node = conn.execute(
-                    "SELECT file_path FROM skill_nodes WHERE name = ?", (subcmd,)
-                ).fetchone()
-                if _node:
-                    _result = _handle_skill_load({"name": subcmd})
-                    _data = json.loads(_result)
-                    if _data.get("success"):
-                        _content = _data.get("content", "")
-                        return (
-                            f"Loaded skill: {subcmd}\n"
-                            f"  Description: {_data.get('description', '')}\n"
-                            f"  Category:    {_data.get('category', '')}\n"
-                            f"  Content ({len(_content)} chars):\n"
-                            f"{_content[:500]}\n"
-                            f"...\n"
-                            f"(Use /sg info {subcmd} for metadata, "
-                            f"/sg terms {subcmd} for term details)"
-                        )
-            except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                    KeyError, AttributeError, IndexError) as exc:
-                _log_fallback_exception("skill-graph: command proxy failed", exc)
-        return _slash_help()
+    return _slash_delegate("_handle_slash_command", args)
 
 # ── Tool handlers ───────────────────────────────────────────────────────────
 

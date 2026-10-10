@@ -107,3 +107,26 @@ def test_scene_failure_redacts_query_and_sql_error(graph, monkeypatch, caplog):
     assert "secret-source-path" not in caplog.text
     assert "private-query" not in caplog.text
     assert caplog.records[0].exc_info is None
+
+
+def test_package_spec_loader_preserves_facade_patch_seams(graph, monkeypatch):
+    _bare_module, db = graph
+    spec = importlib.util.spec_from_file_location(
+        "test_slash_package_plugin", PLUGIN_PATH,
+        submodule_search_locations=[str(PLUGIN_PATH.parent)],
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(module, "_ensure_graph", lambda: db)
+    monkeypatch.setattr(module, "_search_graph", lambda query, conn, limit: [
+        {"name": "orchid", "description": query, "score": 0.8}
+    ])
+    monkeypatch.setattr(module, "_slash_graph_rebuild", lambda rest: f"rebuild: {rest}")
+    monkeypatch.setattr(module, "_handle_source_dir_config", lambda action, path: f"{action}: {path}")
+
+    assert "orchid" in module._handle_slash_command("search garden")
+    assert module._handle_slash_command("rebuild --force") == "rebuild: --force"
+    assert module._handle_slash_command("config add /isolated") == "add: /isolated"
+    assert "Scene distribution (3 skills):" in module._handle_slash_command("scene")
