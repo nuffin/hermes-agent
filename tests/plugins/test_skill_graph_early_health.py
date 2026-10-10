@@ -380,8 +380,8 @@ def test_slash_remaining_commands_preserve_success_and_missing(tmp_path, monkeyp
     module._init_db(db)
     module._migrate_db(db)
     db.execute(
-        "INSERT INTO skill_nodes (name, category, description, file_path) VALUES (?, ?, ?, ?)",
-        ("orchid", "garden", "A flowering skill", "orchid/SKILL.md"),
+        "INSERT INTO skill_nodes (name, category, description, file_path, enriched) VALUES (?, ?, ?, ?, ?)",
+        ("orchid", "garden", "A flowering skill", "orchid/SKILL.md", 1),
     )
     db.commit()
     md = tmp_path / "orchid" / "SKILL.md"
