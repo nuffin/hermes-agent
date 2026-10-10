@@ -8,6 +8,7 @@ to verify the AND-gate detection strategy matches the calibrated results:
 """
 
 import pytest
+import logging
 from unittest.mock import MagicMock
 
 from agent.topic_detection import (
@@ -63,6 +64,26 @@ class TestComputeS6Cosine:
     def test_embed_fn_raises(self):
         embed_fn = MagicMock(side_effect=Exception("boom"))
         assert compute_s6_cosine("hello", "world", embed_fn) is None
+
+    def test_callback_failure_redacts_exception_and_keeps_llm_fallback(self, caplog):
+        secret = "https://user:password@example.invalid/secret-user-text"
+
+        def fail(_text):
+            raise Exception(secret)
+
+        with caplog.at_level(logging.DEBUG, logger="topic_detection"):
+            result = detect_topic_shift(
+                "secret-user-text", prev_msg="previous secret-user-text",
+                llm_topic_continuation=True, embed_fn=fail,
+            )
+        assert result["method"] == "llm_only"
+        assert result["topic_continuation"] is True
+        assert len(caplog.records) == 1
+        assert caplog.records[0].exc_info is not None
+        assert "S6 cosine computation failed" in caplog.text
+        assert "password" not in caplog.text
+        assert "example.invalid" not in caplog.text
+        assert "secret-user-text" not in caplog.text
 
 
 class TestDetectTopicShift:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
+from types import TracebackType
 from typing import Callable, Optional
 
 import requests
@@ -35,6 +36,14 @@ _DEFAULT_MODEL = "bge-m3"
 _CPU_MODEL = None
 
 
+def _redacted_exc_info() -> tuple[type[RuntimeError], RuntimeError, TracebackType | None]:
+    """Keep callback/HTTP exception values out of logged tracebacks."""
+    try:
+        raise RuntimeError("Embedding fallback invoked") from None
+    except RuntimeError as redacted:
+        return type(redacted), redacted, redacted.__traceback__
+
+
 def _read_cfg(config_reader: Callable[[], dict]) -> dict:
     """Read plugin config dict from the injected reader (never raises)."""
     try:
@@ -43,6 +52,11 @@ def _read_cfg(config_reader: Callable[[], dict]) -> dict:
             return {}
         return cfg
     except Exception:
+        # Injected config readers may fail with secrets in their exception text.
+        _logger.warning(
+            "Embedding configuration unavailable; using defaults",
+            exc_info=_redacted_exc_info(),
+        )
         return {}
 
 
@@ -184,7 +198,6 @@ class EmbeddingClient:
             return []
 
         t0 = time.time()
-        preview = texts[0][:80] + ("..." if len(texts[0]) > 80 else "")
         n = len(texts)
         backend = self.backend()
 
@@ -215,21 +228,22 @@ class EmbeddingClient:
                 result = _embed_tei(texts, ep)
                 label = "TEI"
             else:
-                _logger.warning("Unknown protocol at %s — falling back to CPU", ep)
+                _logger.warning("Unknown embedding protocol — falling back to CPU")
                 return _embed_cpu(texts)
 
+            if len(result) != n or any(not isinstance(vector, list) or not vector for vector in result):
+                raise ValueError("Invalid GPU embedding result")
             dim = len(result[0]) if result else 0
             _logger.info(
-                "Embed [%s] %d texts, %d-dim, %.2fs — preview=%r",
-                label, n, dim, time.time() - t0, preview,
+                "Embed [%s] %d texts, %d-dim, %.2fs",
+                label, n, dim, time.time() - t0,
             )
             return result
 
-        except Exception as e:
-            _logger.warning(
-                "Embed [GPU] %d texts failed after %.2fs: %s — falling back to CPU",
-                n, time.time() - t0, e,
-            )
+        except Exception:
+            # HTTP/client responses and injected backends can raise arbitrary
+            # exceptions; never render the original exception or its traceback.
+            _logger.warning("Embed [GPU] failed — falling back to CPU", exc_info=_redacted_exc_info())
             return _embed_cpu(texts)
 
 
