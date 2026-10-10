@@ -563,7 +563,7 @@ def _upsert_skill(conn: sqlite3.Connection, name: str, path: Path, now: float) -
 # ── Embedding ──────────────────────────────────────────────────────────────
 
 
-def _embedding_client() -> "EmbeddingClient | None":
+def _embedding_client() -> Any:
     """Build the EmbeddingClient from skills.config.skill-graph config."""
     try:
         from .embedding_client import EmbeddingClient
@@ -575,18 +575,7 @@ def _embedding_client() -> "EmbeddingClient | None":
             return None
 
     def _reader() -> dict:
-        try:
-            from hermes_cli.config import load_config
-            config = load_config()
-            sg = (
-                (config or {})
-                .get("skills", {})
-                .get("config", {})
-                .get("skill-graph", {})
-            )
-            return sg if isinstance(sg, dict) else {}
-        except Exception:
-            return {}
+        return _skill_graph_config()
 
     return EmbeddingClient(_reader)
 
@@ -811,12 +800,26 @@ def _embedding_search(
 
 # ── pre_llm_call: candidate injection (Plan A) ─────────────────────────────
 
+# Per-session state for delta injection: session_id → set of injected skill names
+_injected_names_cache: dict[str, set[str]] = {}
 
-def _build_skill_candidates_context(user_message: str) -> str | None:
+
+def _build_skill_candidates_context(
+    user_message: str,
+    session_id: str = "",
+    is_first_turn: bool = False,
+    prev_msg: str | None = None,
+    prev_intents: list[str] | None = None,
+) -> tuple[str | None, list[str]]:
     """Build the skill-candidates context block for the current user message.
 
-    Returns None when nothing should be injected (skip conditions, no
-    candidates, retrieval unavailable) — the caller injects nothing.
+    Returns ``(block, intents)``. ``block`` is ``None`` when nothing should be
+    injected (skip conditions, no candidates, retrieval unavailable).
+
+    Incremental injection: when topic detection judges the message as a
+    continuation of the previous topic, only candidates not yet injected
+    in this session are included (delta). On topic shift or first turn,
+    the full candidate list is injected and the tracking set is reset.
 
     Cost guards (every user message would otherwise pay an intent-split LLM
     call + embedding retrieval):
@@ -825,14 +828,14 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
       - Embedding unavailability falls back to lexical search.
     """
     if not user_message or not isinstance(user_message, str):
-        return None
+        return None, []
     msg = user_message.strip()
     if not msg:
-        return None
+        return None, []
 
     # Cost guard: skip conversational filler and very short messages.
     if len(msg) < 12:
-        return None
+        return None, []
     lowered = msg.lower()
     _trivial_prefixes = (
         "hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
@@ -841,26 +844,57 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
     if lowered in _trivial_prefixes or any(
         lowered.startswith(p) for p in _trivial_prefixes
     ):
-        return None
+        return None, []
     # Pure confirmation / single-word replies
     if msg in ("好", "可以", "行", "ok", "yes", "no", "y", "n", "done", "完成", "继续"):
-        return None
+        return None, []
 
     # Config gate: injection can be disabled entirely
+    if _skill_graph_config().get("inject_candidates") is False:
+        return None, []
+
+    # Intent split (one lightweight LLM call). Pass prev_intents to get
+    # topic_continuation judgment (piggy-backed, zero extra cost).
+    intents, scene, llm_tc = _split_intents(msg, prev_intents=prev_intents)
+    if not intents:
+        intents = [msg]
+
+    # ── Topic detection (AND gate) ──
+    topic_result = None
+    llm_tc_for_detect = llm_tc if prev_intents else None
+
+    # Build embed_fn if embedding backend is available
+    embed_fn = None
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-        if isinstance(sg, dict) and sg.get("inject_candidates") is False:
-            return None
+        _ec = _embedding_client()
+        if _ec:
+            def embed_fn(text):
+                results = _ec.embed([text])
+                return results[0] if results else None
     except Exception:
         pass
 
-    # Intent split (one lightweight LLM call). Fall back to the raw message
-    # as a single intent when split fails.
-    intents = _split_intents(msg)
-    if not intents:
-        intents = [msg]
+    try:
+        import importlib.util as _ilu
+        _td_path = str(Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py")
+        if Path(_td_path).exists():
+            _spec = _ilu.spec_from_file_location("topic_detection", _td_path)
+            _td = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_td)
+            topic_result = _td.detect_topic_shift(
+                msg, prev_msg=prev_msg,
+                llm_topic_continuation=llm_tc_for_detect,
+                embed_fn=embed_fn,
+            )
+    except Exception:
+        pass
+
+    # Determine injection mode: full or delta
+    force_full = True  # default: full injection
+    if is_first_turn:
+        force_full = True
+    elif topic_result and topic_result.get("method") != "fallback":
+        force_full = not topic_result.get("topic_continuation", False)
 
     # Retrieve candidates per intent, merge, dedupe.
     merged: dict[str, dict[str, Any]] = {}
@@ -893,10 +927,34 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
 
     ranked = sorted(merged.values(), key=lambda x: -x.get("score", 0))
     if not ranked:
-        return None
+        return None, []
+
+    # ── Delta filtering ──
+    injected_key = f"_injected:{session_id}"
+    if force_full:
+        # Reset: inject all, rebuild tracking set
+        candidates = ranked[:10]
+        _injected_names_cache[injected_key] = set(
+            c["name"] for c in candidates
+        )
+        mode_label = "full"
+    else:
+        # Delta: only inject candidates not yet seen this session
+        already = _injected_names_cache.get(injected_key, set())
+        delta = [c for c in ranked[:10] if c["name"] not in already]
+        if not delta:
+            logger.info(
+                "skill-graph: no new candidates (all %d already injected in session %s)",
+                len(already), session_id,
+            )
+            return None, []
+        candidates = delta
+        _injected_names_cache[injected_key] = already | set(
+            c["name"] for c in candidates
+        )
+        mode_label = "delta"
 
     # Cap the injection budget (~2K tokens ≈ keep candidates lean).
-    candidates = ranked[:10]
     lines = []
     for c in candidates:
         desc = (c.get("description") or "")[:120]
@@ -905,11 +963,18 @@ def _build_skill_candidates_context(user_message: str) -> str | None:
         "Relevant skills you may want to load (skill_load) for this request:\n"
         + "\n".join(lines)
     )
+
+    tc_str = ""
+    if topic_result:
+        tc_str = f" [topic={topic_result.get('method')}, cont={topic_result.get('topic_continuation')}]"
+
     logger.info(
-        "skill-graph: injected %d skill candidates (from %d intents)",
-        len(candidates), len(intents),
+        "skill-graph: injected %d skill candidates (%s mode, from %d intents): %s%s",
+        len(candidates), mode_label, len(intents),
+        ", ".join(c["name"] for c in candidates),
+        tc_str,
     )
-    return block
+    return block, intents
 
 
 # ── LLM Enrichment ────────────────────────────────────────────────────────────
@@ -985,9 +1050,9 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
     try:
         import requests
         from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        config = load_config()
+        config = load_config_readonly() or {}
         sg_config = config.get("skills", {}).get("config", {}).get("skill-graph", {})
         enrichment_cfg = sg_config.get("enrichment", {}) if isinstance(sg_config, dict) else {}
         preferred_provider = enrichment_cfg.get("provider", "")
@@ -1046,10 +1111,7 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
 
         # Resolve model: enrichment config → main agent model → deepseek-v4-flash
         try:
-            config = load_config()
-            sg_config2 = config.get("skills", {}).get("config", {}).get("skill-graph", {})
-            enrichment_cfg2 = sg_config2.get("enrichment", {}) if isinstance(sg_config2, dict) else {}
-            model_name = enrichment_cfg2.get("model", "")
+            model_name = enrichment_cfg.get("model", "")
             if not model_name:
                 # Default to main agent's model, preferring a fast variant
                 main_model = config.get("model", {}).get("default", "")
@@ -1146,12 +1208,12 @@ def _resolve_llm_provider(
     """
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
     except Exception:
         return None
     if config is None:
         try:
-            config = load_config()
+            config = load_config_readonly() or {}
         except Exception:
             return None
     if not isinstance(config, dict):
@@ -1204,36 +1266,46 @@ def _resolve_llm_provider(
     return provider_name, api_key, base_url
 
 
-def _split_intents(user_message: str) -> list[str]:
+def _split_intents(
+    user_message: str,
+    prev_intents: list[str] | None = None,
+) -> tuple[list[str], str | None, bool | None]:
     """Split a user message into intent sentences via one lightweight LLM call.
 
-    Returns a list of intent sentences ([] on failure — callers should fall
-    back to treating the whole message as a single intent).
+    Returns ``(intents, scene, topic_continuation)``:
+
+    - ``intents``: list of intent sentences (``[]`` on failure — caller falls
+      back to treating the whole message as one intent).
+    - ``scene``: one of coding|writing|research|design|devops|hermes|media|common,
+      or ``None`` if the LLM didn't return it.
+    - ``topic_continuation``: ``True``/``False`` from the LLM when
+      ``prev_intents`` is provided, ``None`` if unavailable. Piggy-backed onto
+      the intent-split call (zero extra API cost).
 
     Multi-intent: each intent is a *sentence* (embedding-friendly), not a
-    keyword list. Also returns scene in the same call (not used here — the
-    caller applies it as a soft retrieval weight).
+    keyword list. When ``prev_intents`` is given, the prompt includes the
+    previous message's intents so the model can judge topic continuity.
     """
     if not user_message or not user_message.strip():
-        return []
+        return [], None, None
 
     try:
         import requests
     except ImportError:
         logger.warning("skill-graph: intent split skipped — requests not installed")
-        return []
+        return [], None, None
 
     resolved = _resolve_llm_provider()
     if resolved is None:
         logger.warning("skill-graph: intent split skipped — no provider with API key")
-        return []
+        return [], None, None
     provider_name, api_key, base_url = resolved
 
     # Model: intent_split_model config → enrichment model → main model → default
     model_name = "deepseek-v4-flash"
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
         sg = config.get("skills", {}).get("config", {}).get("skill-graph", {})
         if isinstance(sg, dict):
             model_name = (
@@ -1249,19 +1321,36 @@ def _split_intents(user_message: str) -> list[str]:
     if base_url.endswith("/v1"):
         base_url = base_url[:-3]
 
+    # Build topic-continuation prompt section (only when prev_intents given)
+    topic_section = ""
+    if prev_intents:
+        prev_text = " | ".join(prev_intents[:3])
+        topic_section = (
+            f"\n--- PREVIOUS MESSAGE INTENTS ---\n{prev_text}\n--- END ---\n\n"
+            'Also include this field:\n'
+            '"topic_continuation": true/false — is this new message continuing '
+            "the same topic/task as the previous message (whose intents are "
+            "shown above), or is it a new topic?\n"
+            "Judge by the core intent, not surface words. Follow-ups, "
+            'clarifications, and confirmations are "continuation". A brand-new '
+            'task or unrelated question is "new topic".\n\n'
+        )
+
     prompt = (
         "Split the user's message into separate intents. Each intent should be "
         "ONE complete sentence describing a single topic the user wants done. "
         "Output ONLY JSON:\n"
         '{"intents": ["<intent 1 as a sentence>", "<intent 2 as a sentence>", ...], '
-        '"scene": "<one of: coding|writing|research|design|devops|hermes|media|common>"}\n'
-        "Rules:\n"
+        '"scene": "<one of: coding|writing|research|design|devops|hermes|media|common>"'
+        + (', "topic_continuation": true/false}' if prev_intents else "}")
+        + "\nRules:\n"
         "- Keep the user's original meaning; do not add requirements.\n"
         "- 1-6 intents. If the message is a single topic, return exactly 1 intent "
         "with the full message rephrased as a sentence.\n"
         "- Each intent must be self-contained (no 'it'/'that' references across intents).\n"
         "- Scene: pick the single most applicable value.\n"
-        "User message:\n"
+        + topic_section
+        + "User message:\n"
         f"{user_message}"
     )
 
@@ -1293,7 +1382,7 @@ def _split_intents(user_message: str) -> list[str]:
                 if _attempt < 2:
                     _time.sleep(1.5 * (_attempt + 1))
                     continue
-                return []
+                return [], None, None
 
             # Strip markdown code fences if present
             if text.startswith("```"):
@@ -1307,9 +1396,16 @@ def _split_intents(user_message: str) -> list[str]:
             result = json.loads(text)
             intents = result.get("intents", []) if isinstance(result, dict) else []
             intents = [str(i).strip() for i in intents if str(i).strip()]
+            scene = result.get("scene") if isinstance(result, dict) else None
+            tc = result.get("topic_continuation") if isinstance(result, dict) else None
+            # Coerce tc to bool/None
+            if isinstance(tc, str):
+                tc = tc.lower().strip() in ("true", "yes", "1")
+            elif not isinstance(tc, bool):
+                tc = None
             if intents:
-                return intents
-            return []
+                return intents, scene, tc
+            return [], None, None
 
         except (requests.RequestException, json.JSONDecodeError) as e:
             logger.warning(
@@ -1319,7 +1415,7 @@ def _split_intents(user_message: str) -> list[str]:
             if _attempt < 2:
                 _time.sleep(1.5 * (_attempt + 1))
 
-    return []
+    return [], None, None
 
 
 def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]) -> bool:
@@ -1330,7 +1426,7 @@ def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]
     """
     try:
         p = Path(skill_path)
-        content = p.read_text(encoding="utf-8", errors="replace")
+        content = p.read_text(encoding="utf-8-sig", errors="replace")
 
         # Find frontmatter boundaries
         content_str = content.lstrip("\ufeff")
@@ -1379,7 +1475,7 @@ def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
 
     skill_path = node["file_path"]
     try:
-        content = Path(skill_path).read_text(encoding="utf-8", errors="replace")
+        content = Path(skill_path).read_text(encoding="utf-8-sig", errors="replace")
     except Exception:
         return False
 
@@ -1429,9 +1525,9 @@ def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
         )
 
     # Write back to SKILL.md if not read-only
-    _hermes_live = str(Path.home() / ".hermes" / "hermes-agent")
-    if skill_path.startswith(_hermes_live):
-        logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (live dir, DB only)",
+    bundled_skills = get_bundled_skills_dir(Path(__file__).resolve().parents[2] / "skills")
+    if _is_under(Path(skill_path), bundled_skills):
+        logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (bundled dir, DB only)",
                     skill_name, tags, valid_scenes)
     elif not _is_read_only_skill(skill_path):
         wrote = _patch_skill_frontmatter(skill_path, tags, valid_scenes)
@@ -2364,30 +2460,27 @@ def _slash_graph_rebuild(rest: str) -> str:
         ).fetchone()[0]
         if pending > 0:
             import subprocess as _sp
-            _log_dir = Path.home() / ".hermes" / "personal" / "skill-graph"
+            _log_dir = get_hermes_home() / "personal" / "skill-graph"
             _log_dir.mkdir(parents=True, exist_ok=True)
             _log_file = str(_log_dir / "enrichment.log")
             _lock_file = _log_dir / ".enrichment.lock"
 
             # Prevent concurrent enrichment runs
             if _lock_file.exists():
+                import psutil
                 try:
-                    _stale_pid = int(_lock_file.read_text().strip())
-                    os.kill(_stale_pid, 0)  # signal 0: check existence
-                    # Verify the PID actually belongs to an enrichment worker
-                    _cmdline = Path(f"/proc/{_stale_pid}/cmdline")
-                    if _cmdline.exists():
-                        _cmd = _cmdline.read_bytes()
-                        if b"enrich" in _cmd or b"skill_graph" in _cmd:
+                    _stale_pid = int(_lock_file.read_text(encoding="utf-8-sig").strip())
+                    if psutil.pid_exists(_stale_pid):
+                        _cmd = " ".join(psutil.Process(_stale_pid).cmdline()).lower()
+                        if "enrich" in _cmd or "skill_graph" in _cmd:
                             return (
                                 f"Skill graph rebuilt: {count} skills indexed. "
                                 f"{pending} skills pending enrichment — "
                                 f"background enrichment already running (pid {_stale_pid})."
                             )
-                    # PID alive but not our process — stale lock
-                    logger.warning("skill-graph: stale enrichment lock (pid %d alive but not enrich worker)", _stale_pid)
-                except (ValueError, OSError, ProcessLookupError):
-                    pass  # stale lock — proceed
+                        logger.warning("skill-graph: stale enrichment lock (pid %d alive but not enrich worker)", _stale_pid)
+                except (ValueError, OSError, psutil.Error) as exc:
+                    _log_fallback_exception("skill-graph: stale enrichment lock", exc)
             _script = _log_dir / "_enrich_worker.py"
             _script.write_text(f"""\
 import importlib.util, sys, os, atexit, logging
@@ -2412,11 +2505,12 @@ spec.loader.exec_module(mod)
 conn = mod._get_conn()
 mod._enrich_pending_skills(conn, limit={pending}, force={force})
 """)
-            _sp.Popen(
-                [__import__("sys").executable, str(_script)],
-                stdout=open(_log_file, "a"), stderr=open(_log_file, "a"),
-                start_new_session=True,
-            )
+            with open(_log_file, "a", encoding="utf-8") as log:
+                _sp.Popen(
+                    [__import__("sys").executable, str(_script)],
+                    stdout=log, stderr=log,
+                    start_new_session=True,
+                )
             msg = f"Skill graph rebuilt: {count} skills indexed. {pending} skills pending enrichment — running in background."
             if force:
                 msg += " (forced — cooldown bypassed)"
@@ -3201,12 +3295,45 @@ def register(ctx):
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 
     # ── Hook: pre_llm_call — inject skill candidates (Plan A) ──
+
+    # Per-session state for delta injection (prev message + intents)
+    _pre_llm_session_data: dict[str, dict] = {}  # session_id → {msg, intents}
+
     def _on_pre_llm_call(**kw):
         try:
             user_message = kw.get("user_message") or ""
             if not user_message or not isinstance(user_message, str):
                 return None
-            block = _build_skill_candidates_context(user_message)
+            session_id = kw.get("session_id") or ""
+            is_first_turn = kw.get("is_first_turn", False)
+
+            # Retrieve previous message/intents for topic detection
+            session_data = _pre_llm_session_data.get(session_id, {})
+            prev_msg = session_data.get("msg")
+            prev_intents = session_data.get("intents")
+
+            block, intents = _build_skill_candidates_context(
+                user_message,
+                session_id=session_id,
+                is_first_turn=is_first_turn,
+                prev_msg=prev_msg,
+                prev_intents=prev_intents,
+            )
+
+            # Update session state with current message + intents for next turn
+            _pre_llm_session_data[session_id] = {
+                "msg": user_message.strip(),
+                "intents": intents,
+            }
+
+            # Cap session_data cache (avoid unbounded growth in long-lived processes)
+            if len(_pre_llm_session_data) > 100:
+                # Drop oldest entries (rough heuristic)
+                oldest = sorted(_pre_llm_session_data.keys())[:20]
+                for k in oldest:
+                    if k != session_id:
+                        del _pre_llm_session_data[k]
+
             if not block:
                 return None
             # pre_llm_call context dict: {"context": str} — the core appends
