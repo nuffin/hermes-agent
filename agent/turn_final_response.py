@@ -58,6 +58,117 @@ class FinalResponseVerdict:
     result: Optional[Dict[str, Any]] = None
 
 
+def _continue_interim_response(
+    agent: Any, *, assistant_message: Any, final_response: str, messages: Any,
+    user_message: Any, codex_ack_continuations: int, promoted: bool,
+) -> bool:
+    """Apply the bounded stall/fragment/ack nudge before any durable final row."""
+    from agent.agent_runtime_helpers import (
+        intent_ack_continuation_mode, looks_like_degenerate_final, promoted_reasoning_announces_action,
+        tool_results_this_turn, trailing_continue_intent,
+    )
+    from agent.conversation_loop import _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE
+
+    _ack_mode = intent_ack_continuation_mode(agent)
+    # Said-continue-but-stopped guard: no tool calls but the short reply TAILS with an
+    # announced next action. Promoted reasoning gets the broader first-person-plan detector.
+    _stall_text = agent._strip_think_blocks(final_response or "")
+    _stall_continue_intent = (
+        bool(getattr(agent, "_stall_guards", True))
+        and agent.valid_tool_names
+        and codex_ack_continuations < 2
+        and (
+            trailing_continue_intent(_stall_text)
+            or (promoted and promoted_reasoning_announces_action(_stall_text))
+        )
+    )
+    # Degenerate-final guard shares the same bounded counter; the nudge row closes
+    # the tool-work window so a second fragment ends as an answer.
+    _tool_rows = tool_results_this_turn(messages)
+    _degenerate_final = (
+        bool(getattr(agent, "_stall_guards", True))
+        and _ack_mode != "off"
+        and codex_ack_continuations < 2
+        and _tool_rows > 0
+        and looks_like_degenerate_final(_stall_text, user_message=user_message)
+    )
+    # Precedence: announced next action, then fragment, then codex acknowledgment.
+    if _stall_continue_intent:
+        _continuation_kind = "stall"
+    elif _degenerate_final:
+        _continuation_kind = "degenerate"
+    elif (
+        _ack_mode != "off"
+        and agent.valid_tool_names
+        and codex_ack_continuations < 2
+        and agent._looks_like_codex_intermediate_ack(
+            user_message=user_message, assistant_content=final_response, messages=messages,
+            require_workspace=(_ack_mode == "codex_only"),
+        )
+    ):
+        _continuation_kind = "ack"
+    else:
+        return False
+
+    if _continuation_kind == "stall":
+        logger.info(
+            "Stall guard: turn ending on trailing continue-"
+            "intent with no tool calls — re-prompting to act "
+            "(%d/2)", codex_ack_continuations + 1,
+        )
+    elif _continuation_kind == "degenerate":
+        logger.warning(
+            "Degenerate final: %d-char fragment %r ended the turn after %d tool result(s) — "
+            "re-prompting (%d/2)", len(_stall_text), _stall_text[:40], _tool_rows,
+            codex_ack_continuations + 1,
+        )
+    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+    if promoted:
+        # The wire copy needs the promoted sidecar, not only reasoning_content.
+        interim_msg["api_content"] = final_response
+    append_message(messages, interim_msg)
+    agent._emit_interim_assistant_message(interim_msg)
+    append_message(messages, {
+        "role": "user",
+        "content": (
+            _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
+            else _CODEX_ACK_CONTINUATION_NUDGE
+        ),
+    })
+    agent._session_messages = messages
+    return True
+
+
+def _promote_clean_stop_reasoning(
+    agent: Any, assistant_message: Any, finish_reason: Any, messages: Any, api_call_count: int,
+) -> Optional[str]:
+    """Promote trusted clean-stop reasoning without storing it as ordinary content."""
+    _content = assistant_message.content
+    if not (
+        finish_reason == "stop"
+        and not assistant_message.tool_calls
+        and (_content is None or (isinstance(_content, str) and not _content.strip()))
+        and not any(
+            isinstance(d, dict) and (
+                (d.get("type") in ("thinking", "redacted_thinking") and (d.get("signature") or d.get("data")))
+                or str(d.get("type") or "").endswith(".native_assistant")
+            )
+            for d in getattr(assistant_message, "reasoning_details", None) or ()
+        )
+        and answer_in_reasoning_capability(agent)
+    ):
+        return None
+    promoted = agent._extract_reasoning(assistant_message) or None
+    if promoted:
+        logger.warning(
+            "Reasoning-only clean stop (%d chars) — returning the reasoning as the final "
+            "response (model=%s provider=%s api_calls=%d tool_turns=%d)",
+            len(promoted), agent.model, agent.provider, api_call_count,
+            sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
+        )
+    return promoted
+
+
 def finish_text_response(
     agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
     api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
@@ -72,7 +183,7 @@ def finish_text_response(
     iteration-limit summarization; the final message is appended and flushed only after the
     stop gates accept it."""
     from agent.conversation_loop import (
-        _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
+        _DROPPED_TOOLCALL_NUDGE_CONTENT,
         _join_truncated_parts
     )
 
@@ -102,31 +213,9 @@ def finish_text_response(
     # Anthropic thinking (signed ``thinking`` block, or a plugin's ``*.native_assistant`` carrier
     # of native Claude turns) is a summary written by a separate model, never the answer: it
     # takes the empty-response continuation below instead.
-    _content = assistant_message.content
-    _promoted = None
-    if (
-        finish_reason == "stop"
-        and not assistant_message.tool_calls
-        and (_content is None or (isinstance(_content, str) and not _content.strip()))
-        and not any(
-            isinstance(d, dict) and (
-                (d.get("type") in ("thinking", "redacted_thinking") and (d.get("signature") or d.get("data")))
-                or str(d.get("type") or "").endswith(".native_assistant")
-            )
-            for d in getattr(assistant_message, "reasoning_details", None) or ()
-        )
-        and answer_in_reasoning_capability(agent)
-    ):
-        _promoted = agent._extract_reasoning(assistant_message) or None
-        if _promoted:
-            # WARNING, not INFO: a model that keeps ending turns this way is stalled
-            # (planning monologue, zero tool calls) while the turn reports "complete".
-            logger.warning(
-                "Reasoning-only clean stop (%d chars) — returning the reasoning as the final "
-                "response (model=%s provider=%s api_calls=%d tool_turns=%d)",
-                len(_promoted), agent.model, agent.provider, api_call_count,
-                sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
-            )
+    _promoted = _promote_clean_stop_reasoning(
+        agent, assistant_message, finish_reason, messages, api_call_count,
+    )
     final_response = _promoted or assistant_message.content or ""
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
@@ -179,6 +268,9 @@ def finish_text_response(
             candidate_response=_pre_final_candidate,
         )
     except Exception:
+        # Hook callbacks are isolated by the plugin manager; preserve the fail-open
+        # boundary for unexpected loader/dispatch failures, but keep the traceback.
+        logger.exception("pre_final_response directive dispatch failed; continuing without a directive")
         _pre_final_action, _pre_final_payload = None, None
         _pre_final_attempt = 0
 
@@ -221,85 +313,12 @@ def finish_text_response(
     # heal threshold, deliver the queued notice through the status/warning callback — the normal out-of-band
     # delivery channel (gateway status message / CLI print). NEVER appended to messages/api_messages:
     # conversation context and the cached prompt prefix stay byte-identical.
-    from agent.agent_runtime_helpers import (
-        intent_ack_continuation_mode, looks_like_degenerate_final, promoted_reasoning_announces_action,
-        tool_results_this_turn, trailing_continue_intent,
-    )
-
-    _ack_mode = intent_ack_continuation_mode(agent)
-    # Said-continue-but-stopped guard: no tool calls but the short reply TAILS with an
-    # announced next action. Reuses the SAME bounded continuation counter (max 2 per turn).
-    # Promoted reasoning gets the broader first-person-plan tail detector: with tools offered
-    # and zero tool calls, chain-of-thought ending on "Let me batch the terminal calls..." is a
-    # stalled model, and returning it as the answer aborts the tool loop while reporting
-    # "complete" (#111761). Same cap, so a model that never acts still ends after 2 nudges.
-    _stall_text = agent._strip_think_blocks(final_response or "")
-    _stall_continue_intent = (
-        bool(getattr(agent, "_stall_guards", True))
-        and agent.valid_tool_names
-        and codex_ack_continuations < 2
-        and (
-            trailing_continue_intent(_stall_text)
-            or (bool(_promoted) and promoted_reasoning_announces_action(_stall_text))
-        )
-    )
-    # Degenerate-final guard (#103483): the turn did real tool work and then stopped on a
-    # fragment. Same scope knob and the SAME bounded counter as the ack continuation; the nudge
-    # row itself closes the tool-work window, so a second fragment ends the turn as the answer.
-    _tool_rows = tool_results_this_turn(messages)
-    _degenerate_final = (
-        bool(getattr(agent, "_stall_guards", True))
-        and _ack_mode != "off"
-        and codex_ack_continuations < 2
-        and _tool_rows > 0
-        and looks_like_degenerate_final(_stall_text, user_message=user_message)
-    )
-    # Precedence: an announced next action outranks the fragment shape; the codex ack is last.
-    if _stall_continue_intent:
-        _continuation_kind = "stall"
-    elif _degenerate_final:
-        _continuation_kind = "degenerate"
-    elif (
-        _ack_mode != "off"
-        and agent.valid_tool_names
-        and codex_ack_continuations < 2
-        and agent._looks_like_codex_intermediate_ack(
-            user_message=user_message, assistant_content=final_response, messages=messages,
-            require_workspace=(_ack_mode == "codex_only"),
-        )
+    if _continue_interim_response(
+        agent, assistant_message=assistant_message, final_response=final_response,
+        messages=messages, user_message=user_message,
+        codex_ack_continuations=codex_ack_continuations, promoted=bool(_promoted),
     ):
-        _continuation_kind = "ack"
-    else:
-        _continuation_kind = None
-    if _continuation_kind:
-        if _continuation_kind == "stall":
-            logger.info(
-                "Stall guard: turn ending on trailing continue-"
-                "intent with no tool calls — re-prompting to act "
-                "(%d/2)", codex_ack_continuations + 1,
-            )
-        elif _continuation_kind == "degenerate":
-            logger.warning(
-                "Degenerate final: %d-char fragment %r ended the turn after %d tool result(s) — "
-                "re-prompting (%d/2)", len(_stall_text), _stall_text[:40], _tool_rows,
-                codex_ack_continuations + 1,
-            )
         codex_ack_continuations += 1
-        interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
-        if _promoted:
-            # Same sidecar as the final row: the wire copy must carry the promoted text, not only
-            # ``reasoning_content``, or the continuation replays an empty assistant turn.
-            interim_msg["api_content"] = final_response
-        append_message(messages, interim_msg)
-        agent._emit_interim_assistant_message(interim_msg)
-        append_message(messages, {
-            "role": "user",
-            "content": (
-                _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
-                else _CODEX_ACK_CONTINUATION_NUDGE
-            ),
-        })
-        agent._session_messages = messages
         # An acknowledgment is non-final: its text must not suppress iteration-limit
         # summarization if the continuation exhausts budget.
         final_response = None

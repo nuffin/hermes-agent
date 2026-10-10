@@ -108,8 +108,11 @@ def build_api_request(
     try:
         from hermes_cli.lifecycle import has_hook
         agent._defer_final_response_stream_delivery = bool(has_hook("pre_final_response"))
-    except Exception:
-        agent._defer_final_response_stream_delivery = False
+    except Exception:  # health: allow BLE001 -- plugin discovery can fail arbitrarily; buffer without logging secrets
+        # Hook availability is unknown: buffer until the final-response path can
+        # consult the directive, rather than publishing an unapproved candidate.
+        # The probe exception may contain secrets, so do not log its value.
+        agent._defer_final_response_stream_delivery = True
     agent._reset_stream_delivery_tracking()
     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
     agent._last_api_first_chunk_at = None

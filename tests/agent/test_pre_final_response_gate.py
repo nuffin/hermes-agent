@@ -88,3 +88,56 @@ def test_no_plugin_keeps_terminal_delivery_unbuffered(agent):
 
     assert result["final_response"] == "ordinary final response"
     assert agent._defer_final_response_stream_delivery is False
+
+
+@pytest.mark.parametrize(
+    ("directive", "expected"),
+    [({"action": "replace", "response": "accepted response"}, "accepted response"),
+     (None, "candidate response")],
+)
+def test_hook_probe_failure_buffers_until_final_gate(agent, caplog, capsys, directive, expected):
+    canary = "probe-secret-canary-7319"
+    streamed = []
+    agent.stream_delta_callback = streamed.append
+
+    def gate(name, **_kwargs):
+        if name == "pre_final_response":
+            assert streamed == []
+            return [directive] if directive else []
+        return []
+
+    def probe(name):
+        if name == "pre_final_response":
+            raise RuntimeError(canary)
+        return False
+
+    agent.client.chat.completions.create.return_value = _response("candidate response")
+    with (
+        patch("hermes_cli.lifecycle.has_hook", side_effect=probe),
+        patch("hermes_cli.plugins.invoke_hook", side_effect=gate),
+    ):
+        result = agent.run_conversation("answer safely")
+
+    assert result["final_response"] == expected
+    assert streamed == [expected]
+    assert [message["content"] for message in result["messages"] if message["role"] == "assistant"] == [expected]
+    assert agent._defer_final_response_stream_delivery is False
+    stdout, stderr = capsys.readouterr()
+    assert canary not in stdout + stderr + caplog.text + str(result)
+
+
+def test_directive_dispatch_failure_remains_fail_open_with_traceback(agent, caplog):
+    agent._interruptible_api_call = lambda _kwargs: _response("ordinary final response")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=True),
+        patch("hermes_cli.plugins.get_pre_final_response_directive", side_effect=RuntimeError("dispatch broke")),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("answer normally")
+
+    assert result["final_response"] == "ordinary final response"
+    assert any(
+        record.exc_info and "pre_final_response directive dispatch failed" in record.message
+        for record in caplog.records
+    )
