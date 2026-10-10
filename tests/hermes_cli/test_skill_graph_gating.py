@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -263,9 +265,25 @@ class TestSkillGraphProfileIsolation:
 
         monkeypatch.setenv("HERMES_HOME", str(home_a))
         module = _import_skill_graph()
+        monkeypatch.setattr(module, "get_bundled_skills_dir", lambda _fallback: tmp_path / "bundled")
+        monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+        monkeypatch.setattr(
+            module, "_load_embedding_backend",
+            lambda: SimpleNamespace(to_blob=lambda vec: struct.pack(f"{len(vec)}f", *vec)),
+        )
+        monkeypatch.setattr(
+            module, "_embedding_client", lambda: SimpleNamespace(
+                is_available=lambda: True,
+                model_name=lambda: "test-model",
+                embed=lambda texts: [[0.5, 0.25] for _ in texts],
+            ),
+        )
         conn_a = module._get_conn()
         module._init_db(conn_a)
-        module._full_rebuild(conn_a)
+        assert module._full_rebuild(conn_a) == 1
+        assert conn_a.execute(
+            "SELECT model FROM skill_embeddings WHERE skill_name = 'skill-a'"
+        ).fetchone()[0] == "test-model"
         conn_a.close()
 
         home_b = tmp_path / "profile-b"
@@ -277,6 +295,35 @@ class TestSkillGraphProfileIsolation:
         ).fetchone()[0]
         conn_b.close()
         assert count == 0
+
+    def test_fresh_schema_has_lifecycle_defaults_without_migration(self, tmp_path):
+        module = _import_skill_graph()
+        with sqlite3.connect(tmp_path / "fresh.db") as conn:
+            module._init_db(conn)
+            conn.execute("INSERT INTO skill_nodes (name) VALUES ('fresh')")
+            assert conn.execute(
+                "SELECT is_deleted, deleted_at, needs_organizing FROM skill_nodes WHERE name = 'fresh'"
+            ).fetchone() == (0, None, 0)
+            module._migrate_db(conn)
+            module._migrate_db(conn)
+            assert conn.execute(
+                "SELECT is_deleted, deleted_at, needs_organizing FROM skill_nodes WHERE name = 'fresh'"
+            ).fetchone() == (0, None, 0)
+
+    def test_existing_nodes_gain_lifecycle_columns_without_data_loss(self, tmp_path):
+        module = _import_skill_graph()
+        with sqlite3.connect(tmp_path / "legacy.db") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("CREATE TABLE skill_nodes (name TEXT PRIMARY KEY, description TEXT)")
+            conn.execute("INSERT INTO skill_nodes (name, description) VALUES ('old', 'kept')")
+            module._init_db(conn)
+            module._migrate_db(conn)
+            module._migrate_db(conn)
+            row = conn.execute(
+                "SELECT description, is_deleted, deleted_at, needs_organizing "
+                "FROM skill_nodes WHERE name = 'old'"
+            ).fetchone()
+            assert tuple(row) == ("kept", 0, None, 0)
 
 
 def test_normalizes_non_string_yaml_tag_metadata(tmp_path):
