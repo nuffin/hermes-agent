@@ -117,7 +117,10 @@ CREATE TABLE IF NOT EXISTS skill_nodes (
     enriched_at TEXT DEFAULT NULL,    -- timestamp of last successful enrichment
     file_path   TEXT DEFAULT '',
     content_hash TEXT DEFAULT '',
-    last_parsed REAL DEFAULT 0
+    last_parsed REAL DEFAULT 0,
+    is_deleted INTEGER DEFAULT 0,
+    deleted_at TEXT,
+    needs_organizing INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS skill_edges (

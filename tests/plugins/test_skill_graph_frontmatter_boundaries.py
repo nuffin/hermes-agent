@@ -188,9 +188,10 @@ def test_db_error_before_frontmatter_write_can_be_rolled_back(env, monkeypatch):
 
 def test_pending_cooldown_force_and_private_names(env, monkeypatch, caplog):
     module, conn, root = env
-    # The existing pending query targets databases with the legacy soft-delete column.
-    conn.execute("ALTER TABLE skill_nodes ADD COLUMN is_deleted INTEGER DEFAULT 0")
     _skill(conn, root / "unused", SECRET)
+    assert conn.execute(
+        "SELECT is_deleted FROM skill_nodes WHERE name = ?", (SECRET,)
+    ).fetchone()[0] == 0
     conn.execute("UPDATE skill_nodes SET enriched_at = datetime('now') WHERE name = ?", (SECRET,))
     calls = []
     monkeypatch.setattr(module, "_enrich_skill", lambda db, name: calls.append((db, name)) or False)
