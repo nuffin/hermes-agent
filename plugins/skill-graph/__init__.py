@@ -250,8 +250,8 @@ def _get_read_only_source_dirs() -> set[Path]:
                     path = _resolve_config_path(clean)
                     if path.is_dir():
                         ro_dirs.add(path)
-    except Exception:
-        pass
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        _log_fallback_exception("skill-graph: could not resolve read-only source directories", exc)
     return ro_dirs
 
 
@@ -614,10 +614,13 @@ def _compute_embedding_for_skill(
             return False
     try:
         if not client.is_available():
-            logger.info("skill-graph: embedding backend unavailable, skipping '%s'", name)
+            logger.info("skill-graph: embedding backend unavailable; embedding deferred")
             return False
         text = _embedding_text(name, info)
         vec = client.embed([text])[0]
+        if not vec:
+            logger.warning("skill-graph: empty embedding [location=embedding.single]")
+            return False
         model = client.model_name()
         blob = to_blob(vec)
         dim = len(vec)
@@ -628,8 +631,10 @@ def _compute_embedding_for_skill(
             (name, blob, model, dim, time.time()),
         )
         return True
-    except Exception as e:
-        logger.warning("skill-graph: embedding failed for '%s': %s", name, e)
+    except Exception:
+        # Pluggable backends can put skill text, URLs or credentials in exceptions.
+        logger.warning("skill-graph: embedding failed [location=embedding.single]",
+                       exc_info=_redacted_candidate_exc_info())
         return False
 
 
@@ -655,11 +660,17 @@ def _rebuild_embeddings(conn: sqlite3.Connection) -> int:
         if not client.is_available():
             logger.info("skill-graph: embedding backend unavailable — embeddings deferred")
             return 0
-    except Exception as e:
-        logger.warning("skill-graph: embedding availability check failed: %s", e)
+    except Exception:
+        logger.warning("skill-graph: embedding availability failed [location=embedding.availability]",
+                       exc_info=_redacted_candidate_exc_info())
         return 0
 
-    model = client.model_name()
+    try:
+        model = client.model_name()
+    except Exception:
+        logger.warning("skill-graph: embedding model unavailable [location=embedding.model]",
+                       exc_info=_redacted_candidate_exc_info())
+        return 0
     # Skills missing an embedding for the current model
     rows = conn.execute(
         """SELECT n.name, n.category, n.description, n.tags
@@ -683,42 +694,48 @@ def _rebuild_embeddings(conn: sqlite3.Connection) -> int:
         }
         texts.append(_embedding_text(name, info))
 
-    logger.info("skill-graph: computing embeddings for %d skills (%s)", len(texts), model)
+    logger.info("skill-graph: computing embeddings for %d skills", len(texts))
     # TEI max_client_batch_size is 32 — chunk to avoid oversized POSTs
     BATCH = 32
-    vecs: list[list[float] | None] = []
-    try:
-        for i in range(0, len(texts), BATCH):
-            chunk = texts[i : i + BATCH]
-            try:
-                chunk_vecs = client.embed(chunk)
-                vecs.extend(chunk_vecs)
-            except Exception as e:
-                logger.warning(
-                    "skill-graph: batch embedding failed at chunk %d: %s", i // BATCH, e
-                )
-                vecs.extend([None] * len(chunk))
-                break
-    except Exception as e:
-        logger.warning("skill-graph: batch embedding failed: %s", e)
-        return 0
+    vecs: list[list[float]] = []
+    for i in range(0, len(texts), BATCH):
+        chunk = texts[i : i + BATCH]
+        try:
+            chunk_vecs = client.embed(chunk)
+            if len(chunk_vecs) != len(chunk) or any(not vec for vec in chunk_vecs):
+                raise ValueError("incomplete embedding batch")
+            vecs.extend(chunk_vecs)
+        except Exception:
+            # Preserve complete earlier chunks but never count a partial batch.
+            logger.warning("skill-graph: batch embedding failed [location=embedding.batch]",
+                           exc_info=_redacted_candidate_exc_info())
+            break
 
     now = time.time()
     count = 0
-    expected_dim = len(vecs[0]) if vecs and vecs[0] is not None else 0
+    expected_dim = len(vecs[0]) if vecs else 0
     for row, vec in zip(rows, vecs):
-        if vec is None or (expected_dim and len(vec) != expected_dim):
+        if len(vec) != expected_dim:
+            logger.warning("skill-graph: inconsistent embedding dimension [location=embedding.row]")
             continue
-        name = row["name"]
-        blob = to_blob(vec)
-        conn.execute(
-            """INSERT OR REPLACE INTO skill_embeddings
-               (skill_name, vector, model, dim, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (name, blob, model, len(vec), now),
-        )
-        count += 1
-    conn.commit()
+        try:
+            blob = to_blob(vec)
+            conn.execute(
+                """INSERT OR REPLACE INTO skill_embeddings
+                   (skill_name, vector, model, dim, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (row["name"], blob, model, len(vec), now),
+            )
+            count += 1
+        except Exception:
+            logger.warning("skill-graph: embedding row failed [location=embedding.row]",
+                           exc_info=_redacted_candidate_exc_info())
+    try:
+        conn.commit()
+    except sqlite3.Error as exc:
+        _log_fallback_exception("skill-graph: embedding commit failed [location=embedding.commit]", exc)
+        conn.rollback()
+        return 0
     logger.info("skill-graph: stored %d embeddings", count)
     return count
 
@@ -727,8 +744,8 @@ def _drop_embeddings(conn: sqlite3.Connection, name: str) -> None:
     """Remove embedding rows for a skill (on delete)."""
     try:
         conn.execute("DELETE FROM skill_embeddings WHERE skill_name = ?", (name,))
-    except Exception:
-        pass
+    except sqlite3.Error as exc:
+        _log_fallback_exception("skill-graph: embedding removal failed [location=embedding.drop]", exc)
 
 
 def _embedding_search(
@@ -755,6 +772,8 @@ def _embedding_search(
         if not client.is_available():
             return []
     except Exception:
+        logger.warning("skill-graph: search backend unavailable [location=embedding.search.availability]",
+                       exc_info=_redacted_candidate_exc_info())
         return []
 
     try:
@@ -793,8 +812,9 @@ def _embedding_search(
             )
         out.sort(key=lambda x: -x["score"])
         return out[:topk]
-    except Exception as e:
-        logger.warning("skill-graph: embedding search failed: %s", e)
+    except Exception:
+        logger.warning("skill-graph: embedding search failed [location=embedding.search]",
+                       exc_info=_redacted_candidate_exc_info())
         return []
 
 
@@ -804,6 +824,77 @@ def _embedding_search(
 _injected_names_cache: dict[str, set[str]] = {}
 
 
+def _redacted_candidate_exc_info() -> tuple[type[RuntimeError], RuntimeError, Any]:
+    """Synthetic traceback for failures that may carry private request data."""
+    try:
+        raise RuntimeError("candidate lookup unavailable") from None
+    except RuntimeError as redacted:
+        redacted.__context__ = None
+        return type(redacted), redacted, redacted.__traceback__
+
+
+def _detect_candidate_topic(
+    msg: str, prev_msg: str | None, llm_tc: bool | None,
+) -> dict[str, Any] | None:
+    """Detect continuity; an unavailable detector means full injection."""
+    embed_fn: Any = None
+    try:
+        client = _embedding_client()
+        if client:
+            embed_fn = lambda text: (client.embed([text]) or [None])[0]
+    except Exception:
+        # Client construction is a pluggable boundary; errors may contain URLs or secrets.
+        logger.warning("skill-graph: candidate embedding client unavailable [location=candidate.client]",
+                       exc_info=_redacted_candidate_exc_info())
+
+    try:
+        import importlib.util as importlib_util
+        detector_path = Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py"
+        if detector_path.exists():
+            spec = importlib_util.spec_from_file_location("topic_detection", str(detector_path))
+            detector = importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(detector)
+            return detector.detect_topic_shift(
+                msg, prev_msg=prev_msg,
+                llm_topic_continuation=llm_tc,
+                embed_fn=embed_fn,
+            )
+    except Exception:
+        # Dynamic loader and detector invoke arbitrary callbacks; never expose their errors.
+        logger.warning("skill-graph: candidate topic detection unavailable [location=candidate.topic]",
+                       exc_info=_redacted_candidate_exc_info())
+    return None
+
+
+def _rank_skill_candidates(intents: list[str]) -> list[dict[str, Any]]:
+    """Merge semantic results, falling back to lexical search per intent."""
+    merged: dict[str, dict[str, Any]] = {}
+    for intent in intents[:6]:
+        hits = _embedding_search(intent, topk=5)
+        if not hits:
+            try:
+                conn = _ensure_graph()
+                lex = _search_graph(intent, conn, limit=5)
+                for result in lex:
+                    hits.append({
+                        "name": result.get("name", ""),
+                        "description": result.get("description", ""),
+                        "score": 0.5,
+                        "scenes": [],
+                    })
+            except Exception:
+                # Retrieval is best-effort; SQL and graph callbacks can carry request text.
+                logger.warning("skill-graph: candidate lexical fallback unavailable [location=candidate.lexical]",
+                               exc_info=_redacted_candidate_exc_info())
+        for hit in hits:
+            name = hit.get("name", "")
+            if not name:
+                continue
+            if name not in merged or hit.get("score", 0) > merged[name].get("score", 0):
+                merged[name] = hit
+    return sorted(merged.values(), key=lambda result: -result.get("score", 0))
+
+
 def _build_skill_candidates_context(
     user_message: str,
     session_id: str = "",
@@ -811,21 +902,11 @@ def _build_skill_candidates_context(
     prev_msg: str | None = None,
     prev_intents: list[str] | None = None,
 ) -> tuple[str | None, list[str]]:
-    """Build the skill-candidates context block for the current user message.
+    """Return candidate block and intents, or ``(None, [])`` when skipped.
 
-    Returns ``(block, intents)``. ``block`` is ``None`` when nothing should be
-    injected (skip conditions, no candidates, retrieval unavailable).
-
-    Incremental injection: when topic detection judges the message as a
-    continuation of the previous topic, only candidates not yet injected
-    in this session are included (delta). On topic shift or first turn,
-    the full candidate list is injected and the tracking set is reset.
-
-    Cost guards (every user message would otherwise pay an intent-split LLM
-    call + embedding retrieval):
-      - Trivial / short / conversational messages skip the pipeline.
-      - Intent-split failure falls back to the raw message as one intent.
-      - Embedding unavailability falls back to lexical search.
+    Continuations inject only unseen candidates; topic shifts and failures
+    inject the full list. Empty intent splits use the raw message; unavailable
+    embeddings use lexical lookup. Short conversational messages are skipped.
     """
     if not user_message or not isinstance(user_message, str):
         return None, []
@@ -859,73 +940,15 @@ def _build_skill_candidates_context(
     if not intents:
         intents = [msg]
 
-    # ── Topic detection (AND gate) ──
-    topic_result = None
-    llm_tc_for_detect = llm_tc if prev_intents else None
-
-    # Build embed_fn if embedding backend is available
-    embed_fn = None
-    try:
-        _ec = _embedding_client()
-        if _ec:
-            def embed_fn(text):
-                results = _ec.embed([text])
-                return results[0] if results else None
-    except Exception:
-        pass
-
-    try:
-        import importlib.util as _ilu
-        _td_path = str(Path(__file__).resolve().parent.parent.parent / "agent" / "topic_detection.py")
-        if Path(_td_path).exists():
-            _spec = _ilu.spec_from_file_location("topic_detection", _td_path)
-            _td = _ilu.module_from_spec(_spec)
-            _spec.loader.exec_module(_td)
-            topic_result = _td.detect_topic_shift(
-                msg, prev_msg=prev_msg,
-                llm_topic_continuation=llm_tc_for_detect,
-                embed_fn=embed_fn,
-            )
-    except Exception:
-        pass
+    # LLM judgment is usable only when the previous intents are available.
+    topic_result = _detect_candidate_topic(msg, prev_msg, llm_tc if prev_intents else None)
 
     # Determine injection mode: full or delta
-    force_full = True  # default: full injection
-    if is_first_turn:
-        force_full = True
-    elif topic_result and topic_result.get("method") != "fallback":
+    force_full = True  # missing detector or fallback always uses full injection
+    if not is_first_turn and topic_result and topic_result.get("method") != "fallback":
         force_full = not topic_result.get("topic_continuation", False)
 
-    # Retrieve candidates per intent, merge, dedupe.
-    merged: dict[str, dict[str, Any]] = {}
-    for intent in intents[:6]:
-        hits = _embedding_search(intent, topk=5)
-        if not hits:
-            # Fallback: lexical graph search
-            try:
-                conn = _ensure_graph()
-                lex = _search_graph(intent, conn, limit=5)
-                for r in lex:
-                    hits.append(
-                        {
-                            "name": r.get("name", ""),
-                            "description": r.get("description", ""),
-                            "score": 0.5,
-                            "scenes": [],
-                        }
-                    )
-            except Exception:
-                pass
-        for hit in hits:
-            name = hit.get("name", "")
-            if not name:
-                continue
-            if name not in merged:
-                merged[name] = hit
-            elif hit.get("score", 0) > merged[name].get("score", 0):
-                merged[name] = hit
-
-    ranked = sorted(merged.values(), key=lambda x: -x.get("score", 0))
+    ranked = _rank_skill_candidates(intents)
     if not ranked:
         return None, []
 
@@ -943,10 +966,7 @@ def _build_skill_candidates_context(
         already = _injected_names_cache.get(injected_key, set())
         delta = [c for c in ranked[:10] if c["name"] not in already]
         if not delta:
-            logger.info(
-                "skill-graph: no new candidates (all %d already injected in session %s)",
-                len(already), session_id,
-            )
+            logger.info("skill-graph: no new candidates (all %d already injected)", len(already))
             return None, []
         candidates = delta
         _injected_names_cache[injected_key] = already | set(
@@ -1041,14 +1061,52 @@ SCENE_VOCABULARY_DESC = {
 }
 
 
-def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
-    """Call the configured LLM provider for enrichment.
+def _parse_enrichment_response(data: Any) -> tuple[bool, dict[str, Any] | None]:
+    """Distinguish empty content (retry) from non-object JSON (stop)."""
+    text = (data.get("choices", [{}])[0]
+            .get("message", {}).get("content", "")).strip()
+    if not text:
+        return True, None
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:]) if len(lines) > 1 else text
+        if text.endswith("```"):
+            text = text[:-3]
+    if text.startswith("json"):
+        text = text[4:].strip()
+    result = json.loads(text)
+    return False, result if isinstance(result, dict) else None
 
-    Uses the same provider/model as the current agent session.
-    Returns parsed JSON response or None on failure.
-    """
+
+def _request_enrichment_with_retries(url: str, headers: dict, payload: dict) -> dict[str, Any] | None:
+    """Bound transport/parse retries and keep all failure logs credential-free."""
+    import requests
+
+    for attempt in range(3):
+        resp = None
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            empty, result = _parse_enrichment_response(resp.json())
+            if not empty:
+                return result
+            location = "enrichment.empty"
+        except (requests.RequestException, json.JSONDecodeError, IndexError,
+                AttributeError, TypeError, KeyError):
+            location = "enrichment.request"
+        # A response's status_code is untrusted; log only a real HTTP integer.
+        code = getattr(resp, "status_code", None)
+        status = code if type(code) is int and 100 <= code <= 599 else None
+        logger.warning("skill-graph: %s [attempt=%d/3 status=%s]",
+                       location, attempt + 1, status)
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
+def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
+    """Call the configured LLM provider for enrichment; return JSON or None."""
     try:
-        import requests
         from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
         from hermes_cli.config import load_config_readonly
 
@@ -1080,10 +1138,7 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
                 provider_name = preferred_provider
                 api_key, base_url = resolved
             else:
-                logger.warning(
-                    "skill-graph: enrichment skipped — preferred provider '%s' has no API key configured",
-                    preferred_provider,
-                )
+                logger.warning("skill-graph: enrichment unavailable [location=enrichment.provider]")
                 return None
         else:
             # Default: use the main agent's configured provider
@@ -1106,24 +1161,16 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
                         break
 
         if not provider_name:
-            logger.warning("skill-graph: enrichment skipped — no provider with API key configured")
+            logger.warning("skill-graph: enrichment unavailable [location=enrichment.provider]")
             return None
 
         # Resolve model: enrichment config → main agent model → deepseek-v4-flash
         try:
-            model_name = enrichment_cfg.get("model", "")
-            if not model_name:
-                # Default to main agent's model, preferring a fast variant
-                main_model = config.get("model", {}).get("default", "")
-                if main_model:
-                    model_name = main_model
-            if not model_name:
-                model_name = "deepseek-v4-flash"
-        except Exception:
-            model_name = "deepseek-v4-flash"
-
-        logger.debug("skill-graph: enrichment using provider=%s model=%s",
-                     provider_name, model_name)
+            model_name = enrichment_cfg.get("model", "") or config.get("model", {}).get("default", "")
+        except (AttributeError, TypeError):
+            logger.warning("skill-graph: enrichment model fallback [location=enrichment.model]")
+            model_name = ""
+        model_name = model_name or "deepseek-v4-flash"
 
         # Normalise base_url: strip /v1 suffix if present (we add it below)
         base_url = base_url.rstrip("/")
@@ -1140,58 +1187,10 @@ def _call_llm_for_enrichment(prompt: str) -> dict[str, Any] | None:
             "temperature": 0.3,
             "max_tokens": 2048,
         }
-
-        import time as _time
-
-        for _attempt in range(3):
-            try:
-                resp = requests.post(
-                    f"{base_url}/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                text = (data.get("choices", [{}])[0]
-                        .get("message", {}).get("content", "")).strip()
-                if not text:
-                    logger.warning(
-                        "skill-graph: enrichment empty response (attempt %d/3). "
-                        "provider=%s model=%s status=%d body=%.200s",
-                        _attempt + 1, provider_name, model_name,
-                        resp.status_code, resp.text)
-                    if _attempt < 2:
-                        _time.sleep(2 * (_attempt + 1))
-                        continue
-                    return None
-
-                # Extract JSON from possible markdown code blocks
-                if text.startswith("```"):
-                    lines = text.split("\n")
-                    text = "\n".join(lines[1:]) if len(lines) > 1 else text
-                    if text.endswith("```"):
-                        text = text[:-3]
-                if text.startswith("json"):
-                    text = text[4:].strip()
-
-                result = json.loads(text)
-                if not isinstance(result, dict):
-                    return None
-                return result
-
-            except (requests.RequestException, json.JSONDecodeError) as e:
-                _resp_text = resp.text[:500] if 'resp' in dir() else '(no response)'
-                logger.warning(
-                    "skill-graph: enrichment LLM call failed (attempt %d/3): %s | body=%.500s",
-                    _attempt + 1, e, _resp_text)
-                if _attempt < 2:
-                    _time.sleep(2 * (_attempt + 1))
-
-        return None
-
-    except Exception as e:
-        logger.warning("skill-graph: enrichment LLM call failed: %s", e)
+        return _request_enrichment_with_retries(f"{base_url}/v1/chat/completions", headers, payload)
+    except (ImportError, OSError, TypeError, ValueError, AttributeError,
+            RuntimeError, KeyError, yaml.YAMLError):
+        logger.warning("skill-graph: enrichment unavailable [location=enrichment.setup]")
         return None
 
 
@@ -1209,12 +1208,16 @@ def _resolve_llm_provider(
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY, has_usable_secret
         from hermes_cli.config import load_config_readonly
-    except Exception:
+    except (ImportError, OSError, TypeError, ValueError, AttributeError,
+            RuntimeError, yaml.YAMLError) as exc:
+        _log_fallback_exception("skill-graph: could not import provider configuration", exc)
         return None
     if config is None:
         try:
             config = load_config_readonly() or {}
-        except Exception:
+        except (ImportError, OSError, TypeError, ValueError, AttributeError,
+                RuntimeError, yaml.YAMLError) as exc:
+            _log_fallback_exception("skill-graph: could not read provider configuration", exc)
             return None
     if not isinstance(config, dict):
         return None
@@ -1314,8 +1317,9 @@ def _split_intents(
                 or config.get("model", {}).get("default")
                 or "deepseek-v4-flash"
             )
-    except Exception:
-        pass
+    except (ImportError, OSError, TypeError, ValueError, AttributeError,
+            RuntimeError, yaml.YAMLError) as exc:
+        _log_fallback_exception("skill-graph: intent split model fallback", exc)
 
     base_url = base_url.rstrip("/")
     if base_url.endswith("/v1"):
@@ -1382,6 +1386,7 @@ def _split_intents(
                 if _attempt < 2:
                     _time.sleep(1.5 * (_attempt + 1))
                     continue
+                logger.warning("skill-graph: intent split empty response [attempt=3/3]")
                 return [], None, None
 
             # Strip markdown code fences if present
@@ -1405,12 +1410,13 @@ def _split_intents(
                 tc = None
             if intents:
                 return intents, scene, tc
+            logger.warning("skill-graph: intent split returned no intents")
             return [], None, None
 
-        except (requests.RequestException, json.JSONDecodeError) as e:
+        except (requests.RequestException, json.JSONDecodeError):
             logger.warning(
-                "skill-graph: intent split failed (attempt %d/3): %s",
-                _attempt + 1, e,
+                "skill-graph: intent split request failed [attempt=%d/3]",
+                _attempt + 1,
             )
             if _attempt < 2:
                 _time.sleep(1.5 * (_attempt + 1))
@@ -1440,7 +1446,8 @@ def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]
         frontmatter = content_str[3:end].strip()
         try:
             meta = yaml.safe_load(frontmatter) or {}
-        except yaml.YAMLError:
+        except yaml.YAMLError as exc:
+            _log_fallback_exception("skill-graph: invalid frontmatter [location=frontmatter.parse]", exc)
             return False
 
         # Update metadata.hermes.tags and metadata.hermes.scenes
@@ -1449,14 +1456,15 @@ def _patch_skill_frontmatter(skill_path: str, tags: list[str], scenes: list[str]
         hermes_meta["scenes"] = scenes
 
         # Re-serialize frontmatter
-        new_fm = yaml.dump(meta, default_flow_style=False, allow_unicode=True).strip()
+        new_fm = yaml.safe_dump(meta, default_flow_style=False, allow_unicode=True).strip()
         new_content = f"---\n{new_fm}\n---{content_str[end + 3:]}"
 
         p.write_text(new_content, encoding="utf-8")
         return True
 
-    except Exception as e:
-        logger.warning("skill-graph: failed to patch frontmatter for %s: %s", skill_path, e)
+    except (OSError, UnicodeError, TypeError, ValueError, AttributeError,
+            RuntimeError, yaml.YAMLError) as exc:
+        _log_fallback_exception("skill-graph: frontmatter patch failed [location=frontmatter.patch]", exc)
         return False
 
 
@@ -1476,7 +1484,8 @@ def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
     skill_path = node["file_path"]
     try:
         content = Path(skill_path).read_text(encoding="utf-8-sig", errors="replace")
-    except Exception:
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        _log_fallback_exception("skill-graph: enrichment read failed [location=enrichment.read]", exc)
         return False
 
     # Build prompt + call LLM
@@ -1496,8 +1505,7 @@ def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
     valid_scenes = [s for s in scenes if s in SCENE_VOCABULARY]
     if suggestions:
         logger.info(
-            "skill-graph: enrichment suggestions for '%s': %s",
-            skill_name, suggestions,
+            "skill-graph: enrichment suggestions received [location=enrichment.suggestions]",
         )
 
     # Update DB
@@ -1527,19 +1535,19 @@ def _enrich_skill(conn: sqlite3.Connection, skill_name: str) -> bool:
     # Write back to SKILL.md if not read-only
     bundled_skills = get_bundled_skills_dir(Path(__file__).resolve().parents[2] / "skills")
     if _is_under(Path(skill_path), bundled_skills):
-        logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (bundled dir, DB only)",
-                    skill_name, tags, valid_scenes)
+        logger.info("skill-graph: enriched tags=%d scenes=%d (bundled dir, DB only)",
+                    len(tags), len(valid_scenes))
     elif not _is_read_only_skill(skill_path):
         wrote = _patch_skill_frontmatter(skill_path, tags, valid_scenes)
         if wrote:
-            logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (wrote SKILL.md)",
-                        skill_name, tags, valid_scenes)
+            logger.info("skill-graph: enriched tags=%d scenes=%d (wrote SKILL.md)",
+                        len(tags), len(valid_scenes))
         else:
-            logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (SKILL.md write failed)",
-                        skill_name, tags, valid_scenes)
+            logger.info("skill-graph: enriched tags=%d scenes=%d (SKILL.md write failed)",
+                        len(tags), len(valid_scenes))
     else:
-        logger.info("skill-graph: enriched '%s' → tags=%s scenes=%s (read-only, DB only)",
-                    skill_name, tags, valid_scenes)
+        logger.info("skill-graph: enriched tags=%d scenes=%d (read-only, DB only)",
+                    len(tags), len(valid_scenes))
 
     conn.commit()
     return True
@@ -2540,137 +2548,137 @@ def _slash_help() -> str:
     )
 
 
-def _handle_slash_discovery(subcmd: str, rest: str) -> str:
-    """Handle graph-wide discovery and statistics subcommands."""
-    if subcmd in ("status", "stats"):
-        return _slash_graph_status()
-    if subcmd == "search" and not rest:
+def _slash_graph_search(rest: str) -> str:
+    if not rest:
         return _slash_help()
-    if subcmd == "search":
+    try:
+        conn = _ensure_graph()
+        with _graph_lock:
+            results = _search_graph(rest, conn, limit=15)
+        if not results:
+            return f"No skills found for: {rest}"
+        lines = [f"Search results for: {rest}", ""]
+        for r in results:
+            rel = r.get("relevance", "")
+            chain = r.get("relationship_chain", [])
+            extra = f" [{rel}]" if rel else ""
+            if chain:
+                extra += f"  chain: {' → '.join(chain[:2])}"
+            lines.append(f"  {r['name']:35s}  {r.get('description', '')[:55]}{extra}")
+        return "\n".join(lines)
+    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        _log_fallback_exception("skill-graph: search failed", exc)
+        return "Search failed: could not search skills"
+
+
+def _slash_scene_distribution(conn: sqlite3.Connection) -> str:
+    rows = conn.execute("SELECT scenes FROM skill_nodes WHERE (is_deleted IS NULL OR is_deleted = 0)").fetchall()
+    counts, untagged = {}, 0
+    for row in rows:
         try:
-            conn = _ensure_graph()
-            with _graph_lock:
-                results = _search_graph(rest, conn, limit=15)
-            if not results:
-                return f"No skills found for: {rest}"
-            lines = [f"Search results for: {rest}", ""]
+            slist = json.loads(row["scenes"]) if row["scenes"] else []
+        except (ValueError, TypeError) as exc:
+            _log_fallback_exception("skill-graph: invalid scene data", exc)
+            slist = []
+        if not slist:
+            untagged += 1
+        for s in slist:
+            counts[s] = counts.get(s, 0) + 1
+    lines = [f"Scene distribution ({len(rows)} skills):", ""]
+    for s in SCENE_VOCABULARY:
+        lines.append(f"  {s:12s} {counts.get(s, 0):4d}")
+    if untagged:
+        lines.append(f"  {'(untagged)':12s} {untagged:4d}")
+    other = sum(v for k, v in counts.items() if k not in SCENE_VOCABULARY)
+    if other:
+        lines.append(f"  {'(other)':12s} {other:4d}")
+    return "\n".join(lines)
+
+
+def _slash_scene_show(conn: sqlite3.Connection, scene_arg: str) -> str:
+    rows = conn.execute(
+        "SELECT name, description FROM skill_nodes WHERE (is_deleted IS NULL OR is_deleted = 0) "
+        "AND instr(scenes, ?) > 0 ORDER BY name", (json.dumps(scene_arg),)).fetchall()
+    if not rows:
+        return f"No skills with scene: {scene_arg}"
+    lines = [f"Skills with scene '{scene_arg}' ({len(rows)}):", ""]
+    for row in rows:
+        lines.append(f"  {row['name']:40s} {(row['description'] or '')[:80]}")
+    return "\n".join(lines)
+
+
+def _slash_graph_scene(rest: str) -> str:
+    parts = rest.strip().split(None, 1)
+    scene_sub = parts[0].lower() if parts else "list"
+    scene_arg = parts[1] if len(parts) > 1 else ""
+    try:
+        conn = _ensure_graph()
+        if scene_sub == "list":
+            return _slash_scene_distribution(conn)
+        if scene_sub == "show" and scene_arg:
+            return _slash_scene_show(conn, scene_arg)
+        return "Usage: /sg scene list | /sg scene show <scene-name>"
+    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        _log_fallback_exception("skill-graph: scene command failed", exc)
+        return "Scene command failed: could not read graph results"
+
+
+def _slash_graph_list(_rest: str) -> str:
+    try:
+        conn = _ensure_graph()
+        rows = conn.execute("SELECT name, description, category FROM skill_nodes ORDER BY name").fetchall()
+        if not rows:
+            return "No skills in graph."
+        lines = [f"Skills in graph ({len(rows)}):", ""]
+        for r in rows:
+            lines.append(f"  {r['name']:35s}  [{r['category']}]  {(r['description'] or '')[:60]}")
+        return "\n".join(lines)
+    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        _log_fallback_exception("skill-graph: list failed", exc)
+        return "List failed: could not read graph results"
+
+
+def _slash_graph_score(rest: str) -> str:
+    """Show detailed scoring breakdown for a search query."""
+    if not rest:
+        return "Usage: /skill-graph score <query>"
+    try:
+        conn = _ensure_graph()
+        with _graph_lock:
+            results = _search_graph(rest, conn, limit=8)
+            lines = [f"Score breakdown for: {rest}", ""]
             for r in results:
-                rel = r.get("relevance", "")
-                chain = r.get("relationship_chain", [])
-                extra = f" [{rel}]" if rel else ""
-                if chain:
-                    extra += f"  chain: {' → '.join(chain[:2])}"
-                lines.append(f"  {r['name']:35s}  {r.get('description', '')[:55]}{extra}")
+                name = r["name"]
+                stats_rows = conn.execute(
+                    "SELECT term, load_count, search_count FROM skill_term_stats WHERE skill_name = ?", (name,)
+                ).fetchall()
+                stats_line = (
+                    "; ".join(f"{s['term']}: load={s['load_count']}/{s['search_count']}"
+                              for s in stats_rows[:5]) if stats_rows else "(no stats)"
+                )
+                lines.append(f"  {name:40s} score={r['score']:.4f}  [{r.get('relevance', '?')}]")
+                lines.append(f"  {'':40s}  stats: {stats_line}")
+            lines.append(f"\n{len(results)} results shown")
             return "\n".join(lines)
-        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                KeyError, AttributeError, IndexError) as exc:
-            _log_fallback_exception("skill-graph: search failed", exc)
-            return "Search failed: could not search skills"
+    except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        _log_fallback_exception("skill-graph: score breakdown failed", exc)
+        return "Score breakdown failed: could not read graph results"
 
-    elif subcmd == "scene":
-        scene_sub = rest.strip().split(None, 1)[0].lower() if rest.strip() else "list"
-        scene_arg = rest.strip().split(None, 1)[1] if len(rest.strip().split(None, 1)) > 1 else ""
-        try:
-            conn = _ensure_graph()
-            if scene_sub == "list":
-                rows = conn.execute("""
-                    SELECT scenes FROM skill_nodes
-                    WHERE (is_deleted IS NULL OR is_deleted = 0)
-                """).fetchall()
-                counts = {}
-                untagged = 0
-                for row in rows:
-                    try:
-                        slist = json.loads(row["scenes"]) if row["scenes"] else []
-                    except Exception:
-                        slist = []
-                    if not slist:
-                        untagged += 1
-                    for s in slist:
-                        counts[s] = counts.get(s, 0) + 1
-                lines = [f"Scene distribution ({len(rows)} skills):", ""]
-                for s in SCENE_VOCABULARY:
-                    lines.append(f"  {s:12s} {counts.get(s, 0):4d}")
-                if untagged:
-                    lines.append(f"  {'(untagged)':12s} {untagged:4d}")
-                other = sum(v for k, v in counts.items() if k not in SCENE_VOCABULARY)
-                if other:
-                    lines.append(f"  {'(other)':12s} {other:4d}")
-                return "\n".join(lines)
-            elif scene_sub == "show" and scene_arg:
-                rows = conn.execute("""
-                    SELECT name, description FROM skill_nodes
-                    WHERE (is_deleted IS NULL OR is_deleted = 0)
-                    AND instr(scenes, ?) > 0
-                    ORDER BY name
-                """, (json.dumps(scene_arg),)).fetchall()
-                if not rows:
-                    return f"No skills with scene: {scene_arg}"
-                lines = [f"Skills with scene '{scene_arg}' ({len(rows)}):", ""]
-                for row in rows:
-                    desc = (row["description"] or "")[:80]
-                    lines.append(f"  {row['name']:40s} {desc}")
-                return "\n".join(lines)
-            else:
-                return "Usage: /sg scene list | /sg scene show <scene-name>"
-        except Exception as e:
-            logger.exception("skill-graph: scene command failed")
-            return f"Scene command failed: {e}"
 
-    elif subcmd == "list":
-        try:
-            conn = _ensure_graph()
-            rows = conn.execute(
-                "SELECT name, description, category FROM skill_nodes ORDER BY name"
-            ).fetchall()
-            if not rows:
-                return "No skills in graph."
-            lines = [f"Skills in graph ({len(rows)}):", ""]
-            for r in rows:
-                desc = (r["description"] or "")[:60]
-                lines.append(f"  {r['name']:35s}  [{r['category']}]  {desc}")
-            return "\n".join(lines)
-        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                KeyError, AttributeError, IndexError) as exc:
-            _log_fallback_exception("skill-graph: list failed", exc)
-            return "List failed: could not read graph results"
-
-    elif subcmd in ("score", "explain"):
-        """Show detailed scoring breakdown for a search query."""
-        if not rest:
-            return "Usage: /skill-graph score <query>"
-        try:
-            conn = _ensure_graph()
-            with _graph_lock:
-                results = _search_graph(rest, conn, limit=8)
-                lines = [f"Score breakdown for: {rest}", ""]
-                for r in results:
-                    name = r["name"]
-                    score = r["score"]
-                    rel = r.get("relevance", "?")
-                    # Query term stats for this skill
-                    stats_rows = conn.execute(
-                        "SELECT term, load_count, search_count FROM skill_term_stats WHERE skill_name = ?",
-                        (name,),
-                    ).fetchall()
-                    if stats_rows:
-                        stats_line = "; ".join(
-                            f"{s['term']}: load={s['load_count']}/{s['search_count']}"
-                            for s in stats_rows[:5]
-                        )
-                    else:
-                        stats_line = "(no stats)"
-                    lines.append(
-                        f"  {name:40s} score={score:.4f}  [{rel}]"
-                    )
-                    lines.append(f"  {'':40s}  stats: {stats_line}")
-                lines.append(f"\n{len(results)} results shown")
-                return "\n".join(lines)
-        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError,
-                KeyError, AttributeError, IndexError) as exc:
-            _log_fallback_exception("skill-graph: score breakdown failed", exc)
-            return "Score breakdown failed: could not read graph results"
-    raise ValueError("Unsupported graph discovery command")
+def _handle_slash_discovery(subcmd: str, rest: str) -> str:
+    """Dispatch graph-wide discovery commands and aliases."""
+    handlers = {
+        "status": _slash_graph_status, "stats": _slash_graph_status,
+        "search": _slash_graph_search,
+        "scene": _slash_graph_scene,
+        "list": _slash_graph_list,
+        "score": _slash_graph_score, "explain": _slash_graph_score,
+    }
+    if subcmd not in handlers:
+        raise ValueError("Unsupported graph discovery command")
+    if subcmd in ("status", "stats"):
+        return handlers[subcmd]()
+    return handlers[subcmd](rest)
 
 
 def _slash_graph_config(rest: str) -> str:
