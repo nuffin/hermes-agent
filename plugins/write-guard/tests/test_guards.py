@@ -47,10 +47,6 @@ def tmp_skill(tmp_path):
     skills.mkdir(parents=True)
     old = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = str(home)
-    write_guard._HERMES_HOME = home
-    write_guard._SKILLS_DIR = skills
-    delete_guard._HERMES_HOME = home
-    delete_guard._SKILLS_DIR = skills
     yield home
     if old:
         os.environ["HERMES_HOME"] = old
@@ -86,7 +82,7 @@ class TestPreSkillWriteFile:
         skill = tmp_skill / "skills" / "myskill"
         refs = skill / "references"
         refs.mkdir(parents=True)
-        (refs / "exists.md").write_text("old content")
+        (refs / "exists.md").write_text("old content", encoding="utf-8")
 
         result = write_guard._check_skill_file_exists(
             name="myskill", file_path="references/exists.md"
@@ -121,7 +117,7 @@ class TestPreSkillWriteFile:
 class TestPreToolCall:
     def test_blocks_existing_file(self, tmp_path):
         f = tmp_path / "exists.txt"
-        f.write_text("hello")
+        f.write_text("hello", encoding="utf-8")
         result = write_guard._check_tool_file_write(
             tool_name="write_file", arguments={"path": str(f)}
         )
@@ -149,7 +145,7 @@ class TestPreToolCall:
 
     def test_blocks_patch_tool_too(self, tmp_path):
         f = tmp_path / "patchme.py"
-        f.write_text("# old")
+        f.write_text("# old", encoding="utf-8")
         result = write_guard._check_tool_file_write(
             tool_name="patch", arguments={"path": str(f)}
         )
@@ -226,7 +222,7 @@ class TestPreSkillRemoveFile:
     def test_blocks_existing_file(self, tmp_skill):
         skill = tmp_skill / "skills" / "myskill"
         (skill / "references").mkdir(parents=True)
-        (skill / "references" / "old.md").write_text("data")
+        (skill / "references" / "old.md").write_text("data", encoding="utf-8")
         result = delete_guard._check_remove_file(
             name="myskill", file_path="references/old.md"
         )

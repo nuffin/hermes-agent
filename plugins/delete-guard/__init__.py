@@ -7,13 +7,16 @@ Uses $HERMES_HOME for profile-aware skill paths.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
-_HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-_SKILLS_DIR = _HERMES_HOME / "skills"
+
+def _skills_dir() -> Path:
+    """Resolve the active profile's skills directory at hook execution time."""
+    return get_hermes_home() / "skills"
 
 
 def register(ctx):
@@ -25,7 +28,7 @@ def _check_skill_delete(**kw) -> dict | None:
     name = kw.get("name", "")
     if not name:
         return None
-    target_dir = _SKILLS_DIR / name
+    target_dir = _skills_dir() / name
     if target_dir.is_dir():
         return {
             "action": "block",
@@ -44,7 +47,7 @@ def _check_remove_file(**kw) -> dict | None:
     file_path = kw.get("file_path", "")
     if not name or not file_path:
         return None
-    skill_dir = _SKILLS_DIR / name
+    skill_dir = _skills_dir() / name
     if not skill_dir.is_dir():
         return None
     target = skill_dir / file_path
